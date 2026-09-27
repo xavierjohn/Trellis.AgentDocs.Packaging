@@ -1,3 +1,33 @@
-﻿**/bin/
-**/obj/
+# Build output
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+
+# NuGet
+*.nupkg
+nupkg/
 artifacts/
+*.snupkg
+
+# Strong-name keys
+*.snk
+!build/Trellis.ResourceNaming.PublicKey.snk
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# Test
+[Tt]est[Rr]esults/
+
+# Local template-instantiation scratch used by the contract tests
+_check/
+_smoke/
+
+# DocFX output
+_site/
+
+# Scratch files used to pass multi-line messages to git/gh
+*.tmp
