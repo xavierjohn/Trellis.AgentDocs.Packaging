@@ -113,6 +113,7 @@ automatic refresh through both project and solution restores.
 Both published packages share one repository-wide Nerdbank.GitVersioning
 `version.json`; the internal reader is not published. Package versions are
 computed from Git history at build time, not set in the project files.
+`DotNet.ReproducibleBuilds` normalizes CI source paths in the tool's binaries.
 The single [build and publish workflow](.github/workflows/build.yml) tests
 both components, packs exactly two matching-version nupkgs, and uploads them
 as one artifact. Pushes and pull requests verify only. To preview a release,
