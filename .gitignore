@@ -12,7 +12,6 @@ artifacts/
 
 # Strong-name keys
 *.snk
-!build/Trellis.ResourceNaming.PublicKey.snk
 
 # IDE
 .vs/
