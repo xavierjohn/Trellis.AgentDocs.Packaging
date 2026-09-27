@@ -12,14 +12,16 @@ add an application runtime dependency.
 From the Git repository root, with a project or solution already restored:
 
 ```powershell
+$version = 'YOUR_PUBLISHED_VERSION'
 dotnet new tool-manifest --output .config
-dotnet tool install Trellis.AgentDocs --version 0.1.0-preview.1 --tool-manifest .config\dotnet-tools.json
+dotnet tool install Trellis.AgentDocs --version $version --tool-manifest .config\dotnet-tools.json
 dotnet tool run agentdocs init <solution-or-project>
 dotnet tool run agentdocs check
 ```
 
 If the repository already has `.config\dotnet-tools.json`, reuse it instead of
-creating a second manifest. Until this preview is published, add the local feed
+creating a second manifest. Replace the placeholder with the published version;
+until it is available on NuGet.org, add the local feed
 containing its nupkg to `dotnet tool install` with `--add-source`. The local
 tool is independently versioned; it does **not** need to match the version of
 any library package. No guide is installed merely by adding or restoring a

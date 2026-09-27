@@ -1,0 +1,10 @@
+﻿<Project>
+  <PropertyGroup>
+    <NBGV_SetCloudBuildVersionVars>false</NBGV_SetCloudBuildVersionVars>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/xavierjohn/Trellis.AgentDocs.Packaging</RepositoryUrl>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Nerdbank.GitVersioning" Version="3.10.94" PrivateAssets="all" />
+  </ItemGroup>
+</Project>

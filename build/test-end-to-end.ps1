@@ -4,10 +4,13 @@ param([string] $WorkDirectory = (Join-Path ([System.IO.Path]::GetTempPath()) "ag
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'package-version.ps1')
 $feed = Join-Path $WorkDirectory 'feed'
 $repo = Join-Path $WorkDirectory 'consumer'
 $app = Join-Path $repo 'backend\app'
 $publisher = Join-Path $WorkDirectory 'publisher'
+$helperVersion = ''
+$toolVersion = ''
 if (Test-Path -LiteralPath $WorkDirectory) { throw "Probe directory already exists: $WorkDirectory" }
 New-Item -ItemType Directory -Path $feed, $app, $publisher -Force | Out-Null
 
@@ -24,7 +27,7 @@ function Publish-Version {
         '<PackageGuidanceDocument>$(MSBuildProjectDirectory)/overview.md</PackageGuidanceDocument><PackageGuidancePath>guides/overview.md</PackageGuidancePath>'
     } else { '' }
     $reference = if ($WithGuide) {
-        '<PackageReference Include="Trellis.AgentDocs.Packaging" Version="0.1.0-preview.1" PrivateAssets="all" />'
+        "<PackageReference Include=`"Trellis.AgentDocs.Packaging`" Version=`"$helperVersion`" PrivateAssets=`"all`" />"
     } else { '' }
     [System.IO.File]::WriteAllText((Join-Path $publisher 'overview.md'), "# Guide $Version`n")
     [System.IO.File]::WriteAllText((Join-Path $publisher 'Publisher.csproj'), @"
@@ -62,12 +65,19 @@ $oldHome = $env:DOTNET_CLI_HOME
 $oldPackages = $env:NUGET_PACKAGES
 $succeeded = $false
 try {
-    $env:DOTNET_CLI_HOME = Join-Path $WorkDirectory 'cli-home'
-    $env:NUGET_PACKAGES = Join-Path $WorkDirectory 'packages'
     Invoke-Dotnet 'Pack helper and publisher' @('pack', (Join-Path $root 'src\Trellis.AgentDocs.Packaging.csproj'),
         '-c', 'Release', '-o', $feed, '--nologo', '-v:q') | Out-Null
     Invoke-Dotnet 'Pack tool' @('pack', (Join-Path $root 'Trellis.AgentDocs\src\Trellis.AgentDocs.csproj'),
         '-c', 'Release', '-o', $feed, '--nologo', '-v:q') | Out-Null
+    $helperVersion = Get-NuGetPackageVersion (Join-Path $root 'src\Trellis.AgentDocs.Packaging.csproj')
+    $toolVersion = Get-NuGetPackageVersion (Join-Path $root 'Trellis.AgentDocs\src\Trellis.AgentDocs.csproj')
+    if ($helperVersion -ne $toolVersion -or
+        -not (Test-Path -LiteralPath (Join-Path $feed "Trellis.AgentDocs.Packaging.$helperVersion.nupkg")) -or
+        -not (Test-Path -LiteralPath (Join-Path $feed "Trellis.AgentDocs.$toolVersion.nupkg"))) {
+        throw 'The helper and tool must pack with the same NBGV version.'
+    }
+    $env:DOTNET_CLI_HOME = Join-Path $WorkDirectory 'cli-home'
+    $env:NUGET_PACKAGES = Join-Path $WorkDirectory 'packages'
     Publish-Version '1.0.0' $true
     Invoke-Dotnet 'Git init' @('--version') | Out-Null
     & git -C $repo init --quiet
@@ -80,7 +90,7 @@ try {
     try {
         Invoke-Dotnet 'Initial restore' @('restore', 'backend\app\App.csproj', '--nologo', '-v:q') | Out-Null
         Invoke-Dotnet 'Tool manifest' @('new', 'tool-manifest', '--output', '.config') | Out-Null
-        Invoke-Dotnet 'Install tool' @('tool', 'install', 'Trellis.AgentDocs', '--version', '0.1.0-preview.1',
+        Invoke-Dotnet 'Install tool' @('tool', 'install', 'Trellis.AgentDocs', '--version', $toolVersion,
             '--add-source', $feed, '--tool-manifest', '.config\dotnet-tools.json') | Out-Null
         Invoke-Dotnet 'Init' @('tool', 'run', 'agentdocs', 'init', 'backend\app\App.csproj') | Out-Null
         $installed = Join-Path $repo '.agentdocs\packages\independent.publisher\guides\overview.md'

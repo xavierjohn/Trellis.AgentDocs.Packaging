@@ -1,23 +1,88 @@
-﻿name: Build
+﻿name: Build and publish
+
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Verify and package without publishing'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
 
 jobs:
-  packaging:
+  build:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Test guidance reader
+        run: dotnet test Trellis.Guidance.Reader/tests/Trellis.Guidance.Reader.Tests.csproj -c Release
+      - name: Test installer lifecycle
+        run: dotnet test Trellis.AgentDocs/tests/Trellis.AgentDocs.Tests.csproj -c Release
+      - name: Verify independent publisher
+        shell: pwsh
+        run: ./build/test-packaging.ps1
+      - name: Verify packed restore lifecycle
+        shell: pwsh
+        run: ./build/test-end-to-end.ps1
+      - name: Pack both packages
+        shell: pwsh
+        run: |
+          dotnet pack src/Trellis.AgentDocs.Packaging.csproj -c Release -o artifacts/release
+          if ($LASTEXITCODE -ne 0) { throw 'Helper pack failed.' }
+          dotnet pack Trellis.AgentDocs/src/Trellis.AgentDocs.csproj -c Release -o artifacts/release
+          if ($LASTEXITCODE -ne 0) { throw 'Tool pack failed.' }
+          ./build/test-release-packages.ps1 -CheckSourceVersion
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-nupkgs
+          path: artifacts/release/*.nupkg
+          if-no-files-found: error
+
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run && github.ref == 'refs/heads/main' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Pack and verify independent publisher
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-nupkgs
+          path: artifacts/release
+      - name: Verify both packages
         shell: pwsh
-        run: ./build/test-packaging.ps1
-      - name: Test guidance reader
-        run: dotnet test Trellis.Guidance.Reader/tests/Trellis.Guidance.Reader.Tests.csproj -c Release
-      - name: Test installer lifecycle
-        run: dotnet test Trellis.AgentDocs/tests/Trellis.AgentDocs.Tests.csproj -c Release
-      - name: Verify packed end-to-end restore lifecycle
+        run: ./build/test-release-packages.ps1
+      - name: Exchange OIDC token for a short-lived NuGet.org key
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ vars.NUGET_USER }}
+      - name: Publish both packages to NuGet.org
         shell: pwsh
-        run: ./build/test-end-to-end.ps1
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: |
+          foreach ($id in @('Trellis.AgentDocs.Packaging', 'Trellis.AgentDocs')) {
+            $packages = @(Get-ChildItem artifacts/release -Filter '*.nupkg' | Where-Object {
+              $_.Name -match "^$([regex]::Escape($id))\.\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\.nupkg$"
+            })
+            if ($packages.Count -ne 1) { throw "Expected one $id package." }
+            dotnet nuget push $packages[0].FullName --api-key $env:NUGET_API_KEY `
+              --source https://api.nuget.org/v3/index.json --skip-duplicate
+            if ($LASTEXITCODE -ne 0) { throw "Failed to publish $id." }
+          }

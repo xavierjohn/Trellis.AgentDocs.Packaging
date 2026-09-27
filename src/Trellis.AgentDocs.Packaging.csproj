@@ -2,7 +2,6 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <PackageId>Trellis.AgentDocs.Packaging</PackageId>
-    <Version>0.1.0-preview.1</Version>
     <Authors>Xavier John</Authors>
     <Description>Build-only helper for packing versioned coding-agent documentation into NuGet packages.</Description>
     <PackageTags>coding-agents;documentation;msbuild;packaging</PackageTags>

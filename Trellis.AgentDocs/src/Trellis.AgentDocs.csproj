@@ -7,7 +7,6 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>agentdocs</ToolCommandName>
     <PackageId>Trellis.AgentDocs</PackageId>
-    <Version>0.1.0-preview.1</Version>
     <Authors>Xavier John</Authors>
     <Description>Opt-in repository installer for versioned NuGet package guidance for coding agents.</Description>
     <PackageTags>coding-agents;documentation;nuget;tool</PackageTags>

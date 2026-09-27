@@ -4,6 +4,7 @@ param([string] $Feed = (Join-Path (Join-Path $PSScriptRoot '..') 'artifacts\feed
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'package-version.ps1')
 $work = Join-Path ([System.IO.Path]::GetTempPath()) "agentdocs-packaging-$([guid]::NewGuid().ToString('N'))"
 $publisher = Join-Path $work 'publisher'
 $packages = Join-Path $work 'packages'
@@ -11,7 +12,8 @@ try {
     New-Item -ItemType Directory -Path $Feed, $publisher, $packages -Force | Out-Null
     & dotnet pack (Join-Path $root 'src\Trellis.AgentDocs.Packaging.csproj') -c Release -o $Feed --nologo -v:q
     if ($LASTEXITCODE -ne 0) { throw 'Helper pack failed.' }
-    $helper = Join-Path $Feed 'Trellis.AgentDocs.Packaging.0.1.0-preview.1.nupkg'
+    $version = Get-NuGetPackageVersion (Join-Path $root 'src\Trellis.AgentDocs.Packaging.csproj')
+    $helper = Join-Path $Feed "Trellis.AgentDocs.Packaging.$version.nupkg"
     $zip = [System.IO.Compression.ZipFile]::OpenRead($helper)
     try {
         if (-not $zip.GetEntry('build/Trellis.AgentDocs.Packaging.targets') -or
@@ -24,7 +26,7 @@ try {
 
     $guide = Join-Path $publisher 'overview.md'
     [System.IO.File]::WriteAllText($guide, "# Publisher guide`n", [System.Text.UTF8Encoding]::new($true))
-    [System.IO.File]::WriteAllText((Join-Path $publisher 'Publisher.csproj'), @'
+    [System.IO.File]::WriteAllText((Join-Path $publisher 'Publisher.csproj'), @"
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -32,14 +34,14 @@ try {
     <Version>1.0.0</Version>
     <IncludeBuildOutput>false</IncludeBuildOutput>
     <NoWarn>NU5128</NoWarn>
-    <PackageGuidanceDocument>$(MSBuildProjectDirectory)/overview.md</PackageGuidanceDocument>
+    <PackageGuidanceDocument>`$(MSBuildProjectDirectory)/overview.md</PackageGuidanceDocument>
     <PackageGuidancePath>guides/overview.md</PackageGuidancePath>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Trellis.AgentDocs.Packaging" Version="0.1.0-preview.1" PrivateAssets="all" />
+    <PackageReference Include="Trellis.AgentDocs.Packaging" Version="$version" PrivateAssets="all" />
   </ItemGroup>
 </Project>
-'@)
+"@)
     $project = Join-Path $publisher 'Publisher.csproj'
     & dotnet restore $project --source $Feed "-p:RestorePackagesPath=$packages" --nologo -v:q
     if ($LASTEXITCODE -ne 0) { throw 'Publisher restore failed.' }
