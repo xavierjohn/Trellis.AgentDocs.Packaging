@@ -118,14 +118,3 @@ both components, packs exactly two matching-version nupkgs, and uploads them
 as one artifact. Pushes and pull requests verify only. To preview a release,
 run the workflow manually with its default `dry_run: true`. To publish both
 packages, dispatch it from `main` with `dry_run: false`.
-
-Publication uses [NuGet.org trusted publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing),
-not a stored API key. Before publishing, set the repository variable
-`NUGET_USER` to the **NuGet.org username** (not an email address), and configure
-a NuGet.org trusted-publishing policy for owner `xavierjohn`, repository
-`Trellis.AgentDocs.Packaging`, workflow file `build.yml`, with no environment.
-The publish job obtains a short-lived key through `NuGet/login@v1` only after
-the packed artifacts pass verification. NuGet.org cannot atomically publish
-two packages: a failed second push can be retried with the same commit;
-duplicate versions are skipped. Consumers should pin the actual published
-version, not a speculative next preview version.
