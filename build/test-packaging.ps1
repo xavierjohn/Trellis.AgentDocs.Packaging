@@ -99,3 +99,4 @@ try {
 finally {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
 }
+exit 0
