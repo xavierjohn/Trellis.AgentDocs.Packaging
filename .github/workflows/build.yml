@@ -1,0 +1,23 @@
+﻿name: Build
+on:
+  push:
+  pull_request:
+
+jobs:
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Pack and verify independent publisher
+        shell: pwsh
+        run: ./build/test-packaging.ps1
+      - name: Test guidance reader
+        run: dotnet test Trellis.Guidance.Reader/tests/Trellis.Guidance.Reader.Tests.csproj -c Release
+      - name: Test installer lifecycle
+        run: dotnet test Trellis.AgentDocs/tests/Trellis.AgentDocs.Tests.csproj -c Release
+      - name: Verify packed end-to-end restore lifecycle
+        shell: pwsh
+        run: ./build/test-end-to-end.ps1

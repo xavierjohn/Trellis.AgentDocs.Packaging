@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <PackageId>Trellis.AgentDocs.Packaging</PackageId>
+    <Version>0.1.0-preview.1</Version>
+    <Authors>Xavier John</Authors>
+    <Description>Build-only helper for packing versioned coding-agent documentation into NuGet packages.</Description>
+    <PackageTags>coding-agents;documentation;msbuild;packaging</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="/" />
+    <None Include="..\build\Trellis.AgentDocs.Packaging.targets"
+          Pack="true" PackagePath="build/Trellis.AgentDocs.Packaging.targets" />
+  </ItemGroup>
+</Project>

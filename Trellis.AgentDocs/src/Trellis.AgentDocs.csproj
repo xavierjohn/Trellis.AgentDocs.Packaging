@@ -1,0 +1,29 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>agentdocs</ToolCommandName>
+    <PackageId>Trellis.AgentDocs</PackageId>
+    <Version>0.1.0-preview.1</Version>
+    <Authors>Xavier John</Authors>
+    <Description>Opt-in repository installer for versioned NuGet package guidance for coding agents.</Description>
+    <PackageTags>coding-agents;documentation;nuget;tool</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\Trellis.Guidance.Reader\src\Trellis.Guidance.Reader.csproj" />
+    <None Include="..\README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+  <Target Name="StampToolPackageVersion" BeforeTargets="GetAssemblyAttributes">
+    <ItemGroup>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>AgentDocsToolPackageVersion</_Parameter1>
+        <_Parameter2>$(PackageVersion)</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+  </Target>
+</Project>
