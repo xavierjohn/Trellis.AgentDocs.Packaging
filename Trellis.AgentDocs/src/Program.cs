@@ -22,7 +22,7 @@ internal sealed record GraphPackage(string Id, string Version, string? ContentHa
 internal sealed record GraphProject(string Project, string Framework, string? Runtime, GraphPackage[] Packages);
 internal sealed record GraphInput(string Path, string RestoreSpecSha256);
 internal sealed record GraphState(GraphInput[] EntryPoints, GraphProject[] Projects);
-internal sealed record ContextState(int SchemaVersion, string Scope, string TextHashFormat, string GeneratedBy,
+internal sealed record ContextState(int SchemaVersion, string TextHashFormat, string GeneratedBy,
     string[] SourceRoots, GraphState Graph, InstructionEntry[] InstructionEntries, InstructionEntry[] RestoreEntries,
     OwnedFile[] ToolOwnedFiles,
     OwnedFile[] References, string[] EntryPoints, string[] ExplicitSourceRoots);
@@ -73,7 +73,6 @@ public static partial class AgentDocsCommand
         }
 
         var verb = args[0];
-        string? scopeArg = null;
         var dryRun = false;
         var force = false;
         var restore = false;
@@ -83,10 +82,6 @@ public static partial class AgentDocsCommand
         {
             switch (args[i])
             {
-                case "--scope":
-                    if (++i == args.Length) throw new ArgumentException("--scope requires a directory.");
-                    scopeArg = args[i];
-                    break;
                 case "--source-root":
                     if (++i == args.Length) throw new ArgumentException("--source-root requires a directory.");
                     sourceRootArgs.Add(args[i]);
@@ -112,20 +107,14 @@ public static partial class AgentDocsCommand
         var cwd = Path.GetFullPath(Environment.CurrentDirectory);
         var root = GitRoot(cwd);
         RejectExcluded(root, cwd);
-        var scope = scopeArg is null ? root : Path.GetFullPath(scopeArg, cwd);
-        Inside(root, scope);
-        if (!Physical.Equals(root, scope))
-            throw new InvalidOperationException("Agent context is repository-wide; use the Git root as the scope.");
+        var scope = root;
         RejectExcluded(root, scope);
         EnsureDirectoriesSafe(root, scope);
-        var relativeScope = Rel(root, scope);
         var manifestPath = Path.Combine(root, ".agentdocs", "agent-context.json");
         CheckFileDestination(root, scope, manifestPath);
         var previous = File.Exists(manifestPath) ? LoadState(manifestPath) : null;
-        if (previous is not null && previous.Scope != relativeScope)
-            throw new InvalidOperationException("Recorded context scope does not match the selected scope.");
         if (verb != "init" && previous is null)
-            throw new InvalidOperationException("No initialized context at the selected scope.");
+            throw new InvalidOperationException("No initialized context at the Git root.");
 
         var version = ToolVersion();
         ValidateTool(cwd, scope, version);
@@ -241,7 +230,7 @@ public static partial class AgentDocsCommand
             if (family.Select(p => p.Version).Distinct(StringComparer.OrdinalIgnoreCase).Skip(1).Any())
                 incompatibilities.Add($"Mixed versions of {family.Key}: " +
                     string.Join(", ", family.Select(p => p.Version).Distinct(StringComparer.OrdinalIgnoreCase)
-                        .OrderBy(v => v, StringComparer.Ordinal)) + "; initialize independent scopes.");
+                        .OrderBy(v => v, StringComparer.Ordinal)) + "; select a graph with one version per package.");
         if (incompatibilities.Count != 0)
             throw new InvalidOperationException(string.Join(Environment.NewLine, incompatibilities));
 
@@ -303,7 +292,7 @@ public static partial class AgentDocsCommand
                     .ThenBy(s => s.PackagePath, StringComparer.Ordinal).ToArray())).ToArray();
         var content = mapped.ToDictionary(pair => pair.Key, pair => pair.Value.Text, Portable);
         var graph = BuildGraph(scope, entries, guidance);
-        var state = new ContextState(2, Rel(root, scope), "utf8-lf-no-bom-v1", version, roots, graph,
+        var state = new ContextState(2, "utf8-lf-no-bom-v1", version, roots, graph,
             instructionFiles.Select(p => new InstructionEntry(Rel(root, p), HashText(Entry(scope, p)),
                 previous?.InstructionEntries.SingleOrDefault(e => Portable.Equals(e.InstructionFile, Rel(root, p)))?.ExistedBefore
                 ?? File.Exists(p))).ToArray(),
@@ -1043,17 +1032,17 @@ public static partial class AgentDocsCommand
 
         var expected = Path.Combine(scope, ".config", "dotnet-tools.json");
         if (!string.Equals(selected, expected, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"Run from scope '{scope}' with pinned agentdocs in {expected}.");
+            throw new InvalidOperationException($"Use the pinned agentdocs tool at Git root '{scope}': {expected}.");
         using var manifest = JsonDocument.Parse(File.ReadAllText(expected));
         if (!manifest.RootElement.TryGetProperty("isRoot", out var flag) || flag.ValueKind != JsonValueKind.True ||
             !manifest.RootElement.TryGetProperty("tools", out var declared))
-            throw new InvalidOperationException($"Scoped manifest must declare isRoot true: {expected}");
+            throw new InvalidOperationException($"Git-root tool manifest must declare isRoot true: {expected}");
         var matches = declared.EnumerateObject().Where(t =>
             t.Name.Equals("trellis.agentdocs", StringComparison.OrdinalIgnoreCase) &&
             t.Value.TryGetProperty("commands", out var commands) &&
             commands.EnumerateArray().Any(c => c.GetString() == "agentdocs")).ToArray();
         if (matches.Length != 1 || !matches[0].Value.TryGetProperty("version", out var pin) || pin.GetString() != version)
-            throw new InvalidOperationException($"Scoped manifest must pin running tool version {version}: {expected}");
+            throw new InvalidOperationException($"Git-root tool manifest must pin running tool version {version}: {expected}");
     }
 
     private static FileStream Lock(string root)

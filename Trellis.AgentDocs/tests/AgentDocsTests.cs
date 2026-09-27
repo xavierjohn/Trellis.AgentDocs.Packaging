@@ -36,6 +36,8 @@ public sealed class AgentDocsTests
             .And.Contain("<!-- agentdocs:start -->");
         File.Exists(fixture.Path(".agentdocs", "README.md")).Should().BeTrue();
         File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides", "overview.md")).Should().BeTrue();
+        using (var state = JsonDocument.Parse(File.ReadAllText(fixture.Path(".agentdocs", "agent-context.json"))))
+            state.RootElement.TryGetProperty("Scope", out _).Should().BeFalse();
         fixture.Run("check").Should().Be(0);
         fixture.Run("sync").Should().Be(0);
         fixture.Run("remove").Should().Be(0);
@@ -330,7 +332,7 @@ public sealed class AgentDocsTests
             }
         }));
 
-        fixture.Run("init", "--scope", ".", "App.csproj").Should().NotBe(0);
+        fixture.Run("init", "App.csproj").Should().NotBe(0);
         File.Exists(fixture.Path("service", ".agentdocs", "agent-context.json")).Should().BeFalse();
     }
 
@@ -563,12 +565,12 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
-    public void Init_rejects_explicit_source_root_outside_selected_scope()
+    public void Init_rejects_explicit_source_root_outside_repository()
     {
         using var fixture = new Fixture();
         fixture.Scope("service");
         fixture.Write("shared/AGENTS.md", "# Shared\n");
-        fixture.Run("init", "--scope", ".", "--source-root", "../shared", "App.csproj").Should().NotBe(0);
+        fixture.Run("init", "--source-root", "../../outside", "App.csproj").Should().NotBe(0);
         File.ReadAllText(fixture.Path("shared", "AGENTS.md")).Should().Be("# Shared\n");
         File.Exists(fixture.Path("service", ".agentdocs", "agent-context.json")).Should().BeFalse();
     }
@@ -801,7 +803,7 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
-    public void Init_requires_independent_scopes_for_mixed_versions_of_one_package()
+    public void Init_rejects_mixed_versions_of_one_package()
     {
         using var fixture = new Fixture();
         fixture.Write("package-two/guide/README.md", "# Other\n");
@@ -866,23 +868,21 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
-    public void Init_rejects_nested_scope_and_nested_tool_manifest()
+    public void Init_rejects_nested_tool_manifest()
     {
         using var fixture = new Fixture();
         fixture.Scope("service");
         fixture.Run("init", "App.csproj").Should().NotBe(0);
-        fixture.Run("init", "--scope", ".", "App.csproj").Should().NotBe(0);
         File.Exists(fixture.Path("service", ".agentdocs", "agent-context.json")).Should().BeFalse();
         File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
     }
 
     [Fact]
-    public void Init_rejects_nonroot_scope_even_from_repository_root()
+    public void Init_rejects_removed_scope_switch()
     {
         using var fixture = new Fixture();
-        Directory.CreateDirectory(fixture.Path("orders"));
-        fixture.Run("init", "--scope", "orders", "App.csproj").Should().NotBe(0);
-        fixture.LastOutput.Should().Contain("repository-wide");
+        fixture.Run("init", "--scope", ".", "App.csproj").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Unknown option '--scope'");
         File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
     }
 

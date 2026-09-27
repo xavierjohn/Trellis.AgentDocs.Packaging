@@ -1,6 +1,6 @@
 ﻿{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/xavierjohn/Trellis/blob/main/Trellis.Guidance.Reader/docs/reference-manifest-v1.schema.json",
+  "$id": "https://github.com/xavierjohn/Trellis.AgentDocs.Packaging/blob/main/Trellis.Guidance.Reader/docs/reference-manifest-v1.schema.json",
   "title": "Experimental NuGet package guidance manifest, version 1",
   "type": "object",
   "additionalProperties": false,
