@@ -1,0 +1,19 @@
+﻿<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Trellis.AgentDocs.Packaging.csproj" />
+  </Folder>
+  <Folder Name="/Trellis.AgentDocs/" />
+  <Folder Name="/Trellis.AgentDocs/src/">
+    <Project Path="Trellis.AgentDocs/src/Trellis.AgentDocs.csproj" />
+  </Folder>
+  <Folder Name="/Trellis.AgentDocs/tests/">
+    <Project Path="Trellis.AgentDocs/tests/Trellis.AgentDocs.Tests.csproj" />
+  </Folder>
+  <Folder Name="/Trellis.Guidance.Reader/" />
+  <Folder Name="/Trellis.Guidance.Reader/src/">
+    <Project Path="Trellis.Guidance.Reader/src/Trellis.Guidance.Reader.csproj" />
+  </Folder>
+  <Folder Name="/Trellis.Guidance.Reader/tests/">
+    <Project Path="Trellis.Guidance.Reader/tests/Trellis.Guidance.Reader.Tests.csproj" />
+  </Folder>
+</Solution>

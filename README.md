@@ -99,13 +99,13 @@ publishers needing that today must produce the manifest themselves.
 
 ## Work on this repository
 
+Run `dotnet build Trellis.AgentDocs.slnx -c Release` and
+`dotnet test Trellis.AgentDocs.slnx -c Release` to build and test all projects.
 Run `pwsh build/test-packaging.ps1` to pack the helper and a third-party-style
 publisher into a local feed. The probe checks the packed document, its SHA-256
 manifest, absence of consumer-side build targets or leaked helper dependencies,
 and rejection of invalid paths and missing files.
-Run `dotnet test Trellis.Guidance.Reader/tests/Trellis.Guidance.Reader.Tests.csproj`,
-`dotnet test Trellis.AgentDocs/tests/Trellis.AgentDocs.Tests.csproj`, and
-`pwsh build/test-end-to-end.ps1` to exercise discovery, installation, and
+Run `pwsh build/test-end-to-end.ps1` to exercise discovery, installation, and
 automatic refresh through both project and solution restores.
 
 ## Versioning and releases
@@ -118,3 +118,7 @@ both components, packs exactly two matching-version nupkgs, and uploads them
 as one artifact. Pushes and pull requests verify only. To preview a release,
 run the workflow manually with its default `dry_run: true`. To publish both
 packages, dispatch it from `main` with `dry_run: false`.
+
+## License
+
+AgentDocs is licensed under the [MIT License](LICENSE).
