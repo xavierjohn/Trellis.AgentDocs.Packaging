@@ -7,7 +7,11 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'package-version.ps1')
 $feed = Join-Path $WorkDirectory 'feed'
 $repo = Join-Path $WorkDirectory 'consumer'
-$app = Join-Path $repo 'backend\app'
+$app = Join-Path $repo 'backend' 'app'
+$appProject = Join-Path 'backend' 'app' 'App.csproj'
+$otherProject = Join-Path 'backend' 'other' 'Other.csproj'
+$nestedSolution = Join-Path 'backend' 'Nested.slnx'
+$toolManifest = Join-Path $repo '.config' 'dotnet-tools.json'
 $publisher = Join-Path $WorkDirectory 'publisher'
 $helperVersion = ''
 $toolVersion = ''
@@ -88,11 +92,11 @@ try {
     Select-Package '1.0.0'
     Push-Location $repo
     try {
-        Invoke-Dotnet 'Initial restore' @('restore', 'backend\app\App.csproj', '--nologo', '-v:q') | Out-Null
+        Invoke-Dotnet 'Initial restore' @('restore', $appProject, '--nologo', '-v:q') | Out-Null
         Invoke-Dotnet 'Tool manifest' @('new', 'tool-manifest', '--output', '.config') | Out-Null
         Invoke-Dotnet 'Install tool' @('tool', 'install', 'Trellis.AgentDocs', '--version', $toolVersion,
-            '--add-source', $feed, '--tool-manifest', '.config\dotnet-tools.json') | Out-Null
-        Invoke-Dotnet 'Init' @('tool', 'run', 'agentdocs', 'init', 'backend\app\App.csproj') | Out-Null
+            '--add-source', $feed, '--tool-manifest', $toolManifest) | Out-Null
+        Invoke-Dotnet 'Init' @('tool', 'run', 'agentdocs', 'init', $appProject) | Out-Null
         $installed = Join-Path $repo '.agentdocs\packages\independent.publisher\guides\overview.md'
         if ((Get-Content -LiteralPath $installed -Raw) -notmatch 'Guide 1.0.0') {
             throw 'Initial guide was not installed.'
@@ -100,10 +104,10 @@ try {
         Invoke-Dotnet 'Initial check' @('tool', 'run', 'agentdocs', 'check') | Out-Null
         Invoke-Dotnet 'Explicit sync with restore' @('tool', 'run', 'agentdocs', 'sync', '--restore') | Out-Null
         Invoke-Dotnet 'Initial solution' @('new', 'sln', '-n', 'Consumer', '--format', 'slnx') | Out-Null
-        Invoke-Dotnet 'Add solution project' @('sln', 'Consumer.slnx', 'add', 'backend\app\App.csproj') | Out-Null
+        Invoke-Dotnet 'Add solution project' @('sln', 'Consumer.slnx', 'add', $appProject) | Out-Null
         Publish-Version '2.0.0' $true
         Select-Package '2.0.0'
-        Invoke-Dotnet 'Upgraded project restore' @('restore', 'backend\app\App.csproj', '--nologo', '-v:q') | Out-Null
+        Invoke-Dotnet 'Upgraded project restore' @('restore', $appProject, '--nologo', '-v:q') | Out-Null
         if ((Get-Content -LiteralPath $installed -Raw) -notmatch 'Guide 2.0.0') {
             throw 'Project restore did not refresh the upgraded guide.'
         }
@@ -113,20 +117,20 @@ try {
         Copy-Item -LiteralPath (Join-Path $app 'App.csproj') -Destination (Join-Path $other 'Other.csproj')
         Select-Package '2.0.0'
         Invoke-Dotnet 'Add second solution project' @('sln', 'Consumer.slnx',
-            'add', 'backend\other\Other.csproj') | Out-Null
+            'add', $otherProject) | Out-Null
         Invoke-Dotnet 'Restore two-project solution' @('restore', 'Consumer.slnx', '--nologo', '-v:q') | Out-Null
         Invoke-Dotnet 'Remove project graph' @('tool', 'run', 'agentdocs', 'remove') | Out-Null
         Invoke-Dotnet 'Select two-project graph' @('tool', 'run', 'agentdocs', 'init', 'Consumer.slnx') | Out-Null
         Invoke-Dotnet 'Check two-project graph' @('tool', 'run', 'agentdocs', 'check') | Out-Null
         Invoke-Dotnet 'Nested solution' @('new', 'sln', '-n', 'Nested', '--format', 'slnx',
             '-o', 'backend') | Out-Null
-        Invoke-Dotnet 'Add nested solution project' @('sln', 'backend\Nested.slnx',
-            'add', 'backend\app\App.csproj') | Out-Null
-        Invoke-Dotnet 'Add nested second project' @('sln', 'backend\Nested.slnx',
-            'add', 'backend\other\Other.csproj') | Out-Null
+        Invoke-Dotnet 'Add nested solution project' @('sln', $nestedSolution,
+            'add', $appProject) | Out-Null
+        Invoke-Dotnet 'Add nested second project' @('sln', $nestedSolution,
+            'add', $otherProject) | Out-Null
         Publish-Version '2.1.0' $true
         Select-Package '2.1.0'
-        Invoke-Dotnet 'Nested solution restore' @('restore', 'backend\Nested.slnx', '--nologo', '-v:q') | Out-Null
+        Invoke-Dotnet 'Nested solution restore' @('restore', $nestedSolution, '--nologo', '-v:q') | Out-Null
         if ((Get-Content -LiteralPath $installed -Raw) -notmatch 'Guide 2.1.0') {
             throw 'Nested solution restore did not refresh the upgraded guide.'
         }
