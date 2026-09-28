@@ -274,7 +274,8 @@ public static partial class AgentDocsCommand
         }
 
         foreach (var family in guidance.Packages.GroupBy(p => p.PackageId, StringComparer.OrdinalIgnoreCase))
-            if (family.Select(p => p.Version).Distinct(StringComparer.OrdinalIgnoreCase).Skip(1).Any())
+            if (family.Any(p => p.Contribution is not null) &&
+                family.Select(p => p.Version).Distinct(StringComparer.OrdinalIgnoreCase).Skip(1).Any())
                 incompatibilities.Add($"Mixed versions of {family.Key}: " +
                     string.Join(", ", family.Select(p => p.Version).Distinct(StringComparer.OrdinalIgnoreCase)
                         .OrderBy(v => v, StringComparer.Ordinal)) + "; select a graph with one version per package.");
