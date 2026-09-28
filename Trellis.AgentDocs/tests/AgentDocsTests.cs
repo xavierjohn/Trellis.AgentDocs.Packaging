@@ -1017,6 +1017,106 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
+    public void Init_accepts_non_csproj_references_omitted_from_restore_graph()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("App.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup>
+                <ProjectReference Include="Schema.sqlproj"
+                                  ReferenceOutputAssembly="false"
+                                  SkipGetTargetFrameworkProperties="true"
+                                  OutputItemType="None" />
+                <ProjectReference Include="Native.vcxproj"
+                                  ReferenceOutputAssembly="false" />
+              </ItemGroup>
+            </Project>
+            """);
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+    }
+
+    [Fact]
+    public void Init_accepts_build_only_csproj_reference_omitted_from_restore_graph()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("App.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup>
+                <ProjectReference Include="Dependency.csproj"
+                                  ReferenceOutputAssembly="false"
+                                  SkipGetTargetFrameworkProperties="true"
+                                  OutputItemType="None" />
+              </ItemGroup>
+            </Project>
+            """);
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+    }
+
+    [Fact]
+    public void Init_rejects_unrestored_fsharp_project_reference()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("App.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><ProjectReference Include="Dependency.fsproj" /></ItemGroup>
+            </Project>
+            """);
+        fixture.Run("init", "App.csproj").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("ProjectReference changed");
+    }
+
+    [Fact]
+    public void Init_rejects_restored_reference_missing_from_evaluated_graph()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("obj/project.assets.json", JsonSerializer.Serialize(new
+        {
+            project = new
+            {
+                restore = new
+                {
+                    originalTargetFrameworks = new List<string> { "net10.0" },
+                    frameworks = new Dictionary<string, object>
+                    {
+                        ["net10.0"] = new
+                        {
+                            projectReferences = new Dictionary<string, object>
+                            {
+                                [fixture.Path("Schema.sqlproj")] = new { projectPath = fixture.Path("Schema.sqlproj") }
+                            }
+                        }
+                    }
+                },
+                frameworks = new Dictionary<string, object> { ["net10.0"] = new { } }
+            }
+        }));
+        fixture.Run("init", "App.csproj").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("ProjectReference changed");
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("""{"_RestoreGraphEntry":{}}""")]
+    [InlineData("""{"_RestoreGraphEntry":[{}]}""")]
+    [InlineData("""{"_RestoreGraphEntry":[{"Type":"ProjectReference"}]}""")]
+    public void ProjectReference_validation_reports_unavailable_nuget_graph(string itemsJson)
+    {
+        using var items = JsonDocument.Parse(itemsJson);
+        using var restore = JsonDocument.Parse("{}");
+        var method = typeof(AgentDocsCommand).GetMethod("ValidateProjectReferences",
+            BindingFlags.Static | BindingFlags.NonPublic)!;
+        Action check = () => method.Invoke(null, ["App.csproj", "net10.0", restore.RootElement, items.RootElement]);
+
+        check.Should().Throw<TargetInvocationException>().Which.InnerException.Should()
+            .BeOfType<InvalidOperationException>().Which.Message.Should().Contain("Cannot evaluate NuGet restore graph");
+    }
+
+    [Fact]
     public void Init_rejects_runtime_identifier_missing_from_assets()
     {
         using var fixture = new Fixture();

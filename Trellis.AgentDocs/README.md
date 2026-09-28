@@ -70,6 +70,10 @@ opt-in installs both hooks. The current context selects one graph per Git
 repository; mixed resolved versions of a package that publishes guidance across
 its selected projects are rejected rather than silently mixing guides. Packages
 without guidance may resolve to different versions across those projects.
+For freshness checks, NuGet's evaluated per-target restore references are
+compared against the restored project-reference graph. Build-only references
+that NuGet omits, such as a SQL project supplying a dacpac, do not cause false
+stale-assets errors.
 
 The manifest format is an **experimental convention**, not a NuGet standard.
 An agent needs the repository pointers (or explicit direction from its user)

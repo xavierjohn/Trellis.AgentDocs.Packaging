@@ -519,10 +519,14 @@ public static partial class AgentDocsCommand
             "-getProperty:BaseOutputPath", "-getProperty:OutputPath", "-getProperty:TargetDir",
             "-getProperty:PublishDir", "-getProperty:CompilerGeneratedFilesOutputPath",
             "-getProperty:GeneratedFilesOutputPath",
-            "-getItem:PackageReference", "-getItem:PackageVersion", "-getItem:ProjectReference" })
+            "-getItem:PackageReference", "-getItem:PackageVersion" })
             start.ArgumentList.Add(argument);
         if (framework is not null)
+        {
             start.ArgumentList.Add("-p:TargetFramework=" + framework);
+            start.ArgumentList.Add("-target:_GenerateProjectRestoreGraphPerFramework");
+            start.ArgumentList.Add("-getItem:_RestoreGraphEntry");
+        }
         var result = RunProcess(start, 120000);
         if (result.ExitCode != 0)
             throw new InvalidOperationException($"Cannot evaluate current restore specification: {result.Error}");
@@ -603,9 +607,23 @@ public static partial class AgentDocsCommand
 
     private static void ValidateProjectReferences(string entry, string framework, JsonElement restore, JsonElement items)
     {
-        var evaluated = items.GetProperty("ProjectReference").EnumerateArray()
-            .Select(reference => Path.GetFullPath(reference.GetProperty("FullPath").GetString()!))
-            .ToHashSet(Physical);
+        var unavailable = $"Cannot evaluate NuGet restore graph for {entry} ({framework}); the .NET SDK may be unsupported.";
+        if (!items.TryGetProperty("_RestoreGraphEntry", out var graph) || graph.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException(unavailable);
+
+        var evaluated = new HashSet<string>(Physical);
+        foreach (var reference in graph.EnumerateArray())
+        {
+            if (reference.ValueKind != JsonValueKind.Object ||
+                !reference.TryGetProperty("Type", out var type) || type.ValueKind != JsonValueKind.String)
+                throw new InvalidOperationException(unavailable);
+            if (type.GetString() != "ProjectReference")
+                continue;
+            if (!reference.TryGetProperty("ProjectPath", out var path) ||
+                path.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(path.GetString()))
+                throw new InvalidOperationException(unavailable);
+            evaluated.Add(Path.GetFullPath(path.GetString()!, Path.GetDirectoryName(entry)!));
+        }
         var restored = new HashSet<string>(Physical);
         if (restore.TryGetProperty("frameworks", out var frameworks) &&
             frameworks.ValueKind == JsonValueKind.Object &&
