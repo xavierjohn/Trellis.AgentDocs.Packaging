@@ -242,19 +242,19 @@ public static partial class AgentDocsCommand
             .OrderBy(p => p, StringComparer.Ordinal).ToArray();
         if (projects.Length == 0)
             throw new InvalidOperationException("No selected projects.");
-        foreach (var project in projects)
+        foreach (var selected in projects.Concat(entries).Distinct(Portable))
         {
-            CheckDestination(root, root, project);
-            if (!Portable.Equals(GitRoot(Path.GetDirectoryName(project)!), root))
-                throw new InvalidOperationException($"Selected project crosses a Git working tree boundary: {project}");
-            for (var directory = Path.GetDirectoryName(project); directory is not null &&
+            CheckDestination(root, root, selected);
+            if (!Portable.Equals(GitRoot(Path.GetDirectoryName(selected)!), root))
+                throw new InvalidOperationException($"Selected project or entry crosses a Git working tree boundary: {selected}");
+            for (var directory = Path.GetDirectoryName(selected); directory is not null &&
                 Within(root, directory) && !Portable.Equals(directory, root); directory = Path.GetDirectoryName(directory))
             {
                 var nestedManifest = Path.Combine(directory, ".config", "dotnet-tools.json");
                 CheckDestination(root, root, nestedManifest);
                 if (File.Exists(nestedManifest))
                     throw new InvalidOperationException(
-                        $"Project has a nested tool manifest at {nestedManifest}; use the Git-root tool manifest instead.");
+                        $"Selected project or entry has a nested tool manifest at {nestedManifest}; use the Git-root tool manifest instead.");
             }
         }
 
@@ -303,7 +303,7 @@ public static partial class AgentDocsCommand
         foreach (var source in roots)
             if (generatedDirectories.Any(directory => Within(directory, Full(root, source))))
                 throw new InvalidOperationException($"Source root is inside an evaluated generated directory: {source}");
-        var instructionFiles = InstructionFiles(root, roots, generatedDirectories).ToArray();
+        var instructionFiles = InstructionFiles(root, entries).ToArray();
         var mapped = new Dictionary<string, (string Text, List<Source> Sources)>(Portable);
         var entryPoints = new HashSet<string>(Portable);
         foreach (var package in guidance.Packages.Where(p => p.Contribution is not null))
@@ -677,10 +677,10 @@ public static partial class AgentDocsCommand
                 throw new InvalidOperationException("Excluded instruction path: " + file);
             var path = Full(root, file);
             if ((old?.InstructionEntries.Any(e => Portable.Equals(e.InstructionFile, file)) == true &&
-                 !GovernsSource(root, old.SourceRoots, path)) ||
+                 !CoversSelectedGraph(root, old, path)) ||
                 (next?.InstructionEntries.Any(e => Portable.Equals(e.InstructionFile, file)) == true &&
-                 !GovernsSource(root, next.SourceRoots, path)))
-                throw new InvalidOperationException($"Instruction path does not govern recorded source: {file}");
+                 !CoversSelectedGraph(root, next, path)))
+                throw new InvalidOperationException($"Instruction path is outside recorded source and entry points: {file}");
             CheckFileDestination(root, root, path);
             var before = File.Exists(path) ? File.ReadAllBytes(path) : null;
             var original = before is null ? "" : DecodeInstruction(before);
@@ -700,18 +700,20 @@ public static partial class AgentDocsCommand
         return changes;
     }
 
-    private static bool GovernsSource(string root, string[] sources, string instruction)
+    private static bool CoversSelectedGraph(string root, ContextState state, string instruction)
     {
         if (Physical.Equals(instruction, Path.Combine(root, ".github", "copilot-instructions.md")))
-            return sources.Length != 0;
+            return state.SourceRoots.Length != 0;
         if (!Path.GetFileName(instruction).Equals("AGENTS.md", StringComparison.OrdinalIgnoreCase))
             return false;
         var directory = Path.GetDirectoryName(instruction)!;
-        return sources.Any(source =>
-        {
-            var selected = Full(root, source);
-            return Within(root, selected) && (Within(directory, selected) || Within(selected, directory));
-        });
+        return state.Graph.EntryPoints.Any(entry =>
+            Physical.Equals(directory, Path.GetDirectoryName(Full(root, entry.Path)))) ||
+            state.SourceRoots.Any(source =>
+            {
+                var selected = Full(root, source);
+                return Within(root, selected) && (Within(directory, selected) || Within(selected, directory));
+            });
     }
 
     private static string Index(ContextState state)
@@ -990,57 +992,21 @@ public static partial class AgentDocsCommand
         return generated;
     }
 
-    private static IEnumerable<string> InstructionFiles(string root, string[] sourceRoots,
-        HashSet<string> generatedDirectories)
+    private static IEnumerable<string> InstructionFiles(string root, string[] entries)
     {
         var files = new HashSet<string>(Portable)
         {
             Path.Combine(root, "AGENTS.md"),
             Path.Combine(root, ".github", "copilot-instructions.md")
         };
-        foreach (var source in sourceRoots)
+        foreach (var entry in entries)
         {
-            var directory = Full(root, source);
+            var directory = Path.GetDirectoryName(entry)!;
             Inside(root, directory);
-            if (!Physical.Equals(directory, root))
-                files.Add(Path.Combine(directory, "AGENTS.md"));
-            for (var parent = directory; parent is not null && Within(root, parent); parent = Path.GetDirectoryName(parent))
-            {
-                var candidate = Path.Combine(parent, "AGENTS.md");
-                if (File.Exists(candidate))
-                {
-                    files.Add(candidate);
-                    break;
-                }
-            }
-
-            Walk(directory, files, generatedDirectories);
+            files.Add(Path.Combine(directory, "AGENTS.md"));
         }
 
         return files.OrderBy(p => p, StringComparer.Ordinal);
-
-        static void Walk(string dir, HashSet<string> found, HashSet<string> generatedDirectories)
-        {
-            if (!Directory.Exists(dir))
-                return;
-            foreach (var child in Directory.EnumerateDirectories(dir))
-            {
-                var name = Path.GetFileName(child);
-                if (generatedDirectories.Any(directory => Within(directory, child)) ||
-                    name.Equals(".git", StringComparison.OrdinalIgnoreCase) ||
-                    name.Equals(".agentdocs", StringComparison.OrdinalIgnoreCase) ||
-                    name.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
-                    name.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
-                    name.Equals(".github", StringComparison.OrdinalIgnoreCase) ||
-                    File.Exists(Path.Combine(child, ".git")) || Directory.Exists(Path.Combine(child, ".git")) ||
-                    File.GetAttributes(child).HasFlag(FileAttributes.ReparsePoint))
-                    continue;
-                var instruction = Path.Combine(child, "AGENTS.md");
-                if (File.Exists(instruction))
-                    found.Add(instruction);
-                Walk(child, found, generatedDirectories);
-            }
-        }
     }
 
     private static void ValidateTool(string cwd, string version)

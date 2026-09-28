@@ -164,6 +164,102 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
+    public void Init_places_pointers_at_git_root_and_selected_solution_roots_only()
+    {
+        using var fixture = new Fixture();
+        fixture.Scope("backend/Api/src");
+        File.Delete(fixture.Path("backend", "Api", "src", ".config", "dotnet-tools.json"));
+        fixture.EnterRoot();
+        fixture.Write("backend/Domain/tests/Tests.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+        fixture.Write("backend/Domain/tests/obj/project.assets.json",
+            File.ReadAllText(fixture.Path("backend", "Api", "src", "obj", "project.assets.json")));
+        fixture.Write("backend/Workspace.slnx", """
+            <Solution>
+              <Project Path="Api/src/App.csproj" />
+              <Project Path="Domain/tests/Tests.csproj" />
+            </Solution>
+            """);
+
+        fixture.Run("init", "backend/Workspace.slnx").Should().Be(0, fixture.LastOutput);
+        File.ReadAllText(fixture.Path("AGENTS.md")).Should().Contain(".agentdocs/README.md");
+        File.ReadAllText(fixture.Path("backend", "AGENTS.md")).Should().Contain("../.agentdocs/README.md");
+        File.Exists(fixture.Path("backend", "Api", "src", "AGENTS.md")).Should().BeFalse();
+        File.Exists(fixture.Path("backend", "Domain", "tests", "AGENTS.md")).Should().BeFalse();
+        File.ReadAllText(fixture.Path(".github", "copilot-instructions.md"))
+            .Should().Contain(".agentdocs/README.md");
+        fixture.Run("check").Should().Be(0);
+    }
+
+    [Fact]
+    public void Init_places_one_pointer_in_each_selected_entry_directory()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("backend/Api/App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+        fixture.Write("backend/Api/obj/project.assets.json",
+            File.ReadAllText(fixture.Path("obj", "project.assets.json")));
+        fixture.Write("backend/App.slnx", "<Solution><Project Path=\"Api/App.csproj\" /></Solution>");
+        fixture.Write("tools/Tool.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+        fixture.Write("tools/obj/project.assets.json",
+            File.ReadAllText(fixture.Path("obj", "project.assets.json")));
+        fixture.Write("tools/Tools.slnx", "<Solution><Project Path=\"Tool.csproj\" /></Solution>");
+
+        fixture.Run("init", "App.csproj", "backend/App.slnx", "tools/Tools.slnx")
+            .Should().Be(0, fixture.LastOutput);
+        File.ReadAllText(fixture.Path("AGENTS.md")).Should().Contain(".agentdocs/README.md");
+        File.ReadAllText(fixture.Path("backend", "AGENTS.md")).Should().Contain("../.agentdocs/README.md");
+        File.ReadAllText(fixture.Path("tools", "AGENTS.md")).Should().Contain("../.agentdocs/README.md");
+        File.Exists(fixture.Path("backend", "Api", "AGENTS.md")).Should().BeFalse();
+        using var manifest = JsonDocument.Parse(File.ReadAllText(fixture.Path(".agentdocs", "agent-context.json")));
+        manifest.RootElement.GetProperty("InstructionEntries").GetArrayLength().Should().Be(4);
+        fixture.Run("check").Should().Be(0);
+    }
+
+    [Fact]
+    public void Init_places_solution_pointer_even_when_projects_are_in_sibling_directories()
+    {
+        using var fixture = new Fixture();
+        fixture.Scope("service");
+        File.Delete(fixture.Path("service", ".config", "dotnet-tools.json"));
+        fixture.EnterRoot();
+        fixture.Write("backend/App.slnx", "<Solution><Project Path=\"../service/App.csproj\" /></Solution>");
+
+        fixture.Run("init", "backend/App.slnx").Should().Be(0, fixture.LastOutput);
+        File.ReadAllText(fixture.Path("backend", "AGENTS.md")).Should().Contain("../.agentdocs/README.md");
+        File.Exists(fixture.Path("service", "AGENTS.md")).Should().BeFalse();
+        fixture.Run("check").Should().Be(0);
+    }
+
+    [Fact]
+    public void Init_rejects_solution_in_nested_worktree_with_project_outside_it()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("nested/.git", "gitdir: elsewhere");
+        fixture.Write("nested/App.slnx", "<Solution><Project Path=\"../App.csproj\" /></Solution>");
+
+        fixture.Run("init", "nested/App.slnx").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Git working tree boundary");
+        File.Exists(fixture.Path("nested", "AGENTS.md")).Should().BeFalse();
+        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Init_rejects_solution_in_nested_tool_scope_with_project_outside_it()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("nested/.config/dotnet-tools.json",
+            File.ReadAllText(fixture.Path(".config", "dotnet-tools.json")));
+        fixture.Write("nested/App.slnx", "<Solution><Project Path=\"../App.csproj\" /></Solution>");
+
+        fixture.Run("init", "nested/App.slnx").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("nested tool manifest");
+        File.Exists(fixture.Path("nested", "AGENTS.md")).Should().BeFalse();
+        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
+    }
+
+    [Fact]
     public void Remove_preserves_existing_empty_Visual_Studio_instruction_file()
     {
         using var fixture = new Fixture();
@@ -485,7 +581,7 @@ public sealed class AgentDocsTests
         File.ReadAllText(fixture.Path(".github", "AGENTS.md")).Should().Be("untouched");
         File.ReadAllBytes(fixture.Path(".github", "legacy.md")).Should().Equal([0xFF, 0xFE, 0x00]);
         File.ReadAllText(fixture.Path("src", "Features", "AGENTS.md"))
-            .Should().Contain("agentdocs:start");
+            .Should().Be("# Feature\n");
         fixture.Run("remove").Should().Be(0);
         File.ReadAllText(fixture.Path("src", "Features", "AGENTS.md")).Should().Be("# Feature\n");
     }
@@ -515,7 +611,7 @@ public sealed class AgentDocsTests
             File.ReadAllText(fixture.Path(directory, "AGENTS.md")).Should().Be("# Generated\n",
                 "evaluated output directory {0} must be excluded", directory);
         File.ReadAllText(fixture.Path("src", "Features", "AGENTS.md"))
-            .Should().Contain("agentdocs:start");
+            .Should().Be("# Source\n");
         fixture.Run("check").Should().Be(0);
     }
 
@@ -530,13 +626,13 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
-    public void Sync_tracks_added_and_removed_descendant_instruction_boundaries()
+    public void Sync_leaves_added_descendant_instructions_unmanaged()
     {
         using var fixture = new Fixture();
         fixture.Run("init", "App.csproj").Should().Be(0);
         fixture.Write("src/Features/AGENTS.md", "# Feature\n");
         fixture.Run("sync").Should().Be(0);
-        File.ReadAllText(fixture.Path("src", "Features", "AGENTS.md")).Should().Contain("agentdocs:start");
+        File.ReadAllText(fixture.Path("src", "Features", "AGENTS.md")).Should().Be("# Feature\n");
         File.Delete(fixture.Path("src", "Features", "AGENTS.md"));
         fixture.Run("sync").Should().Be(0);
         using var manifest = JsonDocument.Parse(File.ReadAllText(fixture.Path(".agentdocs", "agent-context.json")));
@@ -554,10 +650,10 @@ public sealed class AgentDocsTests
         fixture.Write("shared/AGENTS.md", "# Shared\n");
         fixture.Write("shared/Linked.cs", "class Linked {}");
         fixture.Run("init", "--source-root", "shared", "service/App.csproj").Should().Be(0);
-        File.ReadAllText(fixture.Path("shared", "AGENTS.md")).Should().Contain("agentdocs:start");
+        File.ReadAllText(fixture.Path("shared", "AGENTS.md")).Should().Be("# Shared\n");
         fixture.Write("shared/Feature/AGENTS.md", "# Feature\n");
         fixture.Run("sync").Should().Be(0);
-        File.ReadAllText(fixture.Path("shared", "Feature", "AGENTS.md")).Should().Contain("agentdocs:start");
+        File.ReadAllText(fixture.Path("shared", "Feature", "AGENTS.md")).Should().Be("# Feature\n");
         fixture.Run("check").Should().Be(0);
         fixture.Run("remove").Should().Be(0);
         File.ReadAllText(fixture.Path("shared", "AGENTS.md")).Should().Be("# Shared\n");
