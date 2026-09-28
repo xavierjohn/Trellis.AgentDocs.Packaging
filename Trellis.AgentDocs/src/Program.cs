@@ -15,6 +15,16 @@ public static class Program
     public static int Main(string[] args) => AgentDocsCommand.Run(args, Console.Error, GuidanceReader.Discover);
 }
 
+internal enum AgentDocsVerb { Init, Sync, Check, Remove, Refresh }
+
+internal sealed record AgentDocsRequest(AgentDocsVerb Verb, bool DryRun, bool Force, bool Restore,
+    IReadOnlyList<string> SourceRoots, IReadOnlyList<string> EntryPoints);
+
+/// <summary>Declares which options and entry points a verb accepts, so an invalid combination for a
+/// given verb is rejected by construction rather than by a hand-maintained combinatorial check.</summary>
+internal readonly record struct VerbOptions(bool SourceRoot, bool DryRun, bool Force, bool Restore,
+    bool EntryPoints, bool RequireEntryPoints);
+
 internal sealed record Source(string Package, string PackageVersion, string PackagePath, string Sha256);
 internal sealed record OwnedFile(string Path, string CanonicalSha256, Source[] Sources);
 internal sealed record InstructionEntry(string InstructionFile, string CanonicalSha256, bool ExistedBefore = false);
@@ -46,7 +56,7 @@ public static partial class AgentDocsCommand
         ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
     private static readonly StringComparison PhysicalComparison = OperatingSystem.IsWindows()
         ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-    private static readonly string[] ExcludedSourceDirectories = [".trellis", ".agentdocs", ".github", ".git", "bin", "obj"];
+    private static readonly string[] ExcludedSourceDirectories = [".agentdocs", ".github", ".git", "bin", "obj"];
 
     /// <summary>Runs a command using a read-only package-guidance discovery adapter.</summary>
     public static int Run(string[] args, TextWriter output, Func<IEnumerable<string>, GuidanceDiscovery> discover)
@@ -65,87 +75,124 @@ public static partial class AgentDocsCommand
 
     private static int Execute(string[] args, TextWriter output, Func<IEnumerable<string>, GuidanceDiscovery> discover)
     {
-        if (args.Length < 1 || args[0] is not ("init" or "sync" or "check" or "remove" or "refresh"))
+        if (args.Length < 1 || !TryParseVerb(args[0], out var verb))
         {
             output.WriteLine("Usage: agentdocs init|sync|check|remove|refresh [--source-root DIR] [--dry-run] [--force] [--restore] [PROJECT|SOLUTION]");
             output.WriteLine("Avoid external edits to affected files during mutation; an edit after the final snapshot check may be lost.");
             return 2;
         }
 
-        var verb = args[0];
+        return Execute(ParseOptions(verb, args), output, discover);
+    }
+
+    private static bool TryParseVerb(string value, out AgentDocsVerb verb)
+    {
+        switch (value)
+        {
+            case "init": verb = AgentDocsVerb.Init; return true;
+            case "sync": verb = AgentDocsVerb.Sync; return true;
+            case "check": verb = AgentDocsVerb.Check; return true;
+            case "remove": verb = AgentDocsVerb.Remove; return true;
+            case "refresh": verb = AgentDocsVerb.Refresh; return true;
+            default: verb = default; return false;
+        }
+    }
+
+    /// <summary>Which options and entry points each verb accepts. An option or entry point outside this
+    /// set is rejected as unknown for that verb, so illegal combinations never need a separate check.</summary>
+    private static VerbOptions AllowedOptions(AgentDocsVerb verb) => verb switch
+    {
+        AgentDocsVerb.Init => new VerbOptions(SourceRoot: true, DryRun: true, Force: true, Restore: true,
+            EntryPoints: true, RequireEntryPoints: true),
+        AgentDocsVerb.Sync => new VerbOptions(SourceRoot: false, DryRun: true, Force: true, Restore: true,
+            EntryPoints: false, RequireEntryPoints: false),
+        AgentDocsVerb.Remove => new VerbOptions(SourceRoot: false, DryRun: true, Force: true, Restore: false,
+            EntryPoints: false, RequireEntryPoints: false),
+        AgentDocsVerb.Check or AgentDocsVerb.Refresh => new VerbOptions(SourceRoot: false, DryRun: false,
+            Force: false, Restore: false, EntryPoints: false, RequireEntryPoints: false),
+        _ => throw new ArgumentOutOfRangeException(nameof(verb))
+    };
+
+    private static AgentDocsRequest ParseOptions(AgentDocsVerb verb, string[] args)
+    {
+        var allowed = AllowedOptions(verb);
         var dryRun = false;
         var force = false;
         var restore = false;
+        var sourceRoots = new List<string>();
         var entryPoints = new List<string>();
-        var sourceRootArgs = new List<string>();
         for (var i = 1; i < args.Length; i++)
         {
             switch (args[i])
             {
-                case "--source-root":
+                case "--source-root" when allowed.SourceRoot:
                     if (++i == args.Length) throw new ArgumentException("--source-root requires a directory.");
-                    sourceRootArgs.Add(args[i]);
+                    sourceRoots.Add(args[i]);
                     break;
-                case "--dry-run": dryRun = true; break;
-                case "--force": force = true; break;
-                case "--restore": restore = true; break;
+                case "--dry-run" when allowed.DryRun: dryRun = true; break;
+                case "--force" when allowed.Force: force = true; break;
+                case "--restore" when allowed.Restore: restore = true; break;
                 default:
                     if (args[i].StartsWith('-'))
-                        throw new ArgumentException($"Unknown option '{args[i]}'.");
+                        throw new ArgumentException($"Unknown option '{args[i]}' for '{args[0]}'.");
+                    if (!allowed.EntryPoints)
+                        throw new ArgumentException($"'{args[0]}' does not accept a project or solution argument.");
                     entryPoints.Add(args[i]);
                     break;
             }
         }
 
-        if (((verb is "check" or "refresh") && (dryRun || force || restore)) ||
-            (verb == "remove" && restore) || (dryRun && restore) ||
-            (verb != "init" && sourceRootArgs.Count != 0) ||
-            (verb != "init" && entryPoints.Count != 0))
-            throw new ArgumentException("Invalid options or entry points for this verb.");
-        if (verb == "init" && entryPoints.Count == 0)
-            throw new ArgumentException("init requires an explicit project or solution.");
+        if (dryRun && restore)
+            throw new ArgumentException("--dry-run cannot be combined with --restore.");
+        if (allowed.RequireEntryPoints && entryPoints.Count == 0)
+            throw new ArgumentException($"{args[0]} requires an explicit project or solution.");
+
+        return new AgentDocsRequest(verb, dryRun, force, restore, sourceRoots, entryPoints);
+    }
+
+    private static int Execute(AgentDocsRequest request, TextWriter output, Func<IEnumerable<string>, GuidanceDiscovery> discover)
+    {
         var cwd = Path.GetFullPath(Environment.CurrentDirectory);
         var root = GitRoot(cwd);
         RejectExcluded(root, cwd);
-        var scope = root;
-        RejectExcluded(root, scope);
-        EnsureDirectoriesSafe(root, scope);
+        EnsureDirectoriesSafe(root, root);
         var manifestPath = Path.Combine(root, ".agentdocs", "agent-context.json");
-        CheckFileDestination(root, scope, manifestPath);
+        CheckFileDestination(root, root, manifestPath);
         var previous = File.Exists(manifestPath) ? LoadState(manifestPath) : null;
-        if (verb != "init" && previous is null)
+        if (request.Verb != AgentDocsVerb.Init && previous is null)
             throw new InvalidOperationException("No initialized context at the Git root.");
 
         var version = ToolVersion();
-        ValidateTool(cwd, scope, version);
-        var selectedEntries = entryPoints.Select(x => CanonicalExistingPath(root, Path.GetFullPath(x, cwd))).ToArray();
-        if (verb == "init" && previous is not null && entryPoints.Count != 0 &&
+        ValidateTool(cwd, version);
+        var selectedEntries = request.EntryPoints.Select(x => CanonicalExistingPath(root, Path.GetFullPath(x, cwd))).ToArray();
+        if (request.Verb == AgentDocsVerb.Init && previous is not null && request.EntryPoints.Count != 0 &&
             !previous.Graph.EntryPoints.Select(x => x.Path).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).SequenceEqual(
-                selectedEntries.Select(x => Rel(scope, x))
+                selectedEntries.Select(x => Rel(root, x))
                     .OrderBy(x => x, StringComparer.OrdinalIgnoreCase), StringComparer.OrdinalIgnoreCase))
             throw new InvalidOperationException("Existing context has different graph entry points; remove it before reinitializing.");
 
-        using var writerLock = verb is "check" || dryRun ? null : Lock(root);
-        var graphEntries = verb == "init" ? selectedEntries
-            : previous?.Graph.EntryPoints.Select(p => Full(scope, p.Path)).ToArray() ?? [];
-        if (restore)
+        using var writerLock = request.Verb == AgentDocsVerb.Check || request.DryRun ? null : Lock(root);
+        var graphEntries = request.Verb == AgentDocsVerb.Init ? selectedEntries
+            : previous?.Graph.EntryPoints.Select(p => Full(root, p.Path)).ToArray() ?? [];
+        if (request.Restore)
         {
             output.WriteLine("Explicit restore may update obj/, the NuGet cache, and configured lock files.");
             foreach (var entry in graphEntries)
             {
-                CheckDestination(root, scope, entry);
+                CheckDestination(root, root, entry);
                 Restore(entry);
             }
         }
 
-        var explicitRoots = verb == "init" ? sourceRootArgs.Select(p => Rel(scope, Path.GetFullPath(p, cwd))).ToArray()
+        var explicitRoots = request.Verb == AgentDocsVerb.Init
+            ? request.SourceRoots.Select(p => Rel(root, Path.GetFullPath(p, cwd))).ToArray()
             : previous?.ExplicitSourceRoots ?? [];
-        (ContextState State, Dictionary<string, string> Content)? discovery = verb == "remove" ? null : BuildState(root, scope,
+        (ContextState State, Dictionary<string, string> Content)? discovery = request.Verb == AgentDocsVerb.Remove ? null : BuildState(root,
             graphEntries, explicitRoots, version, previous, discover, output);
-        var changes = Plan(root, scope, previous, discovery?.State, discovery?.Content, manifestPath, force);
+        var changes = Plan(root, previous, discovery?.State, discovery?.Content, manifestPath, request.Force);
         foreach (var change in changes)
-            output.WriteLine($"{(dryRun ? "Would " : "")}{change.Description}: {Rel(root, change.Path)}");
-        if (verb == "check")
+            output.WriteLine($"{(request.DryRun ? "Would " : "")}{change.Description}: {Rel(root, change.Path)}");
+        if (request.Verb == AgentDocsVerb.Check)
         {
             if (changes.Count == 0)
                 return 0;
@@ -153,7 +200,7 @@ public static partial class AgentDocsCommand
             return 1;
         }
 
-        if (dryRun || changes.Count == 0)
+        if (request.DryRun || changes.Count == 0)
             return 0;
         ProbeAtomic(root, changes.Select(change => change.Path));
         foreach (var change in changes)
@@ -187,7 +234,7 @@ public static partial class AgentDocsCommand
         return 0;
     }
 
-    private static (ContextState State, Dictionary<string, string> Content) BuildState(string root, string scope, string[] entries,
+    private static (ContextState State, Dictionary<string, string> Content) BuildState(string root, string[] entries,
         string[] explicitRoots, string version, ContextState? previous,
         Func<IEnumerable<string>, GuidanceDiscovery> discover, TextWriter output)
     {
@@ -197,14 +244,14 @@ public static partial class AgentDocsCommand
             throw new InvalidOperationException("No selected projects.");
         foreach (var project in projects)
         {
-            CheckDestination(root, scope, project);
+            CheckDestination(root, root, project);
             if (!Portable.Equals(GitRoot(Path.GetDirectoryName(project)!), root))
                 throw new InvalidOperationException($"Selected project crosses a Git working tree boundary: {project}");
             for (var directory = Path.GetDirectoryName(project); directory is not null &&
-                Within(scope, directory) && !Portable.Equals(directory, scope); directory = Path.GetDirectoryName(directory))
+                Within(root, directory) && !Portable.Equals(directory, root); directory = Path.GetDirectoryName(directory))
             {
                 var nestedManifest = Path.Combine(directory, ".config", "dotnet-tools.json");
-                CheckDestination(root, scope, nestedManifest);
+                CheckDestination(root, root, nestedManifest);
                 if (File.Exists(nestedManifest))
                     throw new InvalidOperationException(
                         $"Project has a nested tool manifest at {nestedManifest}; use the Git-root tool manifest instead.");
@@ -213,7 +260,7 @@ public static partial class AgentDocsCommand
 
         var assets = projects.Select(p => AssetPath(p)).ToArray();
         foreach (var asset in assets)
-            CheckDestination(root, scope, asset);
+            CheckDestination(root, root, asset);
         var guidance = discover(assets);
         var incompatibilities = new List<string>();
         if (!guidance.IsSuccessful)
@@ -242,20 +289,20 @@ public static partial class AgentDocsCommand
 
         foreach (var sourceRoot in explicitRoots)
         {
-            var directory = Full(scope, sourceRoot);
-            CheckDestination(root, scope, directory);
+            var directory = Full(root, sourceRoot);
+            CheckDestination(root, root, directory);
             if (sourceRoot.Split('/').Any(p => ExcludedSourceDirectories.Contains(p, Portable)) ||
                 !Directory.Exists(directory) || !Portable.Equals(GitRoot(directory), root))
                 throw new InvalidOperationException($"Invalid explicit source root: {sourceRoot}");
         }
 
-        var roots = projects.Select(p => Rel(scope, Path.GetDirectoryName(p)!)).Concat(explicitRoots)
+        var roots = projects.Select(p => Rel(root, Path.GetDirectoryName(p)!)).Concat(explicitRoots)
             .Distinct(Portable).OrderBy(p => p, StringComparer.Ordinal).ToArray();
         var generatedDirectories = GeneratedDirectories(projects);
         foreach (var source in roots)
-            if (generatedDirectories.Any(directory => Within(directory, Full(scope, source))))
+            if (generatedDirectories.Any(directory => Within(directory, Full(root, source))))
                 throw new InvalidOperationException($"Source root is inside an evaluated generated directory: {source}");
-        var instructionFiles = InstructionFiles(root, scope, roots, generatedDirectories).ToArray();
+        var instructionFiles = InstructionFiles(root, roots, generatedDirectories).ToArray();
         var mapped = new Dictionary<string, (string Text, List<Source> Sources)>(Portable);
         var entryPoints = new HashSet<string>(Portable);
         foreach (var package in guidance.Packages.Where(p => p.Contribution is not null))
@@ -291,9 +338,9 @@ public static partial class AgentDocsCommand
                 pair.Value.Sources.Distinct().OrderBy(s => s.Package, StringComparer.Ordinal)
                     .ThenBy(s => s.PackagePath, StringComparer.Ordinal).ToArray())).ToArray();
         var content = mapped.ToDictionary(pair => pair.Key, pair => pair.Value.Text, Portable);
-        var graph = BuildGraph(scope, entries, guidance);
+        var graph = BuildGraph(root, entries, guidance);
         var state = new ContextState(2, "utf8-lf-no-bom-v1", version, roots, graph,
-            instructionFiles.Select(p => new InstructionEntry(Rel(root, p), HashText(Entry(scope, p)),
+            instructionFiles.Select(p => new InstructionEntry(Rel(root, p), HashText(Entry(root, p)),
                 previous?.InstructionEntries.SingleOrDefault(e => Portable.Equals(e.InstructionFile, Rel(root, p)))?.ExistedBefore
                 ?? File.Exists(p))).ToArray(),
             RestoreHookFiles(root, projects).Select(p => new InstructionEntry(Rel(root, p), HashText(RestoreHook(p, root)),
@@ -310,12 +357,12 @@ public static partial class AgentDocsCommand
              new OwnedFile("restore.targets", HashText(targets), [])] }, content);
     }
 
-    private static GraphState BuildGraph(string scope, string[] entries, GuidanceDiscovery discovery)
+    private static GraphState BuildGraph(string root, string[] entries, GuidanceDiscovery discovery)
     {
-        var graphEntries = entries.Select(p => new GraphInput(Rel(scope, p), RestoreSpec(p)))
+        var graphEntries = entries.Select(p => new GraphInput(Rel(root, p), RestoreSpec(p)))
             .OrderBy(p => p.Path, StringComparer.Ordinal).ToArray();
         var projects = discovery.Packages.GroupBy(p => new { p.Scope.ProjectPath, p.Scope.TargetFramework, p.Scope.RuntimeIdentifier })
-            .Select(g => new GraphProject(Rel(scope, g.Key.ProjectPath), g.Key.TargetFramework, g.Key.RuntimeIdentifier,
+            .Select(g => new GraphProject(Rel(root, g.Key.ProjectPath), g.Key.TargetFramework, g.Key.RuntimeIdentifier,
                 g.Select(p => new GraphPackage(p.PackageId, p.Version, p.NuGetContentHash))
                     .Distinct().OrderBy(p => p.Id, StringComparer.Ordinal).ToArray()))
             .OrderBy(p => p.Project, StringComparer.Ordinal).ThenBy(p => p.Framework, StringComparer.Ordinal).ToArray();
@@ -576,7 +623,7 @@ public static partial class AgentDocsCommand
                 $"Stale assets for {entry} ({framework}): ProjectReference changed; run dotnet restore.");
     }
 
-    private static List<Change> Plan(string root, string scope, ContextState? old, ContextState? next,
+    private static List<Change> Plan(string root, ContextState? old, ContextState? next,
         Dictionary<string, string>? content,
         string manifestPath, bool force)
     {
@@ -587,7 +634,7 @@ public static partial class AgentDocsCommand
         {
             ValidateRelative(file);
             var destination = Full(Path.Combine(root, ".agentdocs"), file);
-            CheckFileDestination(root, scope, destination);
+            CheckFileDestination(root, root, destination);
             var before = File.Exists(destination) ? File.ReadAllBytes(destination) : null;
             var owned = previousFiles.SingleOrDefault(f => Portable.Equals(f.Path, file));
             var expected = desiredFiles.SingleOrDefault(f => Portable.Equals(f.Path, file));
@@ -611,23 +658,22 @@ public static partial class AgentDocsCommand
                 throw new InvalidOperationException("Excluded instruction path: " + file);
             var path = Full(root, file);
             if ((old?.InstructionEntries.Any(e => Portable.Equals(e.InstructionFile, file)) == true &&
-                 !GovernsSource(root, scope, old.SourceRoots, path)) ||
+                 !GovernsSource(root, old.SourceRoots, path)) ||
                 (next?.InstructionEntries.Any(e => Portable.Equals(e.InstructionFile, file)) == true &&
-                 !GovernsSource(root, scope, next.SourceRoots, path)))
+                 !GovernsSource(root, next.SourceRoots, path)))
                 throw new InvalidOperationException($"Instruction path does not govern recorded source: {file}");
             CheckFileDestination(root, root, path);
             var before = File.Exists(path) ? File.ReadAllBytes(path) : null;
             var original = before is null ? "" : DecodeInstruction(before);
             var owned = old?.InstructionEntries.SingleOrDefault(e => Portable.Equals(e.InstructionFile, file));
             var target = next?.InstructionEntries.SingleOrDefault(e => Portable.Equals(e.InstructionFile, file));
-            var updated = Merge(original, scope, path, owned, target is not null, force);
+            var updated = Merge(original, root, path, owned, target is not null, force);
             byte[]? after = updated is null ? null : before is null ? Bom.GetPreamble().Concat(Encoding.UTF8.GetBytes(updated)).ToArray()
                 : EncodeInstruction(updated, before);
-            Add(changes, path, before, after,
-                (target is null ? "Remove pointer " : "Update pointer ") + ScopeKey(scope));
+            Add(changes, path, before, after, target is null ? "Remove pointer" : "Update pointer");
         }
 
-        CheckFileDestination(root, scope, manifestPath);
+        CheckFileDestination(root, root, manifestPath);
         var priorManifest = File.Exists(manifestPath) ? File.ReadAllBytes(manifestPath) : null;
         var newManifest = next is null ? null : Bom.GetPreamble().Concat(Encoding.UTF8.GetBytes(
             JsonSerializer.Serialize(next, Json) + "\n")).ToArray();
@@ -635,7 +681,7 @@ public static partial class AgentDocsCommand
         return changes;
     }
 
-    private static bool GovernsSource(string root, string scope, string[] sources, string instruction)
+    private static bool GovernsSource(string root, string[] sources, string instruction)
     {
         if (Physical.Equals(instruction, Path.Combine(root, ".github", "copilot-instructions.md")))
             return sources.Length != 0;
@@ -644,7 +690,7 @@ public static partial class AgentDocsCommand
         var directory = Path.GetDirectoryName(instruction)!;
         return sources.Any(source =>
         {
-            var selected = Full(scope, source);
+            var selected = Full(root, source);
             return Within(root, selected) && (Within(directory, selected) || Within(selected, directory));
         });
     }
@@ -669,7 +715,7 @@ public static partial class AgentDocsCommand
         .Replace("\r", " ").Replace("\n", " ").Replace("[", "\\[").Replace("]", "\\]")
         .Replace("`", "\\`").Replace("*", "\\*").Replace("_", "\\_");
 
-    private static string? Merge(string content, string scope, string file, InstructionEntry? owned, bool include, bool force)
+    private static string? Merge(string content, string root, string file, InstructionEntry? owned, bool include, bool force)
     {
         var first = content.IndexOf(Start, StringComparison.Ordinal);
         var last = content.IndexOf(End, StringComparison.Ordinal);
@@ -677,8 +723,7 @@ public static partial class AgentDocsCommand
             (content.IndexOf(Start, first + Start.Length, StringComparison.Ordinal) >= 0 ||
              content.IndexOf(End, last + End.Length, StringComparison.Ordinal) >= 0 || last < first)))
             throw new InvalidOperationException($"Incomplete or duplicate marker in {file}.");
-        var key = ScopeKey(scope);
-        var replacement = Entry(scope, file);
+        var replacement = Entry(root, file);
         var nl = content.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
         if (first < 0)
         {
@@ -686,45 +731,20 @@ public static partial class AgentDocsCommand
                 throw new InvalidOperationException($"Owned pointer block missing from {file}; review --force.");
             if (!include)
                 return content.Length == 0 ? null : content;
-            var block = Start + "\n## Installed package guidance\n\n" + replacement + End + "\n\n";
+            var block = Start + "\n" + replacement + End + "\n\n";
             var pos = InsertionPoint(content);
             if (pos > 0 && content[pos - 1] != '\n')
                 block = "\n" + block;
             return content.Insert(pos, block.Replace("\n", nl));
         }
 
-        var blockText = content[(first + Start.Length)..last];
-        var keys = new HashSet<string>(StringComparer.Ordinal);
-        const string keyPrefix = "<!-- agentdocs-scope:";
-        for (var cursor = blockText.IndexOf(keyPrefix, StringComparison.Ordinal);
-            cursor >= 0; cursor = blockText.IndexOf(keyPrefix, cursor + keyPrefix.Length, StringComparison.Ordinal))
-        {
-            var closing = blockText.IndexOf(" -->", cursor + keyPrefix.Length, StringComparison.Ordinal);
-            var token = closing < 0 ? "" : blockText[cursor..(closing + 4)];
-            if (token.Length != keyPrefix.Length + 16 + 4 ||
-                !token.AsSpan(keyPrefix.Length, 16).ToString().All(c => c is (>= '0' and <= '9') or (>= 'a' and <= 'f')) ||
-                !keys.Add(token))
-                throw new InvalidOperationException($"Malformed or duplicate scoped pointer in {file}.");
-        }
-
-        var entryStart = blockText.IndexOf(key, StringComparison.Ordinal);
-        if (entryStart >= 0)
-        {
-            var nextEntry = blockText.IndexOf("<!-- agentdocs-scope:", entryStart + key.Length, StringComparison.Ordinal);
-            var oldEntry = blockText[entryStart..(nextEntry >= 0 ? nextEntry : blockText.Length)].TrimEnd('\r', '\n');
-            if (owned is null && !force)
-                throw new InvalidOperationException($"Unowned pointer entry in {file}; review --force adoption.");
-            if (owned is not null && HashText(oldEntry.Replace("\r\n", "\n") + "\n") != owned.CanonicalSha256 && !force)
-                throw new InvalidOperationException($"Modified pointer entry in {file}; review --force.");
-            if (include && string.Equals(oldEntry.Replace("\r\n", "\n") + "\n", replacement, StringComparison.Ordinal))
-                return content;
-            blockText = blockText[..entryStart] + (nextEntry >= 0 ? blockText[nextEntry..] : "");
-        }
-        else if (owned is not null && !force)
-            throw new InvalidOperationException($"Owned pointer missing from {file}.");
-        if (include)
-            blockText += replacement;
-        if (!blockText.Contains("<!-- agentdocs-scope:", StringComparison.Ordinal))
+        var oldEntry = content[(first + Start.Length)..last].Replace("\r\n", "\n").Trim('\n');
+        oldEntry = oldEntry.Length == 0 ? "" : oldEntry + "\n";
+        if (owned is null && !force)
+            throw new InvalidOperationException($"Unowned pointer block in {file}; review --force adoption.");
+        if (owned is not null && HashText(oldEntry) != owned.CanonicalSha256 && !force)
+            throw new InvalidOperationException($"Modified pointer block in {file}; review --force.");
+        if (!include)
         {
             var suffix = content[(last + End.Length)..];
             if (suffix.StartsWith(nl + nl, StringComparison.Ordinal))
@@ -733,8 +753,9 @@ public static partial class AgentDocsCommand
             return remaining.Length == 0 && owned?.ExistedBefore != true ? null : remaining;
         }
 
-        return content[..(first + Start.Length)] + blockText.Replace("\r\n", "\n").Replace("\n", nl) +
-            content[last..];
+        if (oldEntry == replacement)
+            return content;
+        return content[..(first + Start.Length)] + ("\n" + replacement).Replace("\n", nl) + content[last..];
     }
 
     private static int InsertionPoint(string content)
@@ -785,15 +806,14 @@ public static partial class AgentDocsCommand
         return frontmatterEnd;
     }
 
-    private static string Entry(string scope, string file)
+    private static string Entry(string root, string file)
     {
-        var key = ScopeKey(scope);
-        var path = Path.GetRelativePath(Path.GetDirectoryName(file)!, Path.Combine(scope, ".agentdocs", "README.md"))
+        var path = Path.GetRelativePath(Path.GetDirectoryName(file)!, Path.Combine(root, ".agentdocs", "README.md"))
             .Replace('\\', '/');
         var line = file.EndsWith(VisualStudioInstructions.Replace('/', Path.DirectorySeparatorChar), PhysicalComparison)
             ? $"For this repository, read `{path}` before using package APIs."
-            : $"For files under `{Path.GetRelativePath(Path.GetDirectoryName(file)!, scope).Replace('\\', '/')}/`, read `{path}`.";
-        return key + "\n" + line + "\n";
+            : $"For files under `{Path.GetRelativePath(Path.GetDirectoryName(file)!, root).Replace('\\', '/')}/`, read `{path}`.";
+        return line + "\n";
     }
 
     private static string DecodeInstruction(byte[] bytes)
@@ -824,8 +844,6 @@ public static partial class AgentDocsCommand
         typeof(Program).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>()
             .SingleOrDefault(attribute => attribute.Key == "AgentDocsToolPackageVersion")?.Value ??
         throw new InvalidOperationException("The running tool has no stamped NuGet package version.");
-    private static string ScopeKey(string scope) => "<!-- agentdocs-scope:" +
-        HashText(Rel(GitRoot(scope), scope))[..16] + " -->";
     private static string Canonical(byte[] bytes) => Strict.GetString(bytes.AsSpan(bytes.AsSpan().StartsWith(UTF8Encoding.UTF8.GetPreamble()) ? 3 : 0))
         .Replace("\r\n", "\n").Replace('\r', '\n');
     private static string SafeComponent(string part)
@@ -953,7 +971,7 @@ public static partial class AgentDocsCommand
         return generated;
     }
 
-    private static IEnumerable<string> InstructionFiles(string root, string scope, string[] sourceRoots,
+    private static IEnumerable<string> InstructionFiles(string root, string[] sourceRoots,
         HashSet<string> generatedDirectories)
     {
         var files = new HashSet<string>(Portable)
@@ -963,8 +981,8 @@ public static partial class AgentDocsCommand
         };
         foreach (var source in sourceRoots)
         {
-            var directory = Full(scope, source);
-            Inside(scope, directory);
+            var directory = Full(root, source);
+            Inside(root, directory);
             if (!Physical.Equals(directory, root))
                 files.Add(Path.Combine(directory, "AGENTS.md"));
             for (var parent = directory; parent is not null && Within(root, parent); parent = Path.GetDirectoryName(parent))
@@ -991,7 +1009,6 @@ public static partial class AgentDocsCommand
                 var name = Path.GetFileName(child);
                 if (generatedDirectories.Any(directory => Within(directory, child)) ||
                     name.Equals(".git", StringComparison.OrdinalIgnoreCase) ||
-                    name.Equals(".trellis", StringComparison.OrdinalIgnoreCase) ||
                     name.Equals(".agentdocs", StringComparison.OrdinalIgnoreCase) ||
                     name.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
                     name.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
@@ -1007,7 +1024,7 @@ public static partial class AgentDocsCommand
         }
     }
 
-    private static void ValidateTool(string cwd, string scope, string version)
+    private static void ValidateTool(string cwd, string version)
     {
         string? selected = null;
         var root = GitRoot(cwd);
@@ -1030,9 +1047,9 @@ public static partial class AgentDocsCommand
                 break;
         }
 
-        var expected = Path.Combine(scope, ".config", "dotnet-tools.json");
+        var expected = Path.Combine(root, ".config", "dotnet-tools.json");
         if (!string.Equals(selected, expected, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"Use the pinned agentdocs tool at Git root '{scope}': {expected}.");
+            throw new InvalidOperationException($"Use the pinned agentdocs tool at Git root '{root}': {expected}.");
         using var manifest = JsonDocument.Parse(File.ReadAllText(expected));
         if (!manifest.RootElement.TryGetProperty("isRoot", out var flag) || flag.ValueKind != JsonValueKind.True ||
             !manifest.RootElement.TryGetProperty("tools", out var declared))
