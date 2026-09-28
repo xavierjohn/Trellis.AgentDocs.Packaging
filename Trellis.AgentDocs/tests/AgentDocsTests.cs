@@ -811,6 +811,48 @@ public sealed class AgentDocsTests
         fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md");
         fixture.AddPackage("Other.Publisher", "package-three", "guide/README.md", "3.0.0");
         fixture.Run("init", "App.csproj").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Mixed versions of Other.Publisher");
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Init_allows_mixed_versions_of_packages_without_guidance()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("Other/Other.csproj", File.ReadAllText(fixture.Path("App.csproj")));
+        fixture.Write("Other/obj/project.assets.json", File.ReadAllText(fixture.Path("obj", "project.assets.json")));
+        fixture.Write("Apps.slnx", """
+            <Solution>
+              <Project Path="App.csproj" />
+              <Project Path="Other/Other.csproj" />
+            </Solution>
+            """);
+        fixture.AddWithoutManifest("Azure.Core", "package-two", "1.53.0");
+        fixture.AddWithoutManifest("Azure.Core", "package-three", "1.62.0",
+            new GuidanceScope(fixture.Path("Other", "obj", "project.assets.json"),
+                fixture.Path("Other", "Other.csproj"), "net10.0", null));
+
+        fixture.Run("init", "Apps.slnx").Should().Be(0, fixture.LastOutput);
+        using var state = JsonDocument.Parse(File.ReadAllText(fixture.Path(".agentdocs", "agent-context.json")));
+        var projects = state.RootElement.GetProperty("Graph").GetProperty("Projects").EnumerateArray().ToArray();
+        projects.Should().HaveCount(2);
+        foreach (var (project, version) in new[] { ("App.csproj", "1.53.0"), ("Other/Other.csproj", "1.62.0") })
+            projects.Single(p => p.GetProperty("Project").GetString() == project)
+                .GetProperty("Packages").EnumerateArray().Single(p => p.GetProperty("Id").GetString() == "Azure.Core")
+                .GetProperty("Version").GetString().Should().Be(version);
+        fixture.Run("check").Should().Be(0);
+    }
+
+    [Fact]
+    public void Init_rejects_mixed_versions_when_only_one_publishes_guidance()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("package-two/guide/README.md", "# Other\n");
+        fixture.AddWithoutManifest("Other.Publisher", "package-three", "3.0.0");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md");
+
+        fixture.Run("init", "App.csproj").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Mixed versions of Other.Publisher");
         File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
     }
 
@@ -1284,13 +1326,13 @@ public sealed class AgentDocsTests
                 id, version, Path(root), GuidanceStatus.Valid, guidance, null));
         }
 
-        public void AddWithoutManifest(string id, string root)
+        public void AddWithoutManifest(string id, string root, string version = "1.0.0", GuidanceScope? scope = null)
         {
             Directory.CreateDirectory(Path(root));
-            _extraPackages.Add(new GuidancePackage(new GuidanceScope(
+            _extraPackages.Add(new GuidancePackage(scope ?? new GuidanceScope(
                 Path(_assets.Replace('/', System.IO.Path.DirectorySeparatorChar)),
                 Path(_project.Replace('/', System.IO.Path.DirectorySeparatorChar)), "net10.0", null),
-                id, "1.0.0", Path(root), GuidanceStatus.NoManifest, null, null));
+                id, version, Path(root), GuidanceStatus.NoManifest, null, null));
         }
 
         public void RemovePackage(string id) => _extraPackages.RemoveAll(p => p.PackageId == id);

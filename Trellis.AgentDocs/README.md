@@ -67,8 +67,9 @@ preview. The tool refuses unowned destinations and concurrent edits;
 `--force` is available only for a reviewed adoption or repair. A project
 restore and a solution restore have different MSBuild entry points, so the
 opt-in installs both hooks. The current context selects one graph per Git
-repository; mixed resolved versions of one package across its selected
-projects are rejected rather than silently mixing guides.
+repository; mixed resolved versions of a package that publishes guidance across
+its selected projects are rejected rather than silently mixing guides. Packages
+without guidance may resolve to different versions across those projects.
 
 The manifest format is an **experimental convention**, not a NuGet standard.
 An agent needs the repository pointers (or explicit direction from its user)
