@@ -672,17 +672,17 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
-    public void Check_rejects_duplicate_scope_key_inside_managed_block()
+    public void Check_rejects_modified_managed_block_but_force_resolves_it()
     {
         using var fixture = new Fixture();
         fixture.Run("init", "App.csproj").Should().Be(0);
         var file = fixture.Path("AGENTS.md");
         var text = File.ReadAllText(file);
-        var start = text.IndexOf("<!-- agentdocs-scope:", StringComparison.Ordinal);
         var end = text.IndexOf("<!-- agentdocs:end -->", StringComparison.Ordinal);
-        File.WriteAllText(file, text.Insert(end, text[start..end]), new UTF8Encoding(true));
+        File.WriteAllText(file, text.Insert(end, "tampered line\n"), new UTF8Encoding(true));
         fixture.Run("check").Should().NotBe(0);
-        fixture.Run("sync", "--force").Should().NotBe(0);
+        fixture.Run("sync", "--force").Should().Be(0);
+        File.ReadAllText(file).Should().NotContain("tampered line");
     }
 
     [Fact]
