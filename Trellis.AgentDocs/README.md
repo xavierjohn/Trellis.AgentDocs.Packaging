@@ -29,8 +29,12 @@ NuGet dependency: `init` is the explicit consent to manage repository files.
 
 `init` creates Git-root `.agentdocs\README.md` as an index and installs guides
 under `.agentdocs\packages\<package-id>\<declared-path>`. It adds small managed
-blocks to root and applicable nested `AGENTS.md` files and Git-root
-`.github\copilot-instructions.md`, preserving customer-authored instructions.
+blocks to Git-root `AGENTS.md`, one `AGENTS.md` in each selected solution
+directory (or project directory for a project-only entry point), and Git-root
+`.github\copilot-instructions.md`. When an entry is at the Git root, its
+pointer is deduplicated. Project `src` and `tests` directories and additional
+source roots do not get new pointers. Customer-authored instructions in the
+selected pointer files are preserved.
 Visual Studio Copilot must have custom instructions enabled to use that pointer.
 Review the generated content and commit the tool manifest, pointers, context,
 and restore opt-in files if the team wants them shared.
