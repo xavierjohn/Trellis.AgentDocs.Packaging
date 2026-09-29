@@ -11,7 +11,7 @@ public sealed class GuidanceReaderTests
     [InlineData("valid", GuidanceStatus.Valid)]
     [InlineData("metadata-only", GuidanceStatus.Valid)]
     [InlineData("unsupported", GuidanceStatus.UnsupportedSchema)]
-    [InlineData("invalid-entrypoint", GuidanceStatus.InvalidManifest)]
+    [InlineData("legacy-entrypoints", GuidanceStatus.InvalidManifest)]
     [InlineData("invalid-alias", GuidanceStatus.InvalidManifest)]
     [InlineData("invalid-traversal", GuidanceStatus.InvalidManifest)]
     [InlineData("invalid-hash", GuidanceStatus.InvalidManifest)]
@@ -26,7 +26,8 @@ public sealed class GuidanceReaderTests
         if (fixture == "valid")
         {
             var contribution = result.Packages.Single().Contribution!;
-            contribution.EntryPoints.Should().ContainSingle().Which.Should().Be("guide/intro.md");
+            contribution.Documents.Single().Usage.Should().Be(GuidanceUsage.Required);
+            contribution.Documents.Single().Description.Should().Be("Read before using this library.");
             contribution.Documents.Single().Sha256.Should().Be(
                 Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(contribution.Documents.Single().LocalPath))).ToLowerInvariant());
             contribution.Documents.Single().Identity.PackageId.Should().Be("Other.Publisher");
@@ -44,7 +45,7 @@ public sealed class GuidanceReaderTests
     public void Discover_Unknown_large_integer_schema_is_unsupported()
     {
         using var graph = new Graph();
-        graph.Package("Other", "1.0.0", manifest: """{"schemaVersion":2147483648,"documents":[],"entryPoints":[]}""");
+        graph.Package("Other", "1.0.0", manifest: """{"schemaVersion":2147483648,"documents":[]}""");
         GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.UnsupportedSchema);
     }
 
@@ -53,12 +54,147 @@ public sealed class GuidanceReaderTests
     {
         using var graph = new Graph();
         graph.Package("Trellis.Core", "8.2.1", manifest:
-            """{"schemaVersion":1,"documents":[],"entryPoints":[],"publisherMetadata":{"org.trellis":{"lockstepCohort":["Trellis.Core","Trellis.Asp"]}}}""");
+            """{"schemaVersion":1,"documents":[],"publisherMetadata":{"org.trellis":{"lockstepCohort":["Trellis.Core","Trellis.Asp"]}}}""");
         var result = GuidanceReader.Discover([graph.Assets]);
         result.IsSuccessful.Should().BeTrue();
         result.Packages.Single().Contribution!.PublisherMetadata["org.trellis"]
             .GetProperty("lockstepCohort").EnumerateArray().Select(p => p.GetString())
             .Should().Equal("Trellis.Core", "Trellis.Asp");
+    }
+
+    [Theory]
+    [InlineData("required", GuidanceUsage.Required)]
+    [InlineData("onDemand", GuidanceUsage.OnDemand)]
+    public void Discover_Listed_documents_carry_usage_and_a_normalized_description(string usage, GuidanceUsage expected)
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        WriteManifest(graph, DocumentJson(graph, usage: usage, description: "  Café rules  "));
+
+        var result = GuidanceReader.Discover([graph.Assets]);
+        result.IsSuccessful.Should().BeTrue();
+        var document = result.Packages.Single().Contribution!.Documents.Single();
+        document.Usage.Should().Be(expected);
+        document.Description.Should().Be("Café rules");
+    }
+
+    [Fact]
+    public void Discover_Supporting_document_needs_no_description_beside_a_listed_one()
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        var path = Path.Combine(graph.Root, "cache", "other", "1.0.0", "guide", "intro.md");
+        File.Copy(path, Path.Combine(Path.GetDirectoryName(path)!, "more.md"));
+        WriteManifest(graph, DocumentJson(graph, usage: "required", description: "Start here.") + "," +
+            DocumentJson(graph, "guide/more.md", "supporting", null));
+
+        var result = GuidanceReader.Discover([graph.Assets]);
+        result.IsSuccessful.Should().BeTrue();
+        result.Packages.Single().Contribution!.Documents.Select(d => d.Usage)
+            .Should().Equal(GuidanceUsage.Required, GuidanceUsage.Supporting);
+        result.Packages.Single().Contribution!.Documents[1].Description.Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData("\"usage\":\"required\"")]
+    [InlineData("\"usage\":\"onDemand\"")]
+    [InlineData("\"usage\":\"always\",\"description\":\"x\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"two\\nlines\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"tab\\there\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"zero\\u200bwidth\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"bidi\\u202eoverride\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"line\\u2028break\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"paragraph\\u2029break\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"next\\u0085line\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"bom\\ufeffhere\"")]
+    [InlineData("\"usage\":\"required\",\"description\":42")]
+    [InlineData("\"description\":\"No usage.\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"ok\",\"role\":\"overview\"")]
+    [InlineData("\"usage\":\"required\",\"description\":\"ok\",\"readFirst\":true")]
+    [InlineData("\"usage\":\"required\",\"description\":\"ok\",\"order\":1")]
+    public void Discover_Invalid_usage_or_description_fails(string fields)
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        var path = Path.Combine(graph.Root, "cache", "other", "1.0.0", "guide", "intro.md");
+        var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant();
+        WriteManifest(graph, "{\"path\":\"guide/intro.md\",\"sha256\":\"" + hash + "\"," + fields + "}");
+
+        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.InvalidManifest);
+    }
+
+    [Theory]
+    [InlineData(200, GuidanceStatus.Valid)]
+    [InlineData(201, GuidanceStatus.InvalidManifest)]
+    public void Discover_Description_length_counts_unicode_scalars_after_normalization(int scalars, GuidanceStatus status)
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        var emoji = string.Concat(Enumerable.Repeat("\U0001F600", scalars));
+        WriteManifest(graph, DocumentJson(graph, usage: "onDemand", description: emoji));
+
+        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(status);
+    }
+
+    [Fact]
+    public void Discover_Only_supporting_documents_have_no_listed_root()
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        WriteManifest(graph, DocumentJson(graph, usage: "supporting", description: null));
+
+        var package = GuidanceReader.Discover([graph.Assets]).Packages.Single();
+        package.Status.Should().Be(GuidanceStatus.InvalidManifest);
+        package.Diagnostic.Should().Contain("required or onDemand");
+    }
+
+    [Fact]
+    public void Discover_Rejects_top_level_entry_points()
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        var path = Path.Combine(graph.Root, "cache", "other", "1.0.0", "guide", "intro.md");
+        var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant();
+        File.WriteAllText(Path.Combine(graph.Root, "cache", "other", "1.0.0", "guidance", "reference-manifest.json"),
+            "{\"schemaVersion\":1,\"documents\":[{\"path\":\"guide/intro.md\",\"sha256\":\"" + hash +
+            "\",\"usage\":\"required\",\"description\":\"x\"}],\"entryPoints\":[\"guide/intro.md\"]}");
+
+        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.InvalidManifest);
+    }
+
+    [Fact]
+    public void Discover_Not_loaded_packages_are_never_parsed_but_report_a_declared_manifest()
+    {
+        using var graph = new Graph();
+        graph.Package("Approved.Package", "1.0.0", "valid");
+        graph.Package("Pending.Package", "2.0.0", manifest: "{this is not json and would fail if parsed");
+        graph.Package("Plain.Package", "3.0.0");
+
+        var result = GuidanceReader.Discover([graph.Assets], id => id == "Approved.Package");
+        result.IsSuccessful.Should().BeTrue();
+        var pending = result.Packages.Single(p => p.PackageId == "Pending.Package");
+        pending.Status.Should().Be(GuidanceStatus.NotLoaded);
+        pending.Contribution.Should().BeNull();
+        pending.Diagnostic.Should().BeNull();
+        pending.ManifestDeclared.Should().BeTrue();
+        result.Packages.Single(p => p.PackageId == "Plain.Package").Status.Should().Be(GuidanceStatus.NotLoaded);
+        result.Packages.Single(p => p.PackageId == "Plain.Package").ManifestDeclared.Should().BeFalse();
+        var approved = result.Packages.Single(p => p.PackageId == "Approved.Package");
+        approved.Status.Should().Be(GuidanceStatus.Valid);
+        approved.ManifestDeclared.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Discover_Not_loaded_package_does_not_hash_its_documents()
+    {
+        using var graph = new Graph();
+        graph.Package("Pending.Package", "1.0.0", "invalid-hash");
+
+        var result = GuidanceReader.Discover([graph.Assets], _ => false);
+        result.IsSuccessful.Should().BeTrue();
+        result.Packages.Single().Status.Should().Be(GuidanceStatus.NotLoaded);
+        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.InvalidManifest);
     }
 
     [Fact]
@@ -92,10 +228,9 @@ public sealed class GuidanceReaderTests
 
     [Theory]
     [InlineData("{not json", GuidanceStatus.InvalidManifest)]
-    [InlineData("{\"schemaVersion\":1,\"documents\":[{\"path\":\"a.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"entryPoints\":[\"a.md\"]}", GuidanceStatus.InvalidManifest)]
-    [InlineData("{\"schemaVersion\":1,\"documents\":[{\"path\":\"a.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"path\":\"A.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"entryPoints\":[\"a.md\"]}", GuidanceStatus.InvalidManifest)]
-    [InlineData("{\"schemaVersion\":1,\"documents\":[{\"path\":\"a.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"entryPoints\":[]}", GuidanceStatus.InvalidManifest)]
-    [InlineData("{\"schemaVersion\":1,\"documents\":[{\"path\":\"a.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"entryPoints\":[\"a.md\"],\"routes\":{\"net10.0\":\"a.md\"}}", GuidanceStatus.InvalidManifest)]
+    [InlineData("{\"schemaVersion\":1,\"documents\":[{\"path\":\"a.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"usage\":\"onDemand\",\"description\":\"x\"}],\"routes\":{\"net10.0\":\"a.md\"}}", GuidanceStatus.InvalidManifest)]
+    [InlineData("{\"schemaVersion\":1,\"documents\":[{\"path\":\"a.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"usage\":\"onDemand\",\"description\":\"x\"},{\"path\":\"A.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"usage\":\"onDemand\",\"description\":\"x\"}]}", GuidanceStatus.InvalidManifest)]
+    [InlineData("{\"schemaVersion\":1}", GuidanceStatus.InvalidManifest)]
     public void Discover_Invalid_manifests_fail(string manifest, GuidanceStatus status)
     {
         using var graph = new Graph();
@@ -154,9 +289,8 @@ public sealed class GuidanceReaderTests
         var manifest = JsonSerializer.Serialize(new
         {
             schemaVersion = 1,
-            documents = new[] { new { path = first, sha256 = new string('a', 64) },
-                new { path = second, sha256 = new string('a', 64) } },
-            entryPoints = new[] { first }
+            documents = new[] { new { path = first, sha256 = new string('a', 64), usage = "onDemand", description = "x" },
+                new { path = second, sha256 = new string('a', 64), usage = "onDemand", description = "x" } }
         });
         graph.Package("Other", "1.0.0", manifest: manifest);
         var outcome = GuidanceReader.Discover([graph.Assets]).Packages.Single();
@@ -243,6 +377,19 @@ public sealed class GuidanceReaderTests
 
         GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.InvalidManifest);
     }
+
+    private static string DocumentJson(Graph graph, string path = "guide/intro.md", string usage = "required",
+        string? description = "Read first.")
+    {
+        var file = Path.Combine(graph.Root, "cache", "other", "1.0.0", path.Replace('/', Path.DirectorySeparatorChar));
+        var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file))).ToLowerInvariant();
+        var json = "{\"path\":\"" + path + "\",\"sha256\":\"" + hash + "\",\"usage\":\"" + usage + "\"";
+        return json + (description is null ? "" : ",\"description\":" + JsonSerializer.Serialize(description)) + "}";
+    }
+
+    private static void WriteManifest(Graph graph, string documentsJson) =>
+        File.WriteAllText(Path.Combine(graph.Root, "cache", "other", "1.0.0", "guidance", "reference-manifest.json"),
+            "{\"schemaVersion\":1,\"documents\":[" + documentsJson + "]}");
 
     private sealed class Graph : IDisposable
     {

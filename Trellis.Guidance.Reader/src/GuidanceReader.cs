@@ -16,7 +16,20 @@ public enum GuidanceStatus
     /// <summary>The manifest, paths, links, or document hashes failed validation.</summary>
     InvalidManifest,
     /// <summary>A required restored package or declared document was not available.</summary>
-    MissingAssets
+    MissingAssets,
+    /// <summary>The caller chose not to read this package's manifest; nothing about it was parsed or verified.</summary>
+    NotLoaded
+}
+
+/// <summary>How the publisher intends a document to be used; the consumer decides whether to honor it.</summary>
+public enum GuidanceUsage
+{
+    /// <summary>Recommended reading before writing or changing code that uses the package.</summary>
+    Required,
+    /// <summary>Independently discoverable by topic through its description.</summary>
+    OnDemand,
+    /// <summary>Not independently advertised; intended to be reached from another document.</summary>
+    Supporting
 }
 
 /// <summary>The selected assets file, project, target framework, and runtime identifier.</summary>
@@ -25,11 +38,12 @@ public sealed record GuidanceScope(string AssetsPath, string ProjectPath, string
 /// <summary>A portable logical identity; LocalPath is deliberately not part of this key.</summary>
 public sealed record GuidanceIdentity(string PackageId, string Version, string PackagePath);
 
-/// <summary>A validated document and its exact package-byte SHA-256.</summary>
-public sealed record GuidanceDocument(GuidanceIdentity Identity, string LocalPath, string Sha256, string? Role);
+/// <summary>A validated document and its exact package-byte SHA-256. Description is present for Required and OnDemand documents.</summary>
+public sealed record GuidanceDocument(GuidanceIdentity Identity, string LocalPath, string Sha256, GuidanceUsage Usage,
+    string? Description = null);
 
-/// <summary>One validated manifest; entry points name document paths exactly as declared.</summary>
-public sealed record GuidanceContribution(IReadOnlyList<GuidanceDocument> Documents, IReadOnlyList<string> EntryPoints,
+/// <summary>One validated manifest.</summary>
+public sealed record GuidanceContribution(IReadOnlyList<GuidanceDocument> Documents,
     IReadOnlyDictionary<string, JsonElement> PublisherMetadata);
 
 /// <summary>A package's discovery outcome, retaining machine-local package provenance separately from logical identity.</summary>
@@ -38,14 +52,17 @@ public sealed record GuidancePackage(GuidanceScope Scope, string PackageId, stri
 {
     /// <summary>NuGet's graph-supplied package SHA-512 content hash, when present; not a document hash.</summary>
     public string? NuGetContentHash { get; init; }
+
+    /// <summary>True when the package ships a guidance manifest, whether or not it was read.</summary>
+    public bool ManifestDeclared { get; init; }
 }
 
 /// <summary>Graph-wide discovery; consumers must refuse strict operations unless IsSuccessful is true.</summary>
 public sealed record GuidanceDiscovery(IReadOnlyList<GuidancePackage> Packages, IReadOnlyList<string> Diagnostics)
 {
-    /// <summary>True only if assets were readable and every resolved package was valid or had no manifest.</summary>
+    /// <summary>True only if assets were readable and every resolved package was valid, had no manifest, or was deliberately not loaded.</summary>
     public bool IsSuccessful => Diagnostics.Count == 0 &&
-        Packages.All(p => p.Status is GuidanceStatus.Valid or GuidanceStatus.NoManifest);
+        Packages.All(p => p.Status is GuidanceStatus.Valid or GuidanceStatus.NoManifest or GuidanceStatus.NotLoaded);
 }
 
 /// <summary>Reads only already-restored NuGet assets and verified package payloads; does not run MSBuild or write files.</summary>
@@ -59,10 +76,20 @@ public static class GuidanceReader
         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
     };
 
+    private const int MaxDescriptionScalars = 200;
+
     /// <summary>Discovers every resolved package in each target of the selected assets files, without restore or repository writes.</summary>
-    public static GuidanceDiscovery Discover(IEnumerable<string> assetsPaths)
+    public static GuidanceDiscovery Discover(IEnumerable<string> assetsPaths) => Discover(assetsPaths, _ => true);
+
+    /// <summary>
+    /// Discovers every resolved package, reading a package's manifest only when <paramref name="shouldLoad"/>
+    /// accepts its package ID. Other packages are reported as <see cref="GuidanceStatus.NotLoaded"/>; their
+    /// manifests and documents are never parsed, hashed, or validated.
+    /// </summary>
+    public static GuidanceDiscovery Discover(IEnumerable<string> assetsPaths, Func<string, bool> shouldLoad)
     {
         ArgumentNullException.ThrowIfNull(assetsPaths);
+        ArgumentNullException.ThrowIfNull(shouldLoad);
         var packages = new List<GuidancePackage>();
         var diagnostics = new List<string>();
         var selected = false;
@@ -74,7 +101,7 @@ public static class GuidanceReader
                 var assetBytes = File.ReadAllBytes(assetsPath);
                 using var assets = JsonDocument.Parse(assetBytes.AsMemory(
                     assetBytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? 3 : 0));
-                ReadAssets(Path.GetFullPath(assetsPath), assets.RootElement, packages, diagnostics);
+                ReadAssets(Path.GetFullPath(assetsPath), assets.RootElement, packages, diagnostics, shouldLoad);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
             {
@@ -88,7 +115,8 @@ public static class GuidanceReader
         return new GuidanceDiscovery(packages, diagnostics);
     }
 
-    private static void ReadAssets(string assetsPath, JsonElement root, List<GuidancePackage> packages, List<string> diagnostics)
+    private static void ReadAssets(string assetsPath, JsonElement root, List<GuidancePackage> packages, List<string> diagnostics,
+        Func<string, bool> shouldLoad)
     {
         if (!Object(root) || !TryObject(root, "targets", out var targets) ||
             !TryObject(root, "libraries", out var libraries) ||
@@ -173,9 +201,22 @@ public static class GuidanceReader
                     files.ValueKind == JsonValueKind.Array &&
                     files.EnumerateArray().Any(file => file.ValueKind == JsonValueKind.String &&
                         string.Equals(file.GetString()?.Replace('\\', '/'), ManifestPath, StringComparison.OrdinalIgnoreCase));
-                packages.Add(ReadPackage(scope, id, version, packageRoot, manifestListed) with
+                var contentHash = TryString(library, "sha512", out var hash) ? hash : null;
+                if (!shouldLoad(id))
                 {
-                    NuGetContentHash = TryString(library, "sha512", out var contentHash) ? contentHash : null
+                    packages.Add(new GuidancePackage(scope, id, version, packageRoot, GuidanceStatus.NotLoaded, null, null)
+                    {
+                        NuGetContentHash = contentHash,
+                        ManifestDeclared = manifestListed || File.Exists(Path.Combine(packageRoot, "guidance", "reference-manifest.json"))
+                    });
+                    continue;
+                }
+
+                var read = ReadPackage(scope, id, version, packageRoot, manifestListed);
+                packages.Add(read with
+                {
+                    NuGetContentHash = contentHash,
+                    ManifestDeclared = read.Status != GuidanceStatus.NoManifest
                 });
             }
         }
@@ -213,10 +254,9 @@ public static class GuidanceReader
                 return Outcome(GuidanceStatus.InvalidManifest, "schemaVersion must be an integer.");
             if (versionNumber != 1)
                 return Outcome(GuidanceStatus.UnsupportedSchema, $"unsupported schemaVersion {versionNumber}.");
-            if (manifest.EnumerateObject().Any(p => p.Name is not ("schemaVersion" or "documents" or "entryPoints" or "publisherMetadata")) ||
-                !TryArray(manifest, "documents", out var rawDocuments) ||
-                !TryArray(manifest, "entryPoints", out var rawEntries))
-                return Outcome(GuidanceStatus.InvalidManifest, "unknown field or missing documents/entryPoints array.");
+            if (manifest.EnumerateObject().Any(p => p.Name is not ("schemaVersion" or "documents" or "publisherMetadata")) ||
+                !TryArray(manifest, "documents", out var rawDocuments))
+                return Outcome(GuidanceStatus.InvalidManifest, "unknown field or missing documents array.");
 
             var metadata = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
             if (manifest.TryGetProperty("publisherMetadata", out var extensions))
@@ -231,25 +271,30 @@ public static class GuidanceReader
                 }
             }
 
-            var declaredDocuments = new List<(string Path, string Hash, string? Role)>();
+            var declaredDocuments = new List<(string Path, string Hash, GuidanceUsage Usage, string? Description)>();
             var prefixes = new Dictionary<string, string>(PortableComparer);
             var declared = new HashSet<string>(StringComparer.Ordinal);
             var normalizedDocuments = new HashSet<string>(PortableComparer);
             foreach (var raw in rawDocuments.EnumerateArray())
             {
                 if (!Object(raw) || DuplicateProperties(raw) ||
-                    raw.EnumerateObject().Any(p => p.Name is not ("path" or "sha256" or "role")) ||
+                    raw.EnumerateObject().Any(p => p.Name is not ("path" or "sha256" or "usage" or "description")) ||
                     !TryString(raw, "path", out var path) || !SafePath(path) ||
                     !TryString(raw, "sha256", out var hash) || hash.Length != 64 ||
                     !hash.All(c => c is (>= '0' and <= '9') or (>= 'a' and <= 'f')))
                     return Outcome(GuidanceStatus.InvalidManifest, "invalid document path, hash, or field.");
-                string? role = null;
-                if (raw.TryGetProperty("role", out var roleValue))
+                if (!TryString(raw, "usage", out var usageText) || !TryUsage(usageText, out var usage))
+                    return Outcome(GuidanceStatus.InvalidManifest, $"usage for '{path}' must be required, onDemand, or supporting.");
+                string? description = null;
+                if (raw.TryGetProperty("description", out var descriptionValue))
                 {
-                    if (roleValue.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(roleValue.GetString()))
-                        return Outcome(GuidanceStatus.InvalidManifest, $"invalid role for '{path}'.");
-                    role = roleValue.GetString();
+                    if (descriptionValue.ValueKind != JsonValueKind.String ||
+                        !ValidDescription(descriptionValue.GetString()!, out description))
+                        return Outcome(GuidanceStatus.InvalidManifest,
+                            $"invalid description for '{path}': one line of at most {MaxDescriptionScalars} characters without control or format characters.");
                 }
+                if (usage != GuidanceUsage.Supporting && description is null)
+                    return Outcome(GuidanceStatus.InvalidManifest, $"'{path}' is {usageText} and requires a description.");
 
                 var parts = path.Replace('\\', '/').Split('/');
                 for (var i = 1; i <= parts.Length; i++)
@@ -265,27 +310,18 @@ public static class GuidanceReader
                     !normalizedDocuments.Add(path.Replace('\\', '/').Normalize(NormalizationForm.FormC)))
                     return Outcome(GuidanceStatus.InvalidManifest, $"portable document alias: '{path}'.");
 
-                declaredDocuments.Add((path, hash, role));
+                declaredDocuments.Add((path, hash, usage, description));
             }
 
             if (declaredDocuments.Any(doc => prefixes.Keys.Any(prefix =>
                 prefix.StartsWith(doc.Path.Replace('\\', '/').Normalize(NormalizationForm.FormC) + "/", StringComparison.OrdinalIgnoreCase))))
                 return Outcome(GuidanceStatus.InvalidManifest, "a document is also used as a directory prefix.");
 
-            var entries = new List<string>();
-            foreach (var raw in rawEntries.EnumerateArray())
-            {
-                if (raw.ValueKind != JsonValueKind.String || raw.GetString() is not { } path ||
-                    !declared.Contains(path) || entries.Contains(path, StringComparer.Ordinal))
-                    return Outcome(GuidanceStatus.InvalidManifest, "entryPoints must be unique, exact declared document paths.");
-                entries.Add(path);
-            }
-
-            if (declaredDocuments.Count > 0 && entries.Count == 0)
-                return Outcome(GuidanceStatus.InvalidManifest, "non-empty documents require an entry point.");
+            if (declaredDocuments.Count > 0 && declaredDocuments.All(doc => doc.Usage == GuidanceUsage.Supporting))
+                return Outcome(GuidanceStatus.InvalidManifest, "non-empty documents require at least one required or onDemand document.");
 
             var documents = new List<GuidanceDocument>();
-            foreach (var (path, hash, role) in declaredDocuments)
+            foreach (var (path, hash, usage, description) in declaredDocuments)
             {
                 var location = Path.Combine(packageRoot, Path.Combine(path.Replace('\\', '/').Split('/')));
                 if (HasLink(location))
@@ -296,10 +332,11 @@ public static class GuidanceReader
                 var actual = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
                 if (!string.Equals(hash, actual, StringComparison.Ordinal))
                     return Outcome(GuidanceStatus.InvalidManifest, $"SHA-256 mismatch for '{path}'.");
-                documents.Add(new GuidanceDocument(new GuidanceIdentity(id, version, path), location, hash, role));
+                documents.Add(new GuidanceDocument(new GuidanceIdentity(id, version, path), location, hash,
+                    usage, description));
             }
 
-            return Outcome(GuidanceStatus.Valid, contribution: new GuidanceContribution(documents, entries, metadata));
+            return Outcome(GuidanceStatus.Valid, contribution: new GuidanceContribution(documents, metadata));
         }
         catch (JsonException e)
         {
@@ -309,6 +346,41 @@ public static class GuidanceReader
         {
             return Outcome(GuidanceStatus.MissingAssets, $"required package asset cannot be read: {e.Message}");
         }
+    }
+
+    private static bool TryUsage(string text, out GuidanceUsage usage)
+    {
+        switch (text)
+        {
+            case "required": usage = GuidanceUsage.Required; return true;
+            case "onDemand": usage = GuidanceUsage.OnDemand; return true;
+            case "supporting": usage = GuidanceUsage.Supporting; return true;
+            default: usage = default; return false;
+        }
+    }
+
+    /// <summary>One line, not blank, at most 200 Unicode scalar values after NFC, with no control (Cc), format (Cf), line separator (Zl), or paragraph separator (Zp) characters.</summary>
+    private static bool ValidDescription(string value, out string? description)
+    {
+        description = null;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+        string normalized;
+        try { normalized = value.Trim().Normalize(NormalizationForm.FormC); }
+        catch (ArgumentException) { return false; }
+        var scalars = 0;
+        foreach (var rune in normalized.EnumerateRunes())
+        {
+            var category = Rune.GetUnicodeCategory(rune);
+            if (category is System.Globalization.UnicodeCategory.Control or System.Globalization.UnicodeCategory.Format
+                    or System.Globalization.UnicodeCategory.LineSeparator
+                    or System.Globalization.UnicodeCategory.ParagraphSeparator ||
+                ++scalars > MaxDescriptionScalars)
+                return false;
+        }
+
+        description = normalized;
+        return true;
     }
 
     private static bool HasLink(string path)

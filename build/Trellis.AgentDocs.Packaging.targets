@@ -1,12 +1,22 @@
-﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Target Name="GeneratePackageGuidanceManifest" BeforeTargets="_GetPackageFiles"
           Condition="'$(IsPackable)' != 'false' AND
                      ('$(PackageGuidanceDocument)' != '' OR '$(PackageGuidancePath)' != '')">
+    <PropertyGroup>
+      <PackageGuidanceUsage Condition="'$(PackageGuidanceUsage)' == ''">onDemand</PackageGuidanceUsage>
+    </PropertyGroup>
     <Error Condition="'$(PackageGuidanceDocument)' == '' OR '$(PackageGuidancePath)' == ''"
            Text="Set both PackageGuidanceDocument and PackageGuidancePath to publish guidance." />
     <Error Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(PackageGuidancePath)', '^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*\.md$')) != 'True' OR
                       $([System.Text.RegularExpressions.Regex]::IsMatch('$(PackageGuidancePath)', '(^|/)[^/]+[.](/|$)|(?i)(^|/)(con|prn|aux|nul|com[1-9]|lpt[1-9])([.]|/|$)')) == 'True'"
            Text="PackageGuidancePath must be a portable relative Markdown path with forward slashes and no device names." />
+    <Error Condition="'$(PackageGuidanceUsage)' != 'required' AND '$(PackageGuidanceUsage)' != 'onDemand'"
+           Text="PackageGuidanceUsage must be required or onDemand." />
+    <Error Condition="'$(PackageGuidanceDescription)' == ''"
+           Text="Set PackageGuidanceDescription to one line that says when an agent should open the guide." />
+    <Error Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(PackageGuidanceDescription)', '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]')) == 'True' OR
+                      $(PackageGuidanceDescription.Length) &gt; 200"
+           Text="PackageGuidanceDescription must be a single line of at most 200 characters without control, format, or line-separator characters." />
     <Error Condition="!Exists('$(PackageGuidanceDocument)')"
            Text="Missing package guidance document $(PackageGuidanceDocument)." />
     <PropertyGroup>
@@ -15,8 +25,12 @@
     <GetFileHash Files="$(PackageGuidanceDocument)" Algorithm="SHA256">
       <Output TaskParameter="Hash" PropertyName="_PackageGuidanceHash" />
     </GetFileHash>
+    <PropertyGroup>
+      <_PackageGuidanceDescriptionJson>$(PackageGuidanceDescription.Replace('\', '\\').Replace('"', '\"'))</_PackageGuidanceDescriptionJson>
+      <_PackageGuidanceManifestJson>{"schemaVersion":1,"documents":[{"path":"$(PackageGuidancePath)","sha256":"$(_PackageGuidanceHash.ToLowerInvariant())","usage":"$(PackageGuidanceUsage)","description":"$(_PackageGuidanceDescriptionJson)"}]}</_PackageGuidanceManifestJson>
+    </PropertyGroup>
     <WriteLinesToFile File="$(_PackageGuidanceManifest)" Overwrite="true" Encoding="UTF-8"
-                      Lines='{"schemaVersion":1,"documents":[{"path":"$(PackageGuidancePath)","sha256":"$(_PackageGuidanceHash.ToLowerInvariant())"}],"entryPoints":["$(PackageGuidancePath)"]}' />
+                      Lines="$([MSBuild]::Escape('$(_PackageGuidanceManifestJson)'))" />
     <ItemGroup>
       <None Include="$(PackageGuidanceDocument)" Pack="true"
             PackagePath="$(PackageGuidancePath)" />
