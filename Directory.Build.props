@@ -3,9 +3,11 @@
     <NBGV_SetCloudBuildVersionVars>false</NBGV_SetCloudBuildVersionVars>
     <RepositoryType>git</RepositoryType>
     <RepositoryUrl>https://github.com/xavierjohn/Trellis.AgentDocs.Packaging</RepositoryUrl>
+    <PackageIcon>icon.png</PackageIcon>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Nerdbank.GitVersioning" Version="3.10.94" PrivateAssets="all" />
     <PackageReference Include="DotNet.ReproducibleBuilds" Version="2.0.5" PrivateAssets="all" />
+    <None Include="$(MSBuildThisFileDirectory)icon.png" Pack="true" PackagePath="/" />
   </ItemGroup>
 </Project>
