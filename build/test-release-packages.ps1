@@ -35,6 +35,25 @@ foreach ($id in $ids) {
             $metadata.SelectSingleNode('*[local-name()="version"]').InnerText -ne $version) {
             throw "Nuspec identity/version does not match $($package.Name)."
         }
+        if ($metadata.SelectSingleNode('*[local-name()="icon"]')?.InnerText -ne 'icon.png') {
+            throw "$id must declare the Trellis package icon."
+        }
+        $icon = $archive.GetEntry('icon.png')
+        if (-not $icon) { throw "$id must pack icon.png at the package root." }
+        $iconBytes = [System.IO.MemoryStream]::new()
+        $iconStream = $icon.Open()
+        try {
+            $iconStream.CopyTo($iconBytes)
+            $packedHash = [Convert]::ToHexString(
+                [System.Security.Cryptography.SHA256]::HashData($iconBytes.ToArray()))
+        }
+        finally {
+            $iconStream.Dispose()
+            $iconBytes.Dispose()
+        }
+        if ($packedHash -ne (Get-FileHash (Join-Path $root 'icon.png') -Algorithm SHA256).Hash) {
+            throw "$id packed an unexpected package icon."
+        }
     }
     finally { $archive.Dispose() }
     $versions += $version
