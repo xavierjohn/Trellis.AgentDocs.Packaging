@@ -235,7 +235,7 @@ public sealed class GuidanceValidatorTests
     public void Reference_style_links_and_encoded_paths_are_checked()
     {
         var package = new Package().Doc(Start, "# S\n\n[x][ref]\n\n[ref]: missing%20doc.md\n", "required", "Read first.");
-        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD102" && d.Line == 5);
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD102" && d.Line == 3);
     }
 
     [Fact]
@@ -426,27 +426,62 @@ public sealed class GuidanceValidatorTests
     }
 
     [Fact]
-    public void A_percent_in_a_zip_entry_name_is_kept_as_written_and_the_decoded_spelling_also_resolves()
+    public void Zip_entries_are_addressed_by_their_percent_decoded_logical_path_as_NuGet_extracts_them()
     {
-        var bytes = Encoding.UTF8.GetBytes("# S\n");
-        var package = new Package().Doc("guide/100%25.md", "# S\n", "required", "Read first.", pack: false);
-        package.Files["guide/100%25.md"] = bytes;
-        package.Validate().Diagnostics.Should().BeEmpty("the literal spelling resolves");
+        // NuGet extracts the entry named guide/100%25.md as guide/100%.md, so that is the path a manifest must declare.
+        var entries = new[] { ("guide/100%25.md", Encoding.UTF8.GetBytes("# S\n")) };
 
+        var decoded = new Package().Doc("guide/100%.md", "# S\n", "required", "Read first.", pack: false);
+        Nupkg(entries, decoded).Diagnostics.Should().BeEmpty();
+
+        var literal = new Package().Doc("guide/100%25.md", "# S\n", "required", "Read first.", pack: false);
+        Nupkg(entries, literal).Diagnostics.Should().Contain(d => d.Code == "AD002" && d.Message.Contains("not in the package"));
+    }
+
+    [Fact]
+    public void When_two_zip_entries_decode_to_the_same_path_the_first_one_is_what_consumers_receive()
+    {
+        var first = Encoding.UTF8.GetBytes("# First\n");
+        var second = Encoding.UTF8.GetBytes("# Second\n");
+        var entries = new[] { ("guide/start%2Emd", first), ("guide/start.md", second) };
+
+        Nupkg(entries, new Package().DocBytes("guide/start.md", first, "required", "Read first.", pack: false))
+            .Diagnostics.Should().BeEmpty();
+        Nupkg(entries, new Package().DocBytes("guide/start.md", second, "required", "Read first.", pack: false))
+            .Diagnostics.Should().ContainSingle(d => d.Code == "AD003");
+    }
+
+    [Fact]
+    public void Plain_yaml_keys_with_spaces_in_front_matter_are_not_reported()
+    {
+        var package = new Package().Doc(Start, "---\ndisplay name: Example\nlast verified: 2026-09-29\n---\n\n# Heading\n", "required", "Read first.");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Heading_anchors_come_from_the_rendered_text_not_the_markdown_source()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\n[a](http.md#hello) [b](http.md#emphasised-title) [c](http.md#with-code)\n", "required", "Read first.")
+            .Doc(Http, "# H\n\n## [Hello](https://example.com)\n\n## _Emphasised_ **title**\n\n## With `code`\n", "supporting");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    private static GuidanceValidation Nupkg(IEnumerable<(string Name, byte[] Bytes)> entries, Package package)
+    {
         var nupkg = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".nupkg");
         try
         {
-            package.Files["guidance/reference-manifest.json"] = package.Manifest();
             using (var archive = ZipFile.Open(nupkg, ZipArchiveMode.Create))
             {
-                foreach (var (name, content) in package.Files)
+                foreach (var (name, content) in entries.Append(("guidance/reference-manifest.json", package.Manifest())))
                 {
                     using var entry = archive.CreateEntry(name).Open();
                     entry.Write(content);
                 }
             }
 
-            GuidanceValidator.ValidatePackage(nupkg).Diagnostics.Should().BeEmpty();
+            return GuidanceValidator.ValidatePackage(nupkg);
         }
         finally
         {
@@ -480,6 +515,31 @@ public sealed class GuidanceValidatorTests
             if (Directory.Exists(root))
                 Directory.Delete(root, true);
             Directory.Delete(outside, true);
+        }
+    }
+
+    [Fact]
+    public void A_package_directory_under_a_linked_parent_is_judged_by_its_contents()
+    {
+        // The author's path is not the consumer's: their copy lives in the NuGet cache. (macOS /tmp is itself a link.)
+        var real = Path.Combine(Path.GetTempPath(), "agentdocs-real-" + Guid.NewGuid().ToString("N"));
+        var parent = Path.Combine(Path.GetTempPath(), "agentdocs-parent-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var package = new Package().Doc("guide/start.md", "# S\n", "required", "Read first.");
+            Directory.CreateDirectory(Path.Combine(real, "pkg", "guide"));
+            Directory.CreateDirectory(Path.Combine(real, "pkg", "guidance"));
+            File.WriteAllBytes(Path.Combine(real, "pkg", "guide", "start.md"), package.Files["guide/start.md"]);
+            File.WriteAllBytes(Path.Combine(real, "pkg", "guidance", "reference-manifest.json"), package.Manifest());
+            Assert.SkipUnless(TryCreateDirectoryLink(parent, real), "Directory links are unavailable here.");
+
+            GuidanceValidator.ValidatePackage(Path.Combine(parent, "pkg")).Diagnostics.Should().BeEmpty();
+        }
+        finally
+        {
+            if (Directory.Exists(parent) && (File.GetAttributes(parent) & FileAttributes.ReparsePoint) != 0)
+                Directory.Delete(parent);
+            Directory.Delete(real, true);
         }
     }
 

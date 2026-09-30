@@ -3,7 +3,14 @@ namespace Trellis.Guidance.Reader;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.RegularExpressions;
+using Markdig;
+using Markdig.Extensions.AutoIdentifiers;
+using Markdig.Extensions.Yaml;
+using Markdig.Renderers.Html;
+using Markdig.Syntax;
+using Markdig.Syntax.Inlines;
+using YamlDotNet.Core;
+using YamlDotNet.RepresentationModel;
 
 /// <summary>How serious a validation diagnostic is.</summary>
 public enum GuidanceSeverity
@@ -49,21 +56,24 @@ public sealed record GuidanceValidation(IReadOnlyList<GuidanceDiagnostic> Diagno
 /// Checks a package's guidance the way an author needs it checked before publishing: the manifest against the
 /// contract (errors) and the documents against what makes guidance discoverable (warnings). The manifest rules are
 /// the very code <see cref="GuidanceReader"/> applies, so a package this validator accepts is not rejected by the
-/// reader for manifest reasons. It reads a package or an extracted directory only; it does not restore, run MSBuild
-/// or write files.
+/// reader for manifest reasons. Documents are read with a Markdown parser (links and heading anchors, GitHub
+/// style) and a YAML parser (front matter), not with pattern matching. It reads a package or an extracted
+/// directory only; it does not restore, run MSBuild or write files.
 /// </summary>
+/// <remarks>
+/// A directory is judged by its contents: links inside it are errors, because consumers reject them. Where the
+/// directory lives is not: a package directory under a linked parent (for example macOS <c>/tmp</c>) is fine,
+/// because the consumer's own copy lives in its NuGet cache, not at the author's path.
+/// </remarks>
 public static class GuidanceValidator
 {
     private const string ManifestPath = "guidance/reference-manifest.json";
-    private static readonly Regex InlineLink = new(
-        @"\]\((?:<(?<target>[^>]+)>|(?<target>(?:[^()\s]|\([^()\s]*\))+))(?:\s+(?:""[^""]*""|'[^']*'))?\)", RegexOptions.Compiled);
-    private static readonly Regex ReferenceLink = new(@"^\s{0,3}\[[^\]]+\]:\s*(?<target><[^>]+>|\S+)", RegexOptions.Compiled);
-    private static readonly Regex InlineCode = new(@"(`+)[^`].*?\1", RegexOptions.Compiled);
-    private static readonly Regex Heading = new(@"^\s{0,3}#{1,6}\s+(?<text>.*?)\s*#*\s*$", RegexOptions.Compiled);
-    private static readonly Regex SetextUnderline = new(@"^\s{0,3}(=+|-+)\s*$", RegexOptions.Compiled);
-    private static readonly Regex YamlLine = new(
-        @"^(\s*$|\s|#|-(\s|$)|(""[^""]*""|'[^']*'|[^\s:#][^\s:]*)\s*:(\s|$))", RegexOptions.Compiled);
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+    private static readonly MarkdownPipeline Pipeline = new MarkdownPipelineBuilder()
+        .UsePreciseSourceLocation()
+        .UseYamlFrontMatter()
+        .UseAutoIdentifiers(AutoIdentifierOptions.GitHub)
+        .Build();
 
     /// <summary>Validates a <c>.nupkg</c> file or a directory holding an extracted package.</summary>
     public static GuidanceValidation ValidatePackage(string path, GuidanceValidationOptions? options = null)
@@ -72,10 +82,10 @@ public static class GuidanceValidator
         if (!Directory.Exists(path))
             return Validate(ReadPackageFile(path), options);
 
-        var linked = new HashSet<string>(StringComparer.Ordinal);
         if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
             return new GuidanceValidation(
-                [new GuidanceDiagnostic("AD001", GuidanceSeverity.Error, null, null, "The package directory is a link; validate the real directory.")], 0, 0);
+                [new GuidanceDiagnostic("AD001", GuidanceSeverity.Error, null, null, "The package directory is itself a link; validate the real directory.")], 0, 0);
+        var linked = new HashSet<string>(StringComparer.Ordinal);
         return Validate(ReadDirectory(Path.GetFullPath(path), linked), options, linked);
     }
 
@@ -170,14 +180,15 @@ public static class GuidanceValidator
                 "Every agent reads them before any work; move detail into onDemand documents.", null);
 
         var byPath = documents.ToDictionary(d => d.Path, StringComparer.Ordinal);
-        var slugs = documents.ToDictionary(d => d.Path, d => Slugs(d.Text), StringComparer.Ordinal);
+        var parsed = documents.ToDictionary(d => d.Path, d => Markdown.Parse(d.Text, Pipeline), StringComparer.Ordinal);
+        var slugs = parsed.ToDictionary(pair => pair.Key, pair => Anchors(pair.Value), StringComparer.Ordinal);
         var edges = documents.ToDictionary(d => d.Path, _ => new HashSet<string>(StringComparer.Ordinal), StringComparer.Ordinal);
 
         foreach (var document in documents)
         {
             var path = document.Path;
-            FrontMatter(path, document.Text, warn);
-            foreach (var (target, line) in Links(document.Text))
+            FrontMatter(path, document.Text, parsed[path], warn);
+            foreach (var (target, line) in Links(parsed[path]))
             {
                 var hash = target.IndexOf('#');
                 var file = hash < 0 ? target : target[..hash];
@@ -240,72 +251,63 @@ public static class GuidanceValidator
 
         var listed = new HashSet<string>(documents.Select(d => d.Path), StringComparer.Ordinal);
         var directories = documents.Select(d => DirectoryOf(d.Path)).Where(d => d.Length > 0).ToHashSet(StringComparer.Ordinal);
-        var seenContent = new HashSet<byte[]>(ReferenceEqualityComparer.Instance);
-        foreach (var path in listed)
-            seenContent.Add(files[path]);
-        foreach (var (file, bytes) in files.OrderBy(pair => pair.Key, StringComparer.Ordinal))
-        {
-            // A package can be reachable under a raw and a decoded spelling; report the file once.
-            if (!seenContent.Add(bytes) || !file.EndsWith(".md", StringComparison.OrdinalIgnoreCase) ||
-                listed.Contains(file) || !directories.Contains(DirectoryOf(file)))
-                continue;
+        foreach (var file in files.Keys.Where(f => f.EndsWith(".md", StringComparison.OrdinalIgnoreCase) &&
+                     !listed.Contains(f) && directories.Contains(DirectoryOf(f))).Order(StringComparer.Ordinal))
             warn("AD105", file, "This Markdown file sits beside listed guidance but is not in the manifest, so it is not installed. List it or move it.", null);
-        }
     }
 
-    private static void FrontMatter(string path, string text, Action<string, string?, string, int?> warn)
+    /// <summary>
+    /// A block of front matter is YAML, so it is parsed as YAML. A closing fence that lands after the body leaves prose
+    /// inside the block, which is not valid YAML; an unclosed block is reported as such.
+    /// </summary>
+    private static void FrontMatter(string path, string text, MarkdownDocument document, Action<string, string?, string, int?> warn)
     {
-        var lines = text.Split('\n');
-        if (lines[0].TrimEnd('\r').Trim() != "---")
+        var newline = text.IndexOf('\n');
+        var first = (newline < 0 ? text : text[..newline]).Trim();
+        if (first != "---")
             return;
-        for (var i = 1; i < lines.Length; i++)
+        var block = document.OfType<YamlFrontMatterBlock>().FirstOrDefault();
+        if (block is null)
         {
-            var line = lines[i].TrimEnd('\r');
-            if (Regex.IsMatch(line, @"^---\s*$"))
-                return;
-            if (!YamlLine.IsMatch(line))
-            {
-                warn("AD104", path, $"The front matter block contains a line that is not YAML, so the closing '---' is probably misplaced: '{Truncate(line)}'.", i + 1);
-                return;
-            }
+            warn("AD104", path, "The front matter block is never closed with '---'.", 1);
+            return;
         }
 
-        warn("AD104", path, "The front matter block is never closed with '---'.", 1);
+        try
+        {
+            new YamlStream().Load(new StringReader(block.Lines.ToString()));
+        }
+        catch (YamlException e)
+        {
+            warn("AD104", path,
+                $"The front matter is not valid YAML, so the closing '---' is probably misplaced: {e.Message.Split('\n')[0].Trim()}",
+                (int)e.Start.Line + 1);
+        }
     }
 
-    private static IEnumerable<(string Target, int Line)> Links(string text)
+    private static IEnumerable<(string Target, int Line)> Links(MarkdownDocument document)
     {
-        var fence = new FenceTracker();
-        var lineNumber = 0;
-        foreach (var raw in text.Split('\n'))
+        foreach (var link in document.Descendants<LinkInline>())
         {
-            lineNumber++;
-            var line = raw.TrimEnd('\r');
-            if (fence.InCode(line))
-                continue;
-            var visible = InlineCode.Replace(line, m => new string(' ', m.Length));
-            foreach (Match match in InlineLink.Matches(visible))
-            {
-                var target = Filter(match.Groups["target"].Value);
-                if (target is not null)
-                    yield return (target, lineNumber);
-            }
-
-            var reference = ReferenceLink.Match(visible);
-            if (reference.Success && Filter(reference.Groups["target"].Value) is { } referenceTarget)
-                yield return (referenceTarget, lineNumber);
+            var target = Filter(link.Url);
+            if (target is not null)
+                yield return (target, link.Line + 1);
         }
 
-        static string? Filter(string target)
+        static string? Filter(string? target)
         {
-            target = target.Trim('<', '>');
-            if (target.Length == 0 || target.StartsWith("//", StringComparison.Ordinal))
+            if (string.IsNullOrEmpty(target) || target.StartsWith("//", StringComparison.Ordinal))
                 return null;
             var colon = target.IndexOf(':');
             var slash = target.IndexOfAny(['/', '#', '?']);
             return colon >= 0 && (slash < 0 || colon < slash) ? null : target;
         }
     }
+
+    /// <summary>The heading anchors GitHub would generate, from the rendered heading text.</summary>
+    private static HashSet<string> Anchors(MarkdownDocument document) =>
+        document.Descendants<HeadingBlock>().Select(h => h.GetAttributes().Id).OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
 
     /// <summary>Resolves a relative link against a package-relative document; null when it escapes the package.</summary>
     private static string? Resolve(string document, string relative)
@@ -328,47 +330,6 @@ public static class GuidanceValidator
         }
 
         return string.Join('/', parts);
-    }
-
-    /// <summary>GitHub-style heading anchors (ATX and setext), including the -1, -2 suffixes for repeated headings.</summary>
-    private static HashSet<string> Slugs(string text)
-    {
-        var slugs = new HashSet<string>(StringComparer.Ordinal);
-        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
-        var lines = text.Split('\n').Select(l => l.TrimEnd('\r')).ToArray();
-        var start = 0;
-        if (lines.Length > 0 && lines[0].Trim() == "---")
-        {
-            var close = Array.FindIndex(lines, 1, l => Regex.IsMatch(l, @"^---\s*$"));
-            start = close < 0 ? 0 : close + 1;
-        }
-
-        void Add(string heading)
-        {
-            var slug = Regex.Replace(heading.Replace("`", "").ToLowerInvariant(), @"[^\p{L}\p{N}\p{M}_\- ]", "").Replace(' ', '-');
-            counts.TryGetValue(slug, out var seen);
-            counts[slug] = seen + 1;
-            slugs.Add(seen == 0 ? slug : slug + "-" + seen);
-        }
-
-        var fence = new FenceTracker();
-        for (var i = start; i < lines.Length; i++)
-        {
-            var line = lines[i];
-            if (fence.InCode(line))
-                continue;
-            if (Heading.Match(line) is { Success: true } atx)
-            {
-                Add(atx.Groups["text"].Value);
-            }
-            else if (i + 1 < lines.Length && line.Trim().Length > 0 && SetextUnderline.IsMatch(lines[i + 1]) &&
-                !Regex.IsMatch(line, @"^\s{0,3}([-*+>|]|\d+[.)])\s"))
-            {
-                Add(line.Trim());
-            }
-        }
-
-        return slugs;
     }
 
     private static Dictionary<string, byte[]> ReadDirectory(string root, HashSet<string> linked)
@@ -399,21 +360,23 @@ public static class GuidanceValidator
         return files;
     }
 
+    /// <summary>
+    /// Reads a package the way NuGet exposes it: entries are addressed by their percent-decoded logical path, and when
+    /// two entries decode to the same path the first one wins.
+    /// </summary>
     private static Dictionary<string, byte[]> ReadPackageFile(string path)
     {
         var files = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         using var archive = ZipFile.OpenRead(path);
         foreach (var entry in archive.Entries.Where(e => !e.FullName.EndsWith('/')))
         {
+            var logical = Unescape(entry.FullName);
+            if (files.ContainsKey(logical))
+                continue;
             using var stream = entry.Open();
             using var buffer = new MemoryStream();
             stream.CopyTo(buffer);
-            var bytes = buffer.ToArray();
-            // Entry names are kept as written. NuGet percent-decodes names when it extracts a package, so a decoded
-            // spelling is also made available, pointing at the same bytes.
-            files[entry.FullName] = bytes;
-            if (entry.FullName.Contains('%') && Unescape(entry.FullName) is var decoded && decoded != entry.FullName)
-                files.TryAdd(decoded, bytes);
+            files[logical] = buffer.ToArray();
         }
 
         return files;
@@ -435,48 +398,10 @@ public static class GuidanceValidator
         return slash < 0 ? "" : path[..slash];
     }
 
-    private static string Truncate(string value) => value.Length <= 60 ? value : value[..57] + "...";
-
     private static string Unescape(string value)
     {
         try { return Uri.UnescapeDataString(value); }
         catch (UriFormatException) { return value; }
-    }
-
-    /// <summary>Tracks Markdown fenced code so links and headings inside it are ignored, honouring fence length.</summary>
-    private sealed class FenceTracker
-    {
-        private char _marker;
-        private int _length;
-
-        /// <summary>True when the line is a fence marker or inside a fenced block.</summary>
-        public bool InCode(string line)
-        {
-            var trimmed = line.TrimStart();
-            if (trimmed.Length >= 3 && (trimmed[0] is '`' or '~'))
-            {
-                var marker = trimmed[0];
-                var length = 0;
-                while (length < trimmed.Length && trimmed[length] == marker)
-                    length++;
-                if (length >= 3)
-                {
-                    if (_marker == '\0')
-                    {
-                        _marker = marker;
-                        _length = length;
-                    }
-                    else if (marker == _marker && length >= _length && string.IsNullOrWhiteSpace(trimmed[length..]))
-                    {
-                        _marker = '\0';
-                    }
-
-                    return true;
-                }
-            }
-
-            return _marker != '\0';
-        }
     }
 
     private sealed record Doc(string Path, GuidanceUsage Usage, string Text);
