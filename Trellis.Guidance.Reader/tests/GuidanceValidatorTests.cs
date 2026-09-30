@@ -548,6 +548,24 @@ public sealed class GuidanceValidatorTests
     }
 
     [Fact]
+    public void Rooted_entries_and_windows_aliases_are_AD009()
+    {
+        var bytes = Encoding.UTF8.GetBytes("# S\n");
+        var manifest = new Package().DocBytes("guide/start.md", bytes, "required", "Read first.", pack: false);
+
+        foreach (var rooted in new[] { "/guide/start.md", "%2Fguide/start.md", "\\guide\\start.md", "C:/guide/start.md", "//server/share/start.md" })
+            Nupkg([("guide/start.md", bytes), (rooted, bytes)], manifest).Diagnostics
+                .Should().Contain(d => d.Code == "AD009", $"'{rooted}' is rooted");
+
+        foreach (var alias in new[] { "guide/start.md.", "guide/start.md ", "guide./start.md", "guide/CON.md", "guide/a:b.md", "guide/what?.md" })
+            Nupkg([("guide/start.md", bytes), (alias, bytes)], manifest).Diagnostics
+                .Should().Contain(d => d.Code == "AD009" && d.Message.Contains("portably"), $"'{alias}' does not extract where it claims");
+
+        Nupkg([("guide/start.md", bytes), ("lib/net8.0/My.Package.dll", bytes), ("[Content_Types].xml", bytes)], manifest).Diagnostics
+            .Should().NotContain(d => d.Code == "AD009", "ordinary package entries are fine");
+    }
+
+    [Fact]
     public void Html_links_are_read_with_an_html_parser_not_pattern_matching()
     {
         var package = new Package().Doc(Start,

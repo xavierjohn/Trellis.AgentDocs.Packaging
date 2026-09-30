@@ -510,11 +510,18 @@ public static class GuidanceValidator
             // Extraction resolves '.', '..' and empty segments (Path.GetFullPath), so entries are tracked by the path
             // they land on; an entry that climbs out of the package root is rejected outright.
             var decoded = Unescape(entry.FullName).Replace('\\', '/');
-            var logical = Canonical(decoded);
+            var logical = IsRooted(decoded) ? null : Canonical(decoded);
             if (logical is null)
             {
                 problems.Add(new GuidanceDiagnostic("AD009", GuidanceSeverity.Error, decoded, null,
-                    "This entry's path escapes the package root or is empty, so it cannot be extracted safely."));
+                    "This entry's path is rooted, escapes the package root or is empty, so NuGet cannot extract it."));
+                continue;
+            }
+
+            if (logical.Split('/').FirstOrDefault(IsUnportableSegment) is { } unportable)
+            {
+                problems.Add(new GuidanceDiagnostic("AD009", GuidanceSeverity.Error, logical, null,
+                    $"The segment '{unportable}' cannot be extracted portably: Windows drops trailing dots and spaces, so it lands on a different path, and rejects device names and characters such as : * ? \" < > |."));
                 continue;
             }
 
@@ -554,6 +561,18 @@ public static class GuidanceValidator
             return buffer.ToArray();
         });
     }
+
+    /// <summary>A leading separator (rooted or UNC) or a drive letter: NuGet refuses to extract these.</summary>
+    private static bool IsRooted(string path) =>
+        path.StartsWith('/') || (path.Length >= 2 && char.IsAsciiLetter(path[0]) && path[1] == ':');
+
+    /// <summary>Windows trailing dots and spaces, device names and forbidden characters make a segment extract elsewhere or fail.</summary>
+    private static bool IsUnportableSegment(string segment) =>
+        segment.EndsWith(' ') || segment.EndsWith('.') ||
+        segment.Any(c => c is < ' ' or '<' or '>' or ':' or '"' or '|' or '?' or '*') ||
+        segment.Split('.')[0].ToUpperInvariant() is "CON" or "PRN" or "AUX" or "NUL" or "COM1" or "COM2" or "COM3" or "COM4"
+            or "COM5" or "COM6" or "COM7" or "COM8" or "COM9" or "LPT1" or "LPT2" or "LPT3" or "LPT4" or "LPT5" or "LPT6"
+            or "LPT7" or "LPT8" or "LPT9";
 
     /// <summary>Collapses empty, '.' and '..' segments; null when the path climbs out of the root or nothing is left.</summary>
     private static string? Canonical(string path)
