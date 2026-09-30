@@ -1932,6 +1932,65 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
+    public void Link_scan_keeps_a_long_fence_open_until_a_matching_closing_fence()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("CLAUDE.md", string.Join("\n",
+            "````md",
+            "```",
+            "[inside](missing-inside.md)",
+            "```",
+            "[still inside](missing-inside-too.md)",
+            "````",
+            "[outside](missing-outside.md)",
+            ""));
+
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("CLAUDE.md:7").And.Contain("missing-outside.md");
+        fixture.LastOutput.Should().NotContain("missing-inside");
+    }
+
+    [Fact]
+    public void Link_scan_does_not_close_a_fence_on_a_line_that_has_an_info_string()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("CLAUDE.md", string.Join("\n",
+            "```md",
+            "```js",
+            "[inside](missing-inside.md)",
+            "```",
+            ""));
+
+        fixture.Run("init", "--strict", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().NotContain("agentdocs warning:");
+    }
+
+    [Fact]
+    public void Init_still_succeeds_when_a_directory_cannot_be_listed_during_the_link_scan()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "Uses Unix file modes to make a directory unreadable.");
+        using var fixture = new Fixture();
+        fixture.Write("locked/keep.txt", "x");
+        var locked = fixture.Path("locked");
+        File.SetUnixFileMode(locked, UnixFileMode.None);
+        try
+        {
+            Assert.SkipWhen(Directory.Exists(locked) && CanList(locked), "Running with privileges that ignore file modes.");
+            fixture.Run("init", "--strict", "App.csproj").Should().Be(0, fixture.LastOutput);
+        }
+        finally
+        {
+            File.SetUnixFileMode(locked, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        static bool CanList(string path)
+        {
+            try { _ = Directory.GetFileSystemEntries(path); return true; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
+    }
+
+    [Fact]
     public void Init_is_not_blocked_by_a_pending_package_whose_cache_is_incomplete()
     {
         using var fixture = new Fixture();
