@@ -368,7 +368,7 @@ public static partial class AgentDocsCommand
                     throw new InvalidOperationException($"Conflicting contributions to {relative}: {existing.Sources[0].Package}, {package.PackageId}");
                 existing.Sources.Add(source);
                 if (listings[existingPath] is { } listed &&
-                    (listed.Description != document.Description || listed.Usage != document.Usage))
+                    (listed.Description != (document.Description ?? "") || listed.Usage != document.Usage))
                     throw new InvalidOperationException($"Conflicting guidance metadata for {relative}.");
             }
             else
