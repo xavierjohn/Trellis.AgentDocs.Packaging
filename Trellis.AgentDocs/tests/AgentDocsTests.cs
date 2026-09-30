@@ -1757,6 +1757,20 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
+    public void Init_accepts_one_package_with_a_supporting_document_in_two_projects()
+    {
+        using var fixture = new Fixture();
+        AddSecondProject(fixture);
+        fixture.Write("package-two/guide/README.md", "# One");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md", usage: GuidanceUsage.Supporting);
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md", usage: GuidanceUsage.Supporting,
+            scope: OtherScope(fixture));
+
+        fixture.Run("init", "Apps.slnx").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().NotContain("Conflicting guidance metadata");
+    }
+
+    [Fact]
     public void Init_rejects_one_package_describing_the_same_document_differently_in_two_projects()
     {
         using var fixture = new Fixture();
@@ -2111,13 +2125,14 @@ public sealed class AgentDocsTests
         }
 
         public void AddPackage(string id, string root, string document, string version = "2.0.0",
-            string? description = null, GuidanceScope? scope = null, bool approve = true)
+            string? description = null, GuidanceScope? scope = null, bool approve = true,
+            GuidanceUsage usage = GuidanceUsage.OnDemand)
         {
             var file = Path(root, document.Replace('/', System.IO.Path.DirectorySeparatorChar));
             var sha = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file))).ToLowerInvariant();
             var guidance = new GuidanceContribution(
-                [new GuidanceDocument(new GuidanceIdentity(id, version, document), file, sha, GuidanceUsage.OnDemand,
-                    description ?? "Guide for " + id)],
+                [new GuidanceDocument(new GuidanceIdentity(id, version, document), file, sha, usage,
+                    usage == GuidanceUsage.Supporting ? null : description ?? "Guide for " + id)],
                 new Dictionary<string, JsonElement>());
             _extraPackages.Add(new GuidancePackage(scope ?? new GuidanceScope(Path(_assets.Replace('/', System.IO.Path.DirectorySeparatorChar)),
                 Path(_project.Replace('/', System.IO.Path.DirectorySeparatorChar)), "net10.0", null),
