@@ -97,7 +97,7 @@ public static partial class AgentDocsCommand
                     name.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
                     name.Equals("node_modules", StringComparison.OrdinalIgnoreCase) ||
                     name.Equals(".vs", StringComparison.OrdinalIgnoreCase) ||
-                    File.GetAttributes(child).HasFlag(FileAttributes.ReparsePoint) ||
+                    IsUninspectableOrLink(child) ||
                     File.Exists(Path.Combine(child, ".git")) || Directory.Exists(Path.Combine(child, ".git")))
                     continue;
                 Visit(child);
@@ -118,6 +118,22 @@ public static partial class AgentDocsCommand
         while (length < trimmed.Length && trimmed[length] == marker)
             length++;
         return (marker, length, string.IsNullOrWhiteSpace(trimmed[length..]));
+    }
+
+    /// <summary>
+    /// True for a reparse point, and also for a directory whose attributes cannot be read (denied or
+    /// removed while scanning): the scan only produces warnings, so such a directory is skipped, not fatal.
+    /// </summary>
+    private static bool IsUninspectableOrLink(string directory)
+    {
+        try
+        {
+            return File.GetAttributes(directory).HasFlag(FileAttributes.ReparsePoint);
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+        {
+            return true;
+        }
     }
 
     private static bool IsInstructionFile(string path)
