@@ -1,4 +1,95 @@
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Writes guidance/reference-manifest.json. The manifest is built by a task, not by MSBuild property functions,
+    because publisher text (quotes, backslashes, apostrophes, percent signs) must never be embedded in quoted
+    property-function arguments or path-normalised by MSBuild. The task applies the same description rules as the
+    reader: trimmed, NFC-normalised, not blank, no control/format/line/paragraph-separator characters, and at most
+    200 Unicode scalar values after normalisation.
+  -->
+  <UsingTask TaskName="WriteAgentDocsGuidanceManifest" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <ManifestFile ParameterType="System.String" Required="true" />
+      <DocumentPath ParameterType="System.String" Required="true" />
+      <Sha256 ParameterType="System.String" Required="true" />
+      <Usage ParameterType="System.String" Required="true" />
+      <Description ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.Globalization" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Text" />
+      <Code Type="Method" Language="cs"><![CDATA[
+        public override bool Execute()
+        {
+            string description;
+            try
+            {
+                description = (Description ?? "").Trim().Normalize(NormalizationForm.FormC);
+            }
+            catch (ArgumentException)
+            {
+                description = "";
+            }
+
+            var valid = description.Length > 0;
+            var scalars = 0;
+            for (var i = 0; valid && i < description.Length; i++)
+            {
+                var category = CharUnicodeInfo.GetUnicodeCategory(description, i);
+                if (category == UnicodeCategory.Control || category == UnicodeCategory.Format ||
+                    category == UnicodeCategory.LineSeparator || category == UnicodeCategory.ParagraphSeparator)
+                    valid = false;
+                if (char.IsHighSurrogate(description[i]) && i + 1 < description.Length &&
+                    char.IsLowSurrogate(description[i + 1]))
+                    i++;
+                scalars++;
+            }
+
+            if (!valid || scalars > 200)
+            {
+                Log.LogError("PackageGuidanceDescription must be a single line of at most 200 characters, not blank, " +
+                    "without control, format, or line-separator characters.");
+                return false;
+            }
+
+            var json = new StringBuilder("{\"schemaVersion\":1,\"documents\":[{\"path\":");
+            AppendString(json, DocumentPath);
+            json.Append(",\"sha256\":");
+            AppendString(json, Sha256);
+            json.Append(",\"usage\":");
+            AppendString(json, Usage);
+            json.Append(",\"description\":");
+            AppendString(json, description);
+            json.Append("}]}");
+            var directory = Path.GetDirectoryName(Path.GetFullPath(ManifestFile));
+            if (!string.IsNullOrEmpty(directory))
+                Directory.CreateDirectory(directory);
+            File.WriteAllText(ManifestFile, json.ToString(), new UTF8Encoding(false));
+            return true;
+        }
+
+        private static void AppendString(StringBuilder json, string value)
+        {
+            json.Append('"');
+            foreach (var c in value)
+            {
+                if (c == '"')
+                    json.Append("\\\"");
+                else if (c == '\\')
+                    json.Append("\\\\");
+                else if (c < ' ')
+                    json.Append("\\u").Append(((int)c).ToString("x4"));
+                else
+                    json.Append(c);
+            }
+
+            json.Append('"');
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
   <Target Name="GeneratePackageGuidanceManifest" BeforeTargets="_GetPackageFiles"
           Condition="'$(IsPackable)' != 'false' AND
                      ('$(PackageGuidanceDocument)' != '' OR '$(PackageGuidancePath)' != '')">
@@ -14,9 +105,6 @@
            Text="PackageGuidanceUsage must be required or onDemand." />
     <Error Condition="'$(PackageGuidanceDescription)' == ''"
            Text="Set PackageGuidanceDescription to one line that says when an agent should open the guide." />
-    <Error Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(PackageGuidanceDescription)', '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]')) == 'True' OR
-                      $(PackageGuidanceDescription.Length) &gt; 200"
-           Text="PackageGuidanceDescription must be a single line of at most 200 characters without control, format, or line-separator characters." />
     <Error Condition="!Exists('$(PackageGuidanceDocument)')"
            Text="Missing package guidance document $(PackageGuidanceDocument)." />
     <PropertyGroup>
@@ -25,12 +113,11 @@
     <GetFileHash Files="$(PackageGuidanceDocument)" Algorithm="SHA256">
       <Output TaskParameter="Hash" PropertyName="_PackageGuidanceHash" />
     </GetFileHash>
-    <PropertyGroup>
-      <_PackageGuidanceDescriptionJson>$(PackageGuidanceDescription.Replace('\', '\\').Replace('"', '\"'))</_PackageGuidanceDescriptionJson>
-      <_PackageGuidanceManifestJson>{"schemaVersion":1,"documents":[{"path":"$(PackageGuidancePath)","sha256":"$(_PackageGuidanceHash.ToLowerInvariant())","usage":"$(PackageGuidanceUsage)","description":"$(_PackageGuidanceDescriptionJson)"}]}</_PackageGuidanceManifestJson>
-    </PropertyGroup>
-    <WriteLinesToFile File="$(_PackageGuidanceManifest)" Overwrite="true" Encoding="UTF-8"
-                      Lines="$([MSBuild]::Escape('$(_PackageGuidanceManifestJson)'))" />
+    <WriteAgentDocsGuidanceManifest ManifestFile="$(_PackageGuidanceManifest)"
+                                    DocumentPath="$(PackageGuidancePath)"
+                                    Sha256="$(_PackageGuidanceHash.ToLowerInvariant())"
+                                    Usage="$(PackageGuidanceUsage)"
+                                    Description="$(PackageGuidanceDescription)" />
     <ItemGroup>
       <None Include="$(PackageGuidanceDocument)" Pack="true"
             PackagePath="$(PackageGuidancePath)" />

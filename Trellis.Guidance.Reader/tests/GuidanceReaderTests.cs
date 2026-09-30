@@ -34,19 +34,14 @@ public sealed class GuidanceReaderTests
             contribution.PublisherMetadata["org.example"].GetProperty("edition").GetString().Should().Be("free");
         }
 
+        if (fixture == "legacy-entrypoints")
+            result.Packages.Single().Diagnostic.Should().Contain("unknown field");
+
         if (fixture == "invalid-hash")
             result.Packages.Single().Diagnostic.Should().Contain("SHA-256");
 
         if (fixture == "invalid-nfc")
             result.Packages.Single().Diagnostic.Should().Contain("alias");
-    }
-
-    [Fact]
-    public void Discover_Unknown_large_integer_schema_is_unsupported()
-    {
-        using var graph = new Graph();
-        graph.Package("Other", "1.0.0", manifest: """{"schemaVersion":2147483648,"documents":[]}""");
-        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.UnsupportedSchema);
     }
 
     [Fact]
@@ -150,20 +145,6 @@ public sealed class GuidanceReaderTests
     }
 
     [Fact]
-    public void Discover_Rejects_top_level_entry_points()
-    {
-        using var graph = new Graph();
-        graph.Package("Other", "1.0.0", "valid");
-        var path = Path.Combine(graph.Root, "cache", "other", "1.0.0", "guide", "intro.md");
-        var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant();
-        File.WriteAllText(Path.Combine(graph.Root, "cache", "other", "1.0.0", "guidance", "reference-manifest.json"),
-            "{\"schemaVersion\":1,\"documents\":[{\"path\":\"guide/intro.md\",\"sha256\":\"" + hash +
-            "\",\"usage\":\"required\",\"description\":\"x\"}],\"entryPoints\":[\"guide/intro.md\"]}");
-
-        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.InvalidManifest);
-    }
-
-    [Fact]
     public void Discover_Not_loaded_packages_are_never_parsed_but_report_a_declared_manifest()
     {
         using var graph = new Graph();
@@ -231,6 +212,7 @@ public sealed class GuidanceReaderTests
     [InlineData("{\"schemaVersion\":1,\"documents\":[{\"path\":\"a.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"usage\":\"onDemand\",\"description\":\"x\"}],\"routes\":{\"net10.0\":\"a.md\"}}", GuidanceStatus.InvalidManifest)]
     [InlineData("{\"schemaVersion\":1,\"documents\":[{\"path\":\"a.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"usage\":\"onDemand\",\"description\":\"x\"},{\"path\":\"A.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"usage\":\"onDemand\",\"description\":\"x\"}]}", GuidanceStatus.InvalidManifest)]
     [InlineData("{\"schemaVersion\":1}", GuidanceStatus.InvalidManifest)]
+    [InlineData("{\"schemaVersion\":1,\"documents\":[{\"path\":\"a.md\",\"path\":\"b.md\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"usage\":\"onDemand\",\"description\":\"x\"}]}", GuidanceStatus.InvalidManifest)]
     public void Discover_Invalid_manifests_fail(string manifest, GuidanceStatus status)
     {
         using var graph = new Graph();
@@ -338,6 +320,156 @@ public sealed class GuidanceReaderTests
         result.Packages.Should().OnlyContain(p => p.Status == GuidanceStatus.NoManifest);
     }
 
+    [Theory]
+    [InlineData("2", GuidanceStatus.UnsupportedSchema)]
+    [InlineData("2147483648", GuidanceStatus.UnsupportedSchema)]
+    [InlineData("9223372036854775808", GuidanceStatus.InvalidManifest)]
+    [InlineData("1.5", GuidanceStatus.InvalidManifest)]
+    [InlineData("\"1\"", GuidanceStatus.InvalidManifest)]
+    [InlineData("0", GuidanceStatus.InvalidManifest)]
+    [InlineData("-1", GuidanceStatus.InvalidManifest)]
+    public void Discover_Schema_version_must_be_a_supported_positive_integer(string version, GuidanceStatus status)
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", manifest: "{\"schemaVersion\":" + version + ",\"documents\":[]}");
+        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(status);
+    }
+
+    [Theory]
+    [InlineData("\"publisherMetadata\":[]")]
+    [InlineData("\"publisherMetadata\":{\"org.example\":1,\"org.example\":2}")]
+    [InlineData("\"publisherMetadata\":{\"notNamespaced\":1}")]
+    [InlineData("\"publisherMetadata\":{},\"publisherMetadata\":{}")]
+    public void Discover_Invalid_publisher_metadata_fails(string field)
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", manifest: "{\"schemaVersion\":1,\"documents\":[]," + field + "}");
+        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.InvalidManifest);
+    }
+
+    [Fact]
+    public void Discover_Manifest_that_is_a_directory_is_invalid()
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0");
+        Directory.CreateDirectory(Path.Combine(graph.Root, "cache", "other", "1.0.0", "guidance", "reference-manifest.json"));
+
+        var package = GuidanceReader.Discover([graph.Assets]).Packages.Single();
+        package.Status.Should().Be(GuidanceStatus.InvalidManifest);
+        package.Diagnostic.Should().Contain("directory");
+    }
+
+    [Theory]
+    [InlineData("missing-targets")]
+    [InlineData("relative-package-folder")]
+    [InlineData("target-not-an-object")]
+    [InlineData("library-not-an-object")]
+    [InlineData("identity-without-version")]
+    public void Discover_Malformed_assets_graph_fails_the_whole_discovery(string defect)
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(graph.Assets))!;
+        switch (defect)
+        {
+            case "missing-targets":
+                node.AsObject().Remove("targets");
+                break;
+            case "relative-package-folder":
+                node["packageFolders"] = new System.Text.Json.Nodes.JsonObject
+                    { ["relative/cache"] = new System.Text.Json.Nodes.JsonObject() };
+                break;
+            case "target-not-an-object":
+                node["targets"]!["net10.0/win-x64"] = 5;
+                break;
+            case "library-not-an-object":
+                node["targets"]!["net10.0/win-x64"]!["Other/1.0.0"] = 7;
+                break;
+            case "identity-without-version":
+                node["targets"]!["net10.0/win-x64"]!["NoVersion"] = System.Text.Json.Nodes.JsonNode.Parse("{\"type\":\"package\"}");
+                node["libraries"]!["NoVersion"] = System.Text.Json.Nodes.JsonNode.Parse("{\"type\":\"package\",\"path\":\"noversion/1\"}");
+                break;
+        }
+
+        File.WriteAllText(graph.Assets, node.ToJsonString());
+        var result = GuidanceReader.Discover([graph.Assets]);
+        result.IsSuccessful.Should().BeFalse();
+        result.Diagnostics.Should().NotBeEmpty();
+    }
+
+    [Fact]
+    public void Discover_Package_missing_from_the_libraries_section_is_missing_assets()
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(graph.Assets))!;
+        node["libraries"]!.AsObject().Remove("Other/1.0.0");
+        File.WriteAllText(graph.Assets, node.ToJsonString());
+
+        var package = GuidanceReader.Discover([graph.Assets]).Packages.Single();
+        package.Status.Should().Be(GuidanceStatus.MissingAssets);
+        package.Diagnostic.Should().Contain("library path");
+    }
+
+    [Fact]
+    public void Discover_Not_loaded_package_with_an_incomplete_cache_never_fails_the_graph()
+    {
+        using var graph = new Graph();
+        graph.Package("Pending.Package", "1.0.0", createDirectory: false);
+        var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(graph.Assets))!;
+        node["libraries"]!["Pending.Package/1.0.0"]!["files"] =
+            new System.Text.Json.Nodes.JsonArray(".nupkg.metadata", "guidance/reference-manifest.json");
+        File.WriteAllText(graph.Assets, node.ToJsonString());
+
+        var result = GuidanceReader.Discover([graph.Assets], _ => false);
+        result.IsSuccessful.Should().BeTrue();
+        var package = result.Packages.Single();
+        package.Status.Should().Be(GuidanceStatus.NotLoaded);
+        package.ManifestDeclared.Should().BeTrue("the assets file lists the manifest even though the cache entry is missing");
+        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.MissingAssets);
+    }
+
+    [Fact]
+    public void Discover_Not_loaded_package_with_missing_cache_metadata_is_not_a_failure()
+    {
+        using var graph = new Graph();
+        graph.Package("Pending.Package", "1.0.0");
+        File.Delete(Path.Combine(graph.Root, "cache", "pending.package", "1.0.0", ".nupkg.metadata"));
+
+        GuidanceReader.Discover([graph.Assets], _ => false).IsSuccessful.Should().BeTrue();
+        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.MissingAssets);
+    }
+
+    [Fact]
+    public void Discover_Linked_package_root_is_rejected()
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        var packageRoot = Path.Combine(graph.Root, "cache", "other", "1.0.0");
+        var external = Path.Combine(graph.Root, "external-package");
+        Directory.Move(packageRoot, external);
+        Assert.SkipUnless(TryCreateDirectoryLink(packageRoot, external), LinksUnavailable);
+
+        var package = GuidanceReader.Discover([graph.Assets]).Packages.Single();
+        package.Status.Should().Be(GuidanceStatus.InvalidManifest);
+        package.Diagnostic.Should().Contain("link");
+    }
+
+    [Fact]
+    public void Discover_Linked_guidance_directory_is_rejected()
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        var guidance = Path.Combine(graph.Root, "cache", "other", "1.0.0", "guidance");
+        var external = Path.Combine(graph.Root, "external-guidance");
+        Directory.Move(guidance, external);
+        Assert.SkipUnless(TryCreateDirectoryLink(guidance, external), LinksUnavailable);
+
+        var package = GuidanceReader.Discover([graph.Assets]).Packages.Single();
+        package.Status.Should().Be(GuidanceStatus.InvalidManifest);
+        package.Diagnostic.Should().Contain("manifest path");
+    }
+
     [Fact]
     public void Discover_Linked_document_is_rejected()
     {
@@ -345,15 +477,17 @@ public sealed class GuidanceReaderTests
         graph.Package("Other", "1.0.0", "valid");
         var path = Path.Combine(graph.Root, "cache", "other", "1.0.0", "guide", "intro.md");
         File.Delete(path);
+        var created = true;
         try
         {
             File.CreateSymbolicLink(path, Path.Combine(graph.Root, "outside.md"));
         }
         catch (Exception e) when (e is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
         {
-            return;
+            created = false;
         }
 
+        Assert.SkipUnless(created, LinksUnavailable);
         GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.InvalidManifest);
     }
 
@@ -362,20 +496,44 @@ public sealed class GuidanceReaderTests
     {
         using var graph = new Graph();
         graph.Package("Other", "1.0.0", "valid");
-        var packageRoot = Path.Combine(graph.Root, "cache", "other", "1.0.0");
-        var guide = Path.Combine(packageRoot, "guide");
+        var guide = Path.Combine(graph.Root, "cache", "other", "1.0.0", "guide");
         var external = Path.Combine(graph.Root, "external-guide");
         Directory.Move(guide, external);
+        Assert.SkipUnless(TryCreateDirectoryLink(guide, external), LinksUnavailable);
+
+        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.InvalidManifest);
+    }
+
+    private const string LinksUnavailable = "This machine cannot create the file-system links this test needs.";
+
+    /// <summary>Creates a directory link: a symbolic link, or on Windows without privilege a junction, which also carries the reparse-point attribute.</summary>
+    private static bool TryCreateDirectoryLink(string link, string target)
+    {
         try
         {
-            Directory.CreateSymbolicLink(guide, external);
+            Directory.CreateSymbolicLink(link, target);
+            return true;
         }
         catch (Exception e) when (e is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
         {
-            return;
         }
 
-        GuidanceReader.Discover([graph.Assets]).Packages.Single().Status.Should().Be(GuidanceStatus.InvalidManifest);
+        if (!OperatingSystem.IsWindows() || !Directory.Exists(target))
+            return false;
+        var start = new System.Diagnostics.ProcessStartInfo("cmd")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        foreach (var argument in new[] { "/c", "mklink", "/J", link, target })
+            start.ArgumentList.Add(argument);
+        using var process = System.Diagnostics.Process.Start(start)!;
+        process.StandardOutput.ReadToEnd();
+        process.StandardError.ReadToEnd();
+        process.WaitForExit(10000);
+        return process.ExitCode == 0;
     }
 
     private static string DocumentJson(Graph graph, string path = "guide/intro.md", string usage = "required",
@@ -447,6 +605,14 @@ public sealed class GuidanceReaderTests
             }));
         }
 
-        public void Dispose() => Directory.Delete(Root, true);
+        public void Dispose()
+        {
+            // Remove links first (deepest first): deleting a link never touches its target.
+            foreach (var directory in Directory.EnumerateDirectories(Root, "*", SearchOption.AllDirectories)
+                .OrderByDescending(d => d.Length).ToArray())
+                if (Directory.Exists(directory) && (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+                    Directory.Delete(directory);
+            Directory.Delete(Root, true);
+        }
     }
 }

@@ -20,9 +20,8 @@
           "description": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 200,
             "pattern": "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]*\\S[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]*$",
-            "description": "One line. The length limit counts Unicode scalar values after NFC normalization."
+            "description": "One line. Readers also enforce a limit of 200 Unicode scalar values counted after NFC normalization; JSON Schema cannot express that, so it is not a maxLength here."
           }
         },
         "if": { "properties": { "usage": { "enum": ["required", "onDemand"] } } },

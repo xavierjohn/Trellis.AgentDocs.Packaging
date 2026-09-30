@@ -107,8 +107,20 @@ public static partial class AgentDocsCommand
             (target.Any(char.IsWhiteSpace) && !link.Contains('%')))
             return false;
 
-        var candidates = target.StartsWith('/') ? [Path.GetFullPath(target.TrimStart('/'), root)]
-            : new[] { Path.GetFullPath(target, directory), Path.GetFullPath(target, root) };
+        // A malformed hand-written link (for example a decoded NUL) is not a path we can judge; ignore it
+        // rather than let path construction fail the whole command.
+        string[] candidates;
+        try
+        {
+            candidates = target.Contains('\0') ? []
+                : target.StartsWith('/') ? [Path.GetFullPath(target.TrimStart('/'), root)]
+                : [Path.GetFullPath(target, directory), Path.GetFullPath(target, root)];
+        }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+
         var inside = candidates.Where(candidate => Within(root, candidate)).ToArray();
         return inside.Length != 0 && inside.All(candidate => planned.TryGetValue(candidate, out var change)
                 ? change.After is null : !File.Exists(candidate));

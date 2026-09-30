@@ -301,7 +301,8 @@ public static partial class AgentDocsCommand
         foreach (var package in packages.OrderBy(p => p.PackageId, StringComparer.Ordinal)
             .ThenBy(p => p.Version, StringComparer.Ordinal))
         {
-            if (package.PackageRoot is null || !Directory.Exists(package.PackageRoot))
+            if (package.Status != GuidanceStatus.NotLoaded &&
+                (package.PackageRoot is null || !Directory.Exists(package.PackageRoot)))
                 incompatibilities.Add($"Package assets are missing: {package.PackageId}/{package.Version}");
         }
 

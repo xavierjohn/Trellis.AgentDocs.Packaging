@@ -180,6 +180,25 @@ public static class GuidanceReader
                 var roots = packageFolders.Select(folder => Path.Combine(folder, relative.Replace('/', Path.DirectorySeparatorChar)
                     .Replace('\\', Path.DirectorySeparatorChar))).ToArray();
                 var packageRoot = roots.FirstOrDefault(Directory.Exists);
+                var manifestListed = library.TryGetProperty("files", out var files) &&
+                    files.ValueKind == JsonValueKind.Array &&
+                    files.EnumerateArray().Any(file => file.ValueKind == JsonValueKind.String &&
+                        string.Equals(file.GetString()?.Replace('\\', '/'), ManifestPath, StringComparison.OrdinalIgnoreCase));
+                var contentHash = TryString(library, "sha512", out var hash) ? hash : null;
+                // A package the caller declines is decided before its cache is inspected: nothing about it,
+                // including an incomplete cache entry, may fail discovery.
+                if (!shouldLoad(id))
+                {
+                    packages.Add(new GuidancePackage(scope, id, version, packageRoot ?? roots.FirstOrDefault(),
+                        GuidanceStatus.NotLoaded, null, null)
+                    {
+                        NuGetContentHash = contentHash,
+                        ManifestDeclared = manifestListed || (packageRoot is not null &&
+                            File.Exists(Path.Combine(packageRoot, "guidance", "reference-manifest.json")))
+                    });
+                    continue;
+                }
+
                 if (packageRoot is null)
                 {
                     packages.Add(new GuidancePackage(scope, id, version, roots.FirstOrDefault(),
@@ -194,21 +213,6 @@ public static class GuidanceReader
                 {
                     packages.Add(new GuidancePackage(scope, id, version, packageRoot,
                         GuidanceStatus.MissingAssets, null, $"Package '{id}/{version}': NuGet package cache metadata is missing."));
-                    continue;
-                }
-
-                var manifestListed = library.TryGetProperty("files", out var files) &&
-                    files.ValueKind == JsonValueKind.Array &&
-                    files.EnumerateArray().Any(file => file.ValueKind == JsonValueKind.String &&
-                        string.Equals(file.GetString()?.Replace('\\', '/'), ManifestPath, StringComparison.OrdinalIgnoreCase));
-                var contentHash = TryString(library, "sha512", out var hash) ? hash : null;
-                if (!shouldLoad(id))
-                {
-                    packages.Add(new GuidancePackage(scope, id, version, packageRoot, GuidanceStatus.NotLoaded, null, null)
-                    {
-                        NuGetContentHash = contentHash,
-                        ManifestDeclared = manifestListed || File.Exists(Path.Combine(packageRoot, "guidance", "reference-manifest.json"))
-                    });
                     continue;
                 }
 
