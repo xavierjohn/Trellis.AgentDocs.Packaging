@@ -90,8 +90,182 @@
     </Task>
   </UsingTask>
 
+  <!--
+    Multi-document publishers declare PackageGuidanceItem items instead of the single-document properties:
+
+      <PackageGuidanceItem Include="docs/start.md" PackagePath="guide/start.md" Usage="required"
+                           Description="Read before using X." />
+
+    Usage defaults to onDemand; a supporting document may omit its Description. The task packs nothing itself: it
+    checks the same rules the reader and `agentdocs validate` apply (portable Markdown path, usage, description,
+    no duplicates, at least one required or onDemand document), hashes each file and writes the manifest. Run
+    `agentdocs validate` on the built package for the deeper checks (links, size, discoverability).
+  -->
+  <UsingTask TaskName="WriteAgentDocsGuidanceManifestFromItems" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <ManifestFile ParameterType="System.String" Required="true" />
+      <Documents ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.Globalization" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Security.Cryptography" />
+      <Using Namespace="System.Text" />
+      <Using Namespace="System.Text.RegularExpressions" />
+      <Code Type="Method" Language="cs"><![CDATA[
+        public override bool Execute()
+        {
+            var ok = true;
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var entries = new List<string>();
+            var anyListed = false;
+            foreach (var item in Documents)
+            {
+                var source = item.GetMetadata("FullPath");
+                var path = item.GetMetadata("PackagePath");
+                var usage = item.GetMetadata("Usage");
+                if (usage.Length == 0)
+                    usage = "onDemand";
+                var name = item.ItemSpec;
+
+                if (!Regex.IsMatch(path, @"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*\.md$") ||
+                    Regex.IsMatch(path, @"(^|/)[^/]+[.](/|$)|(?i)(^|/)(con|prn|aux|nul|com[1-9]|lpt[1-9])([.]|/|$)"))
+                {
+                    Log.LogError("PackageGuidanceItem '" + name + "': PackagePath '" + path + "' must be a portable relative Markdown path with forward slashes and no device names.");
+                    ok = false;
+                    continue;
+                }
+
+                if (!seen.Add(path.Normalize(NormalizationForm.FormC)))
+                {
+                    Log.LogError("PackageGuidanceItem '" + name + "': PackagePath '" + path + "' is listed more than once.");
+                    ok = false;
+                    continue;
+                }
+
+                if (usage != "required" && usage != "onDemand" && usage != "supporting")
+                {
+                    Log.LogError("PackageGuidanceItem '" + name + "': Usage must be required, onDemand or supporting.");
+                    ok = false;
+                    continue;
+                }
+
+                if (!File.Exists(source))
+                {
+                    Log.LogError("PackageGuidanceItem '" + name + "': missing guidance document " + source + ".");
+                    ok = false;
+                    continue;
+                }
+
+                string description = null;
+                var raw = item.GetMetadata("Description");
+                if (raw.Length > 0 || usage != "supporting")
+                {
+                    try { description = raw.Trim().Normalize(NormalizationForm.FormC); }
+                    catch (ArgumentException) { description = ""; }
+                    var valid = description.Length > 0;
+                    var scalars = 0;
+                    for (var i = 0; valid && i < description.Length; i++)
+                    {
+                        var category = CharUnicodeInfo.GetUnicodeCategory(description, i);
+                        if (category == UnicodeCategory.Control || category == UnicodeCategory.Format ||
+                            category == UnicodeCategory.LineSeparator || category == UnicodeCategory.ParagraphSeparator)
+                            valid = false;
+                        if (char.IsHighSurrogate(description[i]) && i + 1 < description.Length &&
+                            char.IsLowSurrogate(description[i + 1]))
+                            i++;
+                        scalars++;
+                    }
+
+                    if (!valid || scalars > 200)
+                    {
+                        Log.LogError("PackageGuidanceItem '" + name + "': Description must be a single line of at most 200 characters, " +
+                            (usage == "supporting" ? "" : "not blank (a " + usage + " document needs one), ") +
+                            "without control, format, or line-separator characters.");
+                        ok = false;
+                        continue;
+                    }
+                }
+
+                if (usage != "supporting")
+                    anyListed = true;
+                string hash;
+                using (var stream = File.OpenRead(source))
+                    hash = BitConverter.ToString(SHA256.Create().ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+
+                var json = new StringBuilder("{\"path\":");
+                AppendString(json, path);
+                json.Append(",\"sha256\":");
+                AppendString(json, hash);
+                json.Append(",\"usage\":");
+                AppendString(json, usage);
+                if (description != null)
+                {
+                    json.Append(",\"description\":");
+                    AppendString(json, description);
+                }
+
+                json.Append('}');
+                entries.Add(json.ToString());
+            }
+
+            if (ok && entries.Count > 0 && !anyListed)
+            {
+                Log.LogError("Guidance needs at least one required or onDemand PackageGuidanceItem; agents are never told about supporting documents on their own.");
+                ok = false;
+            }
+
+            if (!ok)
+                return false;
+            var directory = Path.GetDirectoryName(Path.GetFullPath(ManifestFile));
+            if (!string.IsNullOrEmpty(directory))
+                Directory.CreateDirectory(directory);
+            File.WriteAllText(ManifestFile, "{\"schemaVersion\":1,\"documents\":[" + string.Join(",", entries) + "]}",
+                new UTF8Encoding(false));
+            return true;
+        }
+
+        private static void AppendString(StringBuilder json, string value)
+        {
+            json.Append('"');
+            foreach (var c in value)
+            {
+                if (c == '"')
+                    json.Append("\\\"");
+                else if (c == '\\')
+                    json.Append("\\\\");
+                else if (c < ' ')
+                    json.Append("\\u").Append(((int)c).ToString("x4"));
+                else
+                    json.Append(c);
+            }
+
+            json.Append('"');
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="GeneratePackageGuidanceManifestFromItems" BeforeTargets="_GetPackageFiles"
+          Condition="'$(IsPackable)' != 'false' AND '@(PackageGuidanceItem)' != ''">
+    <Error Condition="'$(PackageGuidanceDocument)' != '' OR '$(PackageGuidancePath)' != ''"
+           Text="Use either PackageGuidanceItem items or PackageGuidanceDocument/PackageGuidancePath, not both." />
+    <PropertyGroup>
+      <_PackageGuidanceManifest>$(IntermediateOutputPath)reference-manifest.json</_PackageGuidanceManifest>
+    </PropertyGroup>
+    <WriteAgentDocsGuidanceManifestFromItems ManifestFile="$(_PackageGuidanceManifest)"
+                                             Documents="@(PackageGuidanceItem)" />
+    <ItemGroup>
+      <None Include="@(PackageGuidanceItem)" Pack="true" />
+      <None Include="$(_PackageGuidanceManifest)" Pack="true"
+            PackagePath="guidance/reference-manifest.json" />
+    </ItemGroup>
+  </Target>
+
   <Target Name="GeneratePackageGuidanceManifest" BeforeTargets="_GetPackageFiles"
-          Condition="'$(IsPackable)' != 'false' AND
+          Condition="'$(IsPackable)' != 'false' AND '@(PackageGuidanceItem)' == '' AND
                      ('$(PackageGuidanceDocument)' != '' OR '$(PackageGuidancePath)' != '')">
     <PropertyGroup>
       <PackageGuidanceUsage Condition="'$(PackageGuidanceUsage)' == ''">onDemand</PackageGuidanceUsage>

@@ -1,0 +1,373 @@
+namespace Trellis.Guidance.Reader.Tests;
+
+using System.IO.Compression;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using FluentAssertions;
+
+public sealed class GuidanceValidatorTests
+{
+    private const string Start = "guide/start.md";
+    private const string Http = "guide/http.md";
+
+    [Fact]
+    public void A_well_formed_package_has_no_findings()
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n\nSee [http](http.md#calling-the-api).\n", "required", "Read before using X.")
+            .Doc(Http, "# Http\n\n## Calling the API\n\nBack to [start](start.md).\n", "supporting");
+
+        var result = package.Validate();
+
+        result.Diagnostics.Should().BeEmpty();
+        result.DocumentCount.Should().Be(2);
+        result.RequiredBytes.Should().Be(package.Files[Start].Length);
+    }
+
+    [Fact]
+    public void A_missing_manifest_is_AD001()
+    {
+        var result = GuidanceValidator.Validate(new Dictionary<string, byte[]>());
+        result.Diagnostics.Should().ContainSingle().Which.Code.Should().Be("AD001");
+    }
+
+    [Theory]
+    [InlineData("{not json")]
+    [InlineData("{\"schemaVersion\":2,\"documents\":[]}")]
+    [InlineData("{\"schemaVersion\":1}")]
+    [InlineData("{\"schemaVersion\":1,\"documents\":[],\"entryPoints\":[]}")]
+    [InlineData("{\"schemaVersion\":1,\"documents\":[],\"publisherMetadata\":{\"lockstep\":true}}")]
+    [InlineData("{\"schemaVersion\":1,\"schemaVersion\":1,\"documents\":[]}")]
+    [InlineData("[]")]
+    public void Malformed_manifests_are_AD001(string manifest)
+    {
+        var files = new Dictionary<string, byte[]> { ["guidance/reference-manifest.json"] = Encoding.UTF8.GetBytes(manifest) };
+        GuidanceValidator.Validate(files).Diagnostics.Should().Contain(d => d.Code == "AD001" && d.Severity == GuidanceSeverity.Error);
+    }
+
+    [Fact]
+    public void An_empty_manifest_is_valid()
+    {
+        new Package().Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_document_field_the_contract_does_not_know_is_AD001()
+    {
+        var package = new Package().Doc(Start, "# S\n", "required", "Read first.", extra: "\"role\":\"entry\"");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD001" && d.Message.Contains("role"));
+    }
+
+    [Theory]
+    [InlineData("../escape.md")]
+    [InlineData("/rooted.md")]
+    [InlineData("guide/notes.txt")]
+    [InlineData("guide/con.md")]
+    [InlineData("guide/trailing.md.")]
+    public void Unsafe_paths_are_AD002(string path)
+    {
+        var package = new Package().Doc(path, "# S\n", "required", "Read first.", pack: false);
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD002");
+    }
+
+    [Fact]
+    public void A_listed_document_that_is_not_packed_is_AD002()
+    {
+        var package = new Package().Doc(Start, "# S\n", "required", "Read first.", pack: false);
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD002" && d.Path == Start);
+    }
+
+    [Fact]
+    public void A_hash_that_does_not_match_the_packed_bytes_is_AD003()
+    {
+        var package = new Package().Doc(Start, "# S\n", "required", "Read first.");
+        package.Files[Start] = Encoding.UTF8.GetBytes("# Changed after the manifest was written\n");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD003" && d.Message.Contains("does not match"));
+    }
+
+    [Theory]
+    [InlineData("NOTHEX")]
+    [InlineData("ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789")]
+    [InlineData("")]
+    public void A_malformed_hash_is_AD003(string sha)
+    {
+        var package = new Package().Doc(Start, "# S\n", "required", "Read first.", sha: sha);
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD003");
+    }
+
+    [Fact]
+    public void An_unknown_usage_is_AD004()
+    {
+        var package = new Package().Doc(Start, "# S\n", "sometimes", "Read first.");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD004");
+    }
+
+    [Theory]
+    [InlineData("required")]
+    [InlineData("onDemand")]
+    public void A_listed_document_without_a_description_is_AD005(string usage)
+    {
+        var package = new Package().Doc(Start, "# S\n", usage);
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD005" && d.Path == Start);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("two\nlines")]
+    [InlineData("tab\there")]
+    [InlineData("zero\u200bwidth")]
+    [InlineData("line\u2028separator")]
+    public void A_description_that_breaks_the_rules_is_AD005(string description)
+    {
+        var package = new Package().Doc(Start, "# S\n", "required", description);
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD005");
+    }
+
+    [Fact]
+    public void A_description_over_200_characters_is_AD005_but_exactly_200_is_fine()
+    {
+        new Package().Doc(Start, "# S\n", "required", new string('a', 201)).Validate().Diagnostics
+            .Should().Contain(d => d.Code == "AD005");
+        new Package().Doc(Start, "# S\n", "required", new string('a', 200)).Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Descriptions_count_unicode_scalars_after_normalisation()
+    {
+        // 100 astral characters are 200 UTF-16 units but only 100 scalars.
+        new Package().Doc(Start, "# S\n", "required", string.Concat(Enumerable.Repeat("\U0001F600", 100)))
+            .Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_supporting_document_may_omit_its_description()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\n[h](http.md)\n", "required", "Read first.")
+            .Doc(Http, "# H\n", "supporting");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_manifest_with_only_supporting_documents_is_AD006()
+    {
+        var package = new Package().Doc(Http, "# H\n", "supporting");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD006");
+    }
+
+    [Fact]
+    public void Duplicate_paths_are_AD007_including_after_case_folding()
+    {
+        var package = new Package()
+            .Doc("guide/Start.md", "# S\n", "required", "Read first.")
+            .Doc("guide/start.md", "# S\n", "onDemand", "Open when duplicated.");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD007");
+    }
+
+    [Fact]
+    public void A_document_used_as_a_directory_prefix_is_AD007()
+    {
+        var package = new Package()
+            .Doc("guide.md", "# S\n", "required", "Read first.")
+            .Doc("guide.md/inner.md", "# I\n", "onDemand", "Open when nested.");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD007");
+    }
+
+    [Fact]
+    public void Required_documents_over_the_threshold_warn_AD101()
+    {
+        var package = new Package().Doc(Start, "# S\n" + new string('x', 5000), "required", "Read first.");
+        var options = new GuidanceValidationOptions { MaxRequiredBytes = 1000 };
+        var result = package.Validate(options);
+        result.Diagnostics.Should().ContainSingle(d => d.Code == "AD101").Which.Severity.Should().Be(GuidanceSeverity.Warning);
+        result.HasErrors.Should().BeFalse();
+        package.Validate().Diagnostics.Should().BeEmpty("the default threshold is 32 KiB");
+    }
+
+    [Fact]
+    public void Only_required_documents_count_towards_the_size_threshold()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n", "required", "Read first.")
+            .Doc(Http, "# H\n" + new string('x', 60000), "onDemand", "Open when calling X.");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Broken_links_warn_AD102()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\n[missing](gone.md)\n[out](../../elsewhere.md)\n[heading](http.md#nope)\n[ok](http.md#h)\n", "required", "Read first.")
+            .Doc(Http, "# H\n", "supporting");
+        var findings = package.Validate().Diagnostics.Where(d => d.Code == "AD102").ToArray();
+        findings.Should().HaveCount(3);
+        findings.Select(d => d.Line).Should().BeEquivalentTo([3, 4, 5]);
+    }
+
+    [Fact]
+    public void A_link_to_a_packed_but_unlisted_document_warns_AD102()
+    {
+        var package = new Package().Doc(Start, "# S\n\n[x](extra.md)\n", "required", "Read first.");
+        package.Files["guide/extra.md"] = Encoding.UTF8.GetBytes("# Extra\n");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD102" && d.Message.Contains("not listed"));
+    }
+
+    [Fact]
+    public void Links_that_are_not_relative_documents_are_ignored()
+    {
+        var package = new Package().Doc(Start,
+            "# S\n\n[web](https://example.com/a.md) [mail](mailto:a@b.c) [proto](//cdn/x.md) [img](pic.png) [code](x.cs)\n",
+            "required", "Read first.");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Links_inside_fenced_code_are_not_checked_and_long_fences_are_honoured()
+    {
+        var package = new Package().Doc(Start,
+            "# S\n\n````md\n```\n[a](nope.md)\n```\n[b](nope-too.md)\n````\n\n~~~\n[c](nope-three.md)\n~~~\n", "required", "Read first.");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Reference_style_links_and_encoded_paths_are_checked()
+    {
+        var package = new Package().Doc(Start, "# S\n\n[x][ref]\n\n[ref]: missing%20doc.md\n", "required", "Read first.");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD102" && d.Line == 5);
+    }
+
+    [Fact]
+    public void Anchors_follow_github_slugs_including_repeated_headings_and_punctuation()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\n[a](http.md#recipe-1--crud-aggregate) [b](http.md#same-1) [c](http.md#code-thing)\n", "required", "Read first.")
+            .Doc(Http, "# H\n\n## Recipe 1 — CRUD aggregate\n\n## Same\n\n## Same\n\n## `Code` thing\n", "supporting");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_supporting_document_nothing_links_to_warns_AD103()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n", "required", "Read first.")
+            .Doc(Http, "# H\n\n[self](#h)\n", "supporting");
+        package.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD103").Which.Path.Should().Be(Http);
+    }
+
+    [Fact]
+    public void An_on_demand_document_needs_no_inbound_link()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n", "required", "Read first.")
+            .Doc(Http, "# H\n", "onDemand", "Open when calling X.");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Front_matter_with_a_misplaced_or_missing_closing_fence_warns_AD104()
+    {
+        var misplaced = new Package().Doc(Start, "---\ntitle: x\n\n# Heading inside\n\nbody\n---\n", "required", "Read first.");
+        misplaced.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD104").Which.Line.Should().Be(4);
+
+        var unclosed = new Package().Doc(Start, "---\ntitle: x\nagent_usage: required\n", "required", "Read first.");
+        unclosed.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD104");
+
+        var fine = new Package().Doc(Start, "---\ntitle: x\n---\n\n# Heading\n", "required", "Read first.");
+        fine.Validate().Diagnostics.Should().BeEmpty();
+
+        var crlf = new Package().Doc(Start, "﻿---\r\ntitle: x\r\n---\r\n\r\n# Heading\r\n", "required", "Read first.");
+        crlf.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void An_unlisted_markdown_file_beside_listed_guidance_warns_AD105_but_root_files_do_not()
+    {
+        var package = new Package().Doc(Start, "# S\n", "required", "Read first.");
+        package.Files["guide/forgotten.md"] = Encoding.UTF8.GetBytes("# Forgotten\n");
+        package.Files["README.md"] = Encoding.UTF8.GetBytes("# Package readme\n");
+        package.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD105").Which.Path.Should().Be("guide/forgotten.md");
+    }
+
+    [Fact]
+    public void Findings_are_never_reported_for_documents_that_cannot_be_read()
+    {
+        var package = new Package().Doc(Start, "# S\n\n[x](gone.md)\n", "required", "Read first.", pack: false);
+        package.Validate().Diagnostics.Should().OnlyContain(d => d.Code == "AD002");
+    }
+
+    [Fact]
+    public void A_directory_and_a_nupkg_are_validated_the_same_way()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\n[h](http.md)\n", "required", "Read first.")
+            .Doc(Http, "# H\n", "supporting");
+        package.Files["guidance/reference-manifest.json"] = package.Manifest();
+        var root = Path.Combine(Path.GetTempPath(), "agentdocs-validator-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            foreach (var (path, bytes) in package.Files)
+            {
+                var target = Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                File.WriteAllBytes(target, bytes);
+            }
+
+            var nupkg = Path.Combine(root, "sample.nupkg");
+            using (var archive = ZipFile.Open(nupkg, ZipArchiveMode.Create))
+            {
+                foreach (var (path, bytes) in package.Files)
+                {
+                    using var stream = archive.CreateEntry(path).Open();
+                    stream.Write(bytes);
+                }
+            }
+
+            var fromNupkg = GuidanceValidator.ValidatePackage(nupkg);
+            File.Delete(nupkg);
+            var fromDirectory = GuidanceValidator.ValidatePackage(root);
+            fromNupkg.Diagnostics.Should().BeEmpty();
+            fromDirectory.Diagnostics.Should().BeEmpty();
+            fromNupkg.DocumentCount.Should().Be(fromDirectory.DocumentCount);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    private sealed class Package
+    {
+        private readonly List<string> _documents = [];
+
+        public Dictionary<string, byte[]> Files { get; } = new(StringComparer.Ordinal);
+
+        public Package Doc(string path, string text, string usage, string? description = null,
+            string? sha = null, string? extra = null, bool pack = true)
+        {
+            var bytes = Encoding.UTF8.GetBytes(text);
+            if (pack)
+                Files[path] = bytes;
+            var hash = sha ?? Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+            var entry = new StringBuilder("{\"path\":").Append(JsonSerializer.Serialize(path))
+                .Append(",\"sha256\":").Append(JsonSerializer.Serialize(hash))
+                .Append(",\"usage\":").Append(JsonSerializer.Serialize(usage));
+            if (description is not null)
+                entry.Append(",\"description\":").Append(JsonSerializer.Serialize(description));
+            if (extra is not null)
+                entry.Append(',').Append(extra);
+            _documents.Add(entry.Append('}').ToString());
+            return this;
+        }
+
+        public byte[] Manifest() => Encoding.UTF8.GetBytes(
+            "{\"schemaVersion\":1,\"documents\":[" + string.Join(',', _documents) + "]}");
+
+        public GuidanceValidation Validate(GuidanceValidationOptions? options = null)
+        {
+            Files["guidance/reference-manifest.json"] = Manifest();
+            return GuidanceValidator.Validate(Files, options);
+        }
+    }
+}

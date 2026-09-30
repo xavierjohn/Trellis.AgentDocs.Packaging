@@ -126,6 +126,18 @@ missing.
 | `agentdocs sync` | Update installed guides and the index from the recorded graph and the policy. |
 | `agentdocs check` | Check graph and installed context without writing; useful in CI. |
 | `agentdocs remove` | Remove owned guides, pointers, and context state without touching customer text or the policy. |
+| `agentdocs validate <package.nupkg\|directory>` | For authors: check a package's guidance before publishing. Read-only; needs no repository, restore or policy. |
+
+`validate` is the publisher-side check, so a mistake is caught before a consumer
+meets it. It reports errors for contract violations (`AD001`-`AD007`: manifest
+shape, unsafe or missing paths, hash mismatches, usage, descriptions, at least
+one required or on-demand document, duplicates) and warnings for guidance that
+is valid but hard to use (`AD101`-`AD104`, `AD105`: an oversized required set,
+broken relative links, supporting documents nothing links to, malformed front
+matter, Markdown files beside the guidance that the manifest does not list).
+It exits 1 on errors, and on warnings with `--strict`. Use
+`--max-required-bytes N` to change the required-size threshold (default 32768)
+and `--format json` for machine-readable output on standard output.
 
 `init` accepts `--restore` if the selected project has not yet been restored,
 `--source-root DIR` for additional source directories, and `--dry-run` to

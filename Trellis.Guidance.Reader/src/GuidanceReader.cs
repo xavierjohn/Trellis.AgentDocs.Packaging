@@ -352,7 +352,7 @@ public static class GuidanceReader
         }
     }
 
-    private static bool TryUsage(string text, out GuidanceUsage usage)
+    internal static bool TryUsage(string text, out GuidanceUsage usage)
     {
         switch (text)
         {
@@ -364,7 +364,7 @@ public static class GuidanceReader
     }
 
     /// <summary>One line, not blank, at most 200 Unicode scalar values after NFC, with no control (Cc), format (Cf), line separator (Zl), or paragraph separator (Zp) characters.</summary>
-    private static bool ValidDescription(string value, out string? description)
+    internal static bool ValidDescription(string value, out string? description)
     {
         description = null;
         if (string.IsNullOrWhiteSpace(value))
@@ -407,7 +407,7 @@ public static class GuidanceReader
         return false;
     }
 
-    private static bool SafePath(string path)
+    internal static bool SafePath(string path)
     {
         if (string.IsNullOrEmpty(path) || path[0] is '/' or '\\' ||
             path.Any(c => c is < ' ' or '<' or '>' or ':' or '"' or '|' or '?' or '*'))
@@ -418,12 +418,12 @@ public static class GuidanceReader
             !ReservedNames.Contains(segment.Split('.')[0]));
     }
 
-    private static bool Namespaced(string key) =>
+    internal static bool Namespaced(string key) =>
         key.Length > 2 && key.Contains('.') &&
         key.Split('.').All(p => p.Length > 0 && p.All(c => char.IsAsciiLetterOrDigit(c) || c == '-'));
 
-    private static bool Object(JsonElement element) => element.ValueKind == JsonValueKind.Object;
-    private static bool DuplicateProperties(JsonElement element) => element.ValueKind switch
+    internal static bool Object(JsonElement element) => element.ValueKind == JsonValueKind.Object;
+    internal static bool DuplicateProperties(JsonElement element) => element.ValueKind switch
     {
         JsonValueKind.Object => element.EnumerateObject().GroupBy(p => p.Name, StringComparer.Ordinal).Any(g => g.Count() > 1) ||
             element.EnumerateObject().Any(p => DuplicateProperties(p.Value)),
@@ -432,9 +432,9 @@ public static class GuidanceReader
     };
     private static bool TryObject(JsonElement obj, string name, out JsonElement value) =>
         obj.TryGetProperty(name, out value) && Object(value);
-    private static bool TryArray(JsonElement obj, string name, out JsonElement value) =>
+    internal static bool TryArray(JsonElement obj, string name, out JsonElement value) =>
         obj.TryGetProperty(name, out value) && value.ValueKind == JsonValueKind.Array;
-    private static bool TryString(JsonElement obj, string name, out string value)
+    internal static bool TryString(JsonElement obj, string name, out string value)
     {
         value = "";
         if (!obj.TryGetProperty(name, out var element) || element.ValueKind != JsonValueKind.String ||

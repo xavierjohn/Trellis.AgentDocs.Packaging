@@ -114,11 +114,47 @@ uses `PrivateAssets="all"`. The developer can opt in using the
 already-restored NuGet graph, verifies each guide, and writes only the
 repository-local context it owns. NuGet itself does not interpret the manifest.
 
-The preview helper intentionally supports one Markdown guide; the manifest
-format can represent several documents, each with its own `usage`
-(`required`, `onDemand`, or `supporting`), so publishers needing that today
-must produce the manifest themselves. See the
-[contract](Trellis.Guidance.Reader/docs/experimental-guidance-v1.md).
+### Several documents
+
+To publish more than one document, declare `PackageGuidanceItem` items instead
+of the single-document properties (using both is an error):
+
+```xml
+<ItemGroup>
+  <PackageGuidanceItem Include="docs/start.md" PackagePath="guide/start.md"
+                       Usage="required" Description="Read before using Example.Library." />
+  <PackageGuidanceItem Include="docs/http.md" PackagePath="guide/http.md"
+                       Description="Open when calling the Example HTTP client." />
+  <PackageGuidanceItem Include="docs/internals.md" PackagePath="guide/internals.md"
+                       Usage="supporting" />
+</ItemGroup>
+```
+
+`Include` is the source file and `PackagePath` its destination in the nupkg,
+under the same rules as above. `Usage` is `required`, `onDemand` (the default) or
+`supporting`; a supporting document may omit `Description`, because consumers do
+not list it and an agent reaches it through a link from another document. The
+helper checks the same rules the reader applies (path, usage, description,
+no duplicates, at least one required or on-demand document), hashes each file,
+and packs the documents and the manifest. Documents appear in the manifest in
+the order the items are declared.
+
+## Check your guidance before publishing
+
+The helper checks that the manifest is well formed. Run the
+[`agentdocs validate`](Trellis.AgentDocs/README.md) command on the built package
+to check the guidance itself: whether the required documents are small enough,
+whether relative links resolve, whether every supporting document is linked from
+somewhere an agent will read, and whether the front matter of your documents is
+closed properly.
+
+```powershell
+dotnet pack -c Release
+dotnet tool run agentdocs validate artifacts/Example.Library.1.0.0.nupkg --strict
+```
+
+See the [contract](Trellis.Guidance.Reader/docs/experimental-guidance-v1.md) for
+the manifest format.
 
 ## Write a good guide
 
