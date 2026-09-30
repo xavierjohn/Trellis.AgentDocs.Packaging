@@ -3,7 +3,6 @@ namespace Trellis.Guidance.Reader;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 
 /// <summary>How serious a validation diagnostic is.</summary>
@@ -16,7 +15,7 @@ public enum GuidanceSeverity
 }
 
 /// <summary>One finding from <see cref="GuidanceValidator"/>.</summary>
-/// <param name="Code">Stable identifier: ADnnn for errors, ADnnn (100 and up) for warnings.</param>
+/// <param name="Code">Stable identifier: AD001-AD008 for errors, AD101 and up for warnings.</param>
 /// <param name="Severity">Error or warning.</param>
 /// <param name="Path">Package-relative path the finding concerns, when there is one.</param>
 /// <param name="Line">One-based line in <paramref name="Path"/>, when known.</param>
@@ -48,25 +47,44 @@ public sealed record GuidanceValidation(IReadOnlyList<GuidanceDiagnostic> Diagno
 
 /// <summary>
 /// Checks a package's guidance the way an author needs it checked before publishing: the manifest against the
-/// contract (errors AD001-AD007) and the documents against what makes guidance discoverable (warnings AD101-AD105).
-/// It reads a package or an extracted directory only; it does not restore, run MSBuild or write files.
+/// contract (errors) and the documents against what makes guidance discoverable (warnings). The manifest rules are
+/// the very code <see cref="GuidanceReader"/> applies, so a package this validator accepts is not rejected by the
+/// reader for manifest reasons. It reads a package or an extracted directory only; it does not restore, run MSBuild
+/// or write files.
 /// </summary>
 public static class GuidanceValidator
 {
     private const string ManifestPath = "guidance/reference-manifest.json";
-    private static readonly Regex InlineLink = new(@"\]\((?<target>[^)\s]+)(?:\s+(?:""[^""]*""|'[^']*'))?\)", RegexOptions.Compiled);
-    private static readonly Regex ReferenceLink = new(@"^\s{0,3}\[[^\]]+\]:\s*(?<target>\S+)", RegexOptions.Compiled);
+    private static readonly Regex InlineLink = new(
+        @"\]\((?:<(?<target>[^>]+)>|(?<target>(?:[^()\s]|\([^()\s]*\))+))(?:\s+(?:""[^""]*""|'[^']*'))?\)", RegexOptions.Compiled);
+    private static readonly Regex ReferenceLink = new(@"^\s{0,3}\[[^\]]+\]:\s*(?<target><[^>]+>|\S+)", RegexOptions.Compiled);
+    private static readonly Regex InlineCode = new(@"(`+)[^`].*?\1", RegexOptions.Compiled);
     private static readonly Regex Heading = new(@"^\s{0,3}#{1,6}\s+(?<text>.*?)\s*#*\s*$", RegexOptions.Compiled);
+    private static readonly Regex SetextUnderline = new(@"^\s{0,3}(=+|-+)\s*$", RegexOptions.Compiled);
+    private static readonly Regex YamlLine = new(
+        @"^(\s*$|\s|#|-(\s|$)|(""[^""]*""|'[^']*'|[^\s:#][^\s:]*)\s*:(\s|$))", RegexOptions.Compiled);
+    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
     /// <summary>Validates a <c>.nupkg</c> file or a directory holding an extracted package.</summary>
     public static GuidanceValidation ValidatePackage(string path, GuidanceValidationOptions? options = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
-        return Validate(Directory.Exists(path) ? ReadDirectory(path) : ReadPackageFile(path), options);
+        if (!Directory.Exists(path))
+            return Validate(ReadPackageFile(path), options);
+
+        var linked = new HashSet<string>(StringComparer.Ordinal);
+        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+            return new GuidanceValidation(
+                [new GuidanceDiagnostic("AD001", GuidanceSeverity.Error, null, null, "The package directory is a link; validate the real directory.")], 0, 0);
+        return Validate(ReadDirectory(Path.GetFullPath(path), linked), options, linked);
     }
 
     /// <summary>Validates package contents keyed by package-relative path with forward slashes.</summary>
-    public static GuidanceValidation Validate(IReadOnlyDictionary<string, byte[]> files, GuidanceValidationOptions? options = null)
+    public static GuidanceValidation Validate(IReadOnlyDictionary<string, byte[]> files, GuidanceValidationOptions? options = null) =>
+        Validate(files, options, null);
+
+    private static GuidanceValidation Validate(IReadOnlyDictionary<string, byte[]> files, GuidanceValidationOptions? options,
+        IReadOnlySet<string>? linked)
     {
         ArgumentNullException.ThrowIfNull(files);
         options ??= new GuidanceValidationOptions();
@@ -75,6 +93,7 @@ public static class GuidanceValidator
             diagnostics.Add(new GuidanceDiagnostic(code, GuidanceSeverity.Error, path, line, message));
         void Warn(string code, string? path, string message, int? line = null) =>
             diagnostics.Add(new GuidanceDiagnostic(code, GuidanceSeverity.Warning, path, line, message));
+        bool IsLinked(string path) => linked is not null && PathChain(path).Any(linked.Contains);
 
         if (!files.TryGetValue(ManifestPath, out var manifestBytes))
         {
@@ -82,75 +101,67 @@ public static class GuidanceValidator
             return new GuidanceValidation(diagnostics, 0, 0);
         }
 
-        var declared = ReadManifest(manifestBytes, Error);
-        if (declared is null)
+        if (IsLinked(ManifestPath))
+        {
+            Error("AD001", ManifestPath, "The manifest path contains a link/reparse point, which consumers reject.");
             return new GuidanceValidation(diagnostics, 0, 0);
+        }
 
-        var documents = new List<Declared>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var entry in declared)
+        var parse = ManifestCheck.Parse(manifestBytes);
+        foreach (var issue in parse.Issues)
+            Error(issue.Code, issue.Path ?? ManifestPath, issue.Message);
+
+        var readable = new List<Doc>();
+        var requiredBytes = 0L;
+        foreach (var document in parse.Documents)
         {
-            if (entry.Path is null)
-                continue;
-            var alias = entry.Path.Replace('\\', '/').Normalize(NormalizationForm.FormC);
-            if (!seen.Add(alias))
+            var path = document.Path;
+            var canonical = path.Replace('\\', '/');
+            if (!canonical.EndsWith(".md", StringComparison.OrdinalIgnoreCase))
             {
-                Error("AD007", entry.Path, "The document is listed more than once (compared after Unicode normalisation, ignoring case).");
+                Error("AD002", path, "Guidance documents must be Markdown (.md); the tool installs Markdown only.");
                 continue;
             }
 
-            documents.Add(entry);
-        }
+            if (IsLinked(canonical))
+            {
+                Error("AD002", path, "The document path contains a link/reparse point, which consumers reject.");
+                continue;
+            }
 
-        foreach (var entry in documents)
-        {
-            var path = entry.Path!;
-            var pathOk = GuidanceReader.SafePath(path) && path.EndsWith(".md", StringComparison.OrdinalIgnoreCase);
-            if (!pathOk)
-                Error("AD002", path, "The path must be a portable relative Markdown path (no rooted, '..', device or trailing-dot segments).");
-            else if (!files.ContainsKey(path))
+            if (!files.TryGetValue(canonical, out var bytes))
+            {
                 Error("AD002", path, "The document is listed in the manifest but is not in the package.");
+                continue;
+            }
 
-            if (entry.Sha256 is null || entry.Sha256.Length != 64 || !entry.Sha256.All(c => c is (>= '0' and <= '9') or (>= 'a' and <= 'f')))
-                Error("AD003", path, "sha256 must be 64 lowercase hexadecimal characters.");
-            else if (pathOk && files.TryGetValue(path, out var bytes) &&
-                !string.Equals(Convert.ToHexString(SHA256.HashData(bytes)), entry.Sha256, StringComparison.OrdinalIgnoreCase))
+            if (document.Usage == GuidanceUsage.Required)
+                requiredBytes += bytes.Length;
+            if (!string.Equals(Convert.ToHexString(SHA256.HashData(bytes)), document.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
                 Error("AD003", path, "sha256 does not match the packed bytes; regenerate the manifest after changing the document.");
-
-            if (entry.Usage is null || !GuidanceReader.TryUsage(entry.Usage, out _))
-                Error("AD004", path, "usage must be required, onDemand or supporting.");
-
-            var needsDescription = entry.Usage is "required" or "onDemand";
-            if (entry.Description is null)
-            {
-                if (needsDescription)
-                    Error("AD005", path, $"A {entry.Usage} document needs a description that says when to open it.");
+                continue;
             }
-            else if (!GuidanceReader.ValidDescription(entry.Description, out _))
+
+            string text;
+            try
             {
-                Error("AD005", path, "description must be one non-blank line of at most 200 characters, without control, format or line-separator characters.");
+                text = Decode(bytes);
             }
+            catch (DecoderFallbackException)
+            {
+                Error("AD008", path, "The document is not valid UTF-8, which the tool requires when installing it.");
+                continue;
+            }
+
+            readable.Add(new Doc(canonical, document.Usage, text));
         }
 
-        if (documents.Count > 0 && !documents.Any(d => d.Usage is "required" or "onDemand"))
-            Error("AD006", ManifestPath, "A non-empty manifest needs at least one required or onDemand document; agents are never told about supporting documents on their own.");
-
-        var alias2 = documents.Where(d => d.Path is not null).Select(d => d.Path!.Replace('\\', '/').Normalize(NormalizationForm.FormC)).ToArray();
-        foreach (var path in alias2.Where(p => alias2.Any(o => o.StartsWith(p + "/", StringComparison.OrdinalIgnoreCase))))
-            Error("AD007", path, "A document path is also used as a directory prefix by another document.");
-
-        var required = documents.Where(d => d.Usage == "required" && d.Path is not null && files.ContainsKey(d.Path)).ToArray();
-        var requiredBytes = required.Sum(d => (long)files[d.Path!].Length);
-
-        // Warnings only make sense for documents that exist.
-        var readable = documents.Where(d => d.Path is not null && files.ContainsKey(d.Path) &&
-            GuidanceReader.SafePath(d.Path)).ToList();
         AnalyseDocuments(files, readable, requiredBytes, options, Warn);
-
-        return new GuidanceValidation(diagnostics, documents.Count, requiredBytes);
+        return new GuidanceValidation(diagnostics, parse.Documents.Count, requiredBytes);
     }
 
-    private static void AnalyseDocuments(IReadOnlyDictionary<string, byte[]> files, List<Declared> documents,
+    private static void AnalyseDocuments(IReadOnlyDictionary<string, byte[]> files, List<Doc> documents,
         long requiredBytes, GuidanceValidationOptions options, Action<string, string?, string, int?> warn)
     {
         if (requiredBytes > options.MaxRequiredBytes)
@@ -158,14 +169,15 @@ public static class GuidanceValidator
                 $"Required documents total {requiredBytes:N0} bytes (about {requiredBytes / 4:N0} tokens), above the {options.MaxRequiredBytes:N0}-byte threshold. " +
                 "Every agent reads them before any work; move detail into onDemand documents.", null);
 
-        var texts = documents.ToDictionary(d => d.Path!, d => Decode(files[d.Path!]), StringComparer.Ordinal);
-        var headingSlugs = texts.ToDictionary(pair => pair.Key, pair => Slugs(pair.Value), StringComparer.Ordinal);
-        var linkedFrom = new HashSet<string>(StringComparer.Ordinal);
+        var byPath = documents.ToDictionary(d => d.Path, StringComparer.Ordinal);
+        var slugs = documents.ToDictionary(d => d.Path, d => Slugs(d.Text), StringComparer.Ordinal);
+        var edges = documents.ToDictionary(d => d.Path, _ => new HashSet<string>(StringComparer.Ordinal), StringComparer.Ordinal);
 
-        foreach (var (path, text) in texts)
+        foreach (var document in documents)
         {
-            FrontMatter(path, text, warn);
-            foreach (var (target, line) in Links(text))
+            var path = document.Path;
+            FrontMatter(path, document.Text, warn);
+            foreach (var (target, line) in Links(document.Text))
             {
                 var hash = target.IndexOf('#');
                 var file = hash < 0 ? target : target[..hash];
@@ -196,44 +208,64 @@ public static class GuidanceValidator
                         continue;
                     }
 
-                    if (!texts.ContainsKey(resolved))
+                    if (!byPath.ContainsKey(resolved))
                     {
-                        warn("AD102", path, $"Link '{target}' points to '{resolved}', which is in the package but not listed in the manifest, so it is not installed.", line);
+                        warn("AD102", path, $"Link '{target}' points to '{resolved}', which is in the package but not an installed guidance document, so it will not exist after install.", line);
                         continue;
                     }
                 }
 
                 if (!string.Equals(resolved, path, StringComparison.Ordinal))
-                    linkedFrom.Add(resolved);
-                if (fragment.Length > 0 && headingSlugs.TryGetValue(resolved, out var slugs) &&
-                    !slugs.Contains(Unescape(fragment).ToLowerInvariant()))
+                    edges[path].Add(resolved);
+                if (fragment.Length > 0 && !slugs[resolved].Contains(Unescape(fragment).ToLowerInvariant()))
                     warn("AD102", path, $"Link '{target}' points to a heading that does not exist in '{resolved}'.", line);
             }
         }
 
-        foreach (var document in documents.Where(d => d.Usage == "supporting" && !linkedFrom.Contains(d.Path!)))
-            warn("AD103", document.Path, "No other document links to this supporting document, and the index does not list supporting documents, so agents cannot discover it.", null);
+        // An agent is told about required and on-demand documents, and follows links from there.
+        var reachable = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<string>();
+        foreach (var root in documents.Where(d => d.Usage != GuidanceUsage.Supporting))
+        {
+            reachable.Add(root.Path);
+            queue.Enqueue(root.Path);
+        }
 
-        var listed = new HashSet<string>(documents.Select(d => d.Path!), StringComparer.Ordinal);
-        var directories = documents.Select(d => DirectoryOf(d.Path!)).Where(d => d.Length > 0).ToHashSet(StringComparer.Ordinal);
-        foreach (var file in files.Keys.Where(f => f.EndsWith(".md", StringComparison.OrdinalIgnoreCase) &&
-                     !listed.Contains(f) && directories.Contains(DirectoryOf(f))).Order(StringComparer.Ordinal))
+        while (queue.Count > 0)
+            foreach (var next in edges[queue.Dequeue()].Where(reachable.Add))
+                queue.Enqueue(next);
+        foreach (var document in documents.Where(d => d.Usage == GuidanceUsage.Supporting && !reachable.Contains(d.Path)))
+            warn("AD103", document.Path,
+                "No required or on-demand document links to this supporting document, directly or through other documents, and the index does not list supporting documents, so agents cannot discover it.", null);
+
+        var listed = new HashSet<string>(documents.Select(d => d.Path), StringComparer.Ordinal);
+        var directories = documents.Select(d => DirectoryOf(d.Path)).Where(d => d.Length > 0).ToHashSet(StringComparer.Ordinal);
+        var seenContent = new HashSet<byte[]>(ReferenceEqualityComparer.Instance);
+        foreach (var path in listed)
+            seenContent.Add(files[path]);
+        foreach (var (file, bytes) in files.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+        {
+            // A package can be reachable under a raw and a decoded spelling; report the file once.
+            if (!seenContent.Add(bytes) || !file.EndsWith(".md", StringComparison.OrdinalIgnoreCase) ||
+                listed.Contains(file) || !directories.Contains(DirectoryOf(file)))
+                continue;
             warn("AD105", file, "This Markdown file sits beside listed guidance but is not in the manifest, so it is not installed. List it or move it.", null);
+        }
     }
 
     private static void FrontMatter(string path, string text, Action<string, string?, string, int?> warn)
     {
         var lines = text.Split('\n');
-        if (lines.Length == 0 || lines[0].TrimEnd('\r').Trim() != "---")
+        if (lines[0].TrimEnd('\r').Trim() != "---")
             return;
         for (var i = 1; i < lines.Length; i++)
         {
             var line = lines[i].TrimEnd('\r');
             if (Regex.IsMatch(line, @"^---\s*$"))
                 return;
-            if (Regex.IsMatch(line, @"^#{1,6}\s"))
+            if (!YamlLine.IsMatch(line))
             {
-                warn("AD104", path, "The front matter block contains what looks like a Markdown heading; the closing '---' is probably misplaced.", i + 1);
+                warn("AD104", path, $"The front matter block contains a line that is not YAML, so the closing '---' is probably misplaced: '{Truncate(line)}'.", i + 1);
                 return;
             }
         }
@@ -243,46 +275,23 @@ public static class GuidanceValidator
 
     private static IEnumerable<(string Target, int Line)> Links(string text)
     {
-        var fence = '\0';
-        var fenceLength = 0;
+        var fence = new FenceTracker();
         var lineNumber = 0;
         foreach (var raw in text.Split('\n'))
         {
             lineNumber++;
             var line = raw.TrimEnd('\r');
-            var trimmed = line.TrimStart();
-            if (trimmed.Length >= 3 && (trimmed[0] is '`' or '~'))
-            {
-                var marker = trimmed[0];
-                var length = 0;
-                while (length < trimmed.Length && trimmed[length] == marker)
-                    length++;
-                if (length >= 3)
-                {
-                    if (fence == '\0')
-                    {
-                        fence = marker;
-                        fenceLength = length;
-                    }
-                    else if (marker == fence && length >= fenceLength && string.IsNullOrWhiteSpace(trimmed[length..]))
-                    {
-                        fence = '\0';
-                    }
-
-                    continue;
-                }
-            }
-
-            if (fence != '\0')
+            if (fence.InCode(line))
                 continue;
-            foreach (Match match in InlineLink.Matches(line))
+            var visible = InlineCode.Replace(line, m => new string(' ', m.Length));
+            foreach (Match match in InlineLink.Matches(visible))
             {
                 var target = Filter(match.Groups["target"].Value);
                 if (target is not null)
                     yield return (target, lineNumber);
             }
 
-            var reference = ReferenceLink.Match(line);
+            var reference = ReferenceLink.Match(visible);
             if (reference.Success && Filter(reference.Groups["target"].Value) is { } referenceTarget)
                 yield return (referenceTarget, lineNumber);
         }
@@ -321,137 +330,72 @@ public static class GuidanceValidator
         return string.Join('/', parts);
     }
 
-    /// <summary>GitHub-style heading anchors, including the -1, -2 suffixes for repeated headings.</summary>
+    /// <summary>GitHub-style heading anchors (ATX and setext), including the -1, -2 suffixes for repeated headings.</summary>
     private static HashSet<string> Slugs(string text)
     {
         var slugs = new HashSet<string>(StringComparer.Ordinal);
         var counts = new Dictionary<string, int>(StringComparer.Ordinal);
-        var fence = '\0';
-        foreach (var raw in text.Split('\n'))
+        var lines = text.Split('\n').Select(l => l.TrimEnd('\r')).ToArray();
+        var start = 0;
+        if (lines.Length > 0 && lines[0].Trim() == "---")
         {
-            var line = raw.TrimEnd('\r');
-            var trimmed = line.TrimStart();
-            if (trimmed.StartsWith("```", StringComparison.Ordinal) || trimmed.StartsWith("~~~", StringComparison.Ordinal))
-            {
-                fence = fence == '\0' ? trimmed[0] : fence == trimmed[0] ? '\0' : fence;
-                continue;
-            }
+            var close = Array.FindIndex(lines, 1, l => Regex.IsMatch(l, @"^---\s*$"));
+            start = close < 0 ? 0 : close + 1;
+        }
 
-            if (fence != '\0' || Heading.Match(line) is not { Success: true } match)
-                continue;
-            var slug = Regex.Replace(match.Groups["text"].Value.Replace("`", "").ToLowerInvariant(), @"[^\p{L}\p{N}\p{M}_\- ]", "")
-                .Replace(' ', '-');
+        void Add(string heading)
+        {
+            var slug = Regex.Replace(heading.Replace("`", "").ToLowerInvariant(), @"[^\p{L}\p{N}\p{M}_\- ]", "").Replace(' ', '-');
             counts.TryGetValue(slug, out var seen);
             counts[slug] = seen + 1;
             slugs.Add(seen == 0 ? slug : slug + "-" + seen);
         }
 
+        var fence = new FenceTracker();
+        for (var i = start; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            if (fence.InCode(line))
+                continue;
+            if (Heading.Match(line) is { Success: true } atx)
+            {
+                Add(atx.Groups["text"].Value);
+            }
+            else if (i + 1 < lines.Length && line.Trim().Length > 0 && SetextUnderline.IsMatch(lines[i + 1]) &&
+                !Regex.IsMatch(line, @"^\s{0,3}([-*+>|]|\d+[.)])\s"))
+            {
+                Add(line.Trim());
+            }
+        }
+
         return slugs;
     }
 
-    private static List<Declared>? ReadManifest(byte[] bytes, Action<string, string?, string, int?> error)
-    {
-        void Fail(string message) => error("AD001", ManifestPath, message, null);
-        try
-        {
-            using var parsed = JsonDocument.Parse(bytes.AsMemory(bytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? 3 : 0));
-            var manifest = parsed.RootElement;
-            if (!GuidanceReader.Object(manifest) || GuidanceReader.DuplicateProperties(manifest))
-            {
-                Fail("The manifest must be a JSON object with unique property names.");
-                return null;
-            }
-
-            if (!manifest.TryGetProperty("schemaVersion", out var schema) || !schema.TryGetInt64(out var version))
-            {
-                Fail("schemaVersion is required and must be an integer.");
-                return null;
-            }
-
-            if (version != 1)
-            {
-                Fail($"schemaVersion {version} is not supported; this validator reads schemaVersion 1.");
-                return null;
-            }
-
-            var ok = true;
-            foreach (var property in manifest.EnumerateObject().Where(p => p.Name is not ("schemaVersion" or "documents" or "publisherMetadata")))
-            {
-                Fail($"Unknown manifest field '{property.Name}'.");
-                ok = false;
-            }
-
-            if (manifest.TryGetProperty("publisherMetadata", out var metadata))
-            {
-                if (!GuidanceReader.Object(metadata))
-                {
-                    Fail("publisherMetadata must be an object.");
-                    ok = false;
-                }
-                else
-                {
-                    foreach (var key in metadata.EnumerateObject().Where(p => !GuidanceReader.Namespaced(p.Name)))
-                    {
-                        Fail($"publisherMetadata key '{key.Name}' must be namespaced, for example 'org.example'.");
-                        ok = false;
-                    }
-                }
-            }
-
-            if (!GuidanceReader.TryArray(manifest, "documents", out var rawDocuments))
-            {
-                Fail("documents is required and must be an array.");
-                return null;
-            }
-
-            var result = new List<Declared>();
-            foreach (var raw in rawDocuments.EnumerateArray())
-            {
-                if (!GuidanceReader.Object(raw) || GuidanceReader.DuplicateProperties(raw))
-                {
-                    Fail("Every document must be an object with unique property names.");
-                    ok = false;
-                    continue;
-                }
-
-                foreach (var property in raw.EnumerateObject().Where(p => p.Name is not ("path" or "sha256" or "usage" or "description")))
-                {
-                    Fail($"Unknown document field '{property.Name}'.");
-                    ok = false;
-                }
-
-                string? Text(string name) => raw.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-                    ? value.GetString() : null;
-                var path = Text("path");
-                if (string.IsNullOrEmpty(path))
-                {
-                    error("AD002", ManifestPath, "A document has no path.", null);
-                    ok = false;
-                    continue;
-                }
-
-                result.Add(new Declared(path, Text("sha256"), Text("usage"), Text("description")));
-            }
-
-            return ok || result.Count > 0 ? result : null;
-        }
-        catch (JsonException e)
-        {
-            Fail("The manifest is not valid JSON: " + e.Message);
-            return null;
-        }
-    }
-
-    private static Dictionary<string, byte[]> ReadDirectory(string root)
+    private static Dictionary<string, byte[]> ReadDirectory(string root, HashSet<string> linked)
     {
         var files = new Dictionary<string, byte[]>(StringComparer.Ordinal);
-        var full = Path.GetFullPath(root);
-        foreach (var file in Directory.EnumerateFiles(full, "*", SearchOption.AllDirectories))
+        void Walk(string directory, string prefix)
         {
-            var relative = Path.GetRelativePath(full, file).Replace('\\', '/');
-            files[relative] = File.ReadAllBytes(file);
+            foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos().OrderBy(e => e.Name, StringComparer.Ordinal))
+            {
+                var relative = prefix.Length == 0 ? entry.Name : prefix + "/" + entry.Name;
+                if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    // Never follow a link: its target may be outside the package, and consumers reject linked paths.
+                    linked.Add(relative);
+                    if (entry is FileInfo)
+                        files[relative] = [];
+                    continue;
+                }
+
+                if (entry is DirectoryInfo)
+                    Walk(entry.FullName, relative);
+                else
+                    files[relative] = File.ReadAllBytes(entry.FullName);
+            }
         }
 
+        Walk(root, "");
         return files;
     }
 
@@ -464,14 +408,26 @@ public static class GuidanceValidator
             using var stream = entry.Open();
             using var buffer = new MemoryStream();
             stream.CopyTo(buffer);
-            files[Uri.UnescapeDataString(entry.FullName)] = buffer.ToArray();
+            var bytes = buffer.ToArray();
+            // Entry names are kept as written. NuGet percent-decodes names when it extracts a package, so a decoded
+            // spelling is also made available, pointing at the same bytes.
+            files[entry.FullName] = bytes;
+            if (entry.FullName.Contains('%') && Unescape(entry.FullName) is var decoded && decoded != entry.FullName)
+                files.TryAdd(decoded, bytes);
         }
 
         return files;
     }
 
     private static string Decode(byte[] bytes) =>
-        new UTF8Encoding(false).GetString(bytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? bytes[3..] : bytes);
+        StrictUtf8.GetString(bytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? bytes[3..] : bytes);
+
+    private static IEnumerable<string> PathChain(string path)
+    {
+        var parts = path.Split('/');
+        for (var i = 1; i <= parts.Length; i++)
+            yield return string.Join('/', parts.Take(i));
+    }
 
     private static string DirectoryOf(string path)
     {
@@ -479,11 +435,49 @@ public static class GuidanceValidator
         return slash < 0 ? "" : path[..slash];
     }
 
+    private static string Truncate(string value) => value.Length <= 60 ? value : value[..57] + "...";
+
     private static string Unescape(string value)
     {
         try { return Uri.UnescapeDataString(value); }
         catch (UriFormatException) { return value; }
     }
 
-    private sealed record Declared(string? Path, string? Sha256, string? Usage, string? Description);
+    /// <summary>Tracks Markdown fenced code so links and headings inside it are ignored, honouring fence length.</summary>
+    private sealed class FenceTracker
+    {
+        private char _marker;
+        private int _length;
+
+        /// <summary>True when the line is a fence marker or inside a fenced block.</summary>
+        public bool InCode(string line)
+        {
+            var trimmed = line.TrimStart();
+            if (trimmed.Length >= 3 && (trimmed[0] is '`' or '~'))
+            {
+                var marker = trimmed[0];
+                var length = 0;
+                while (length < trimmed.Length && trimmed[length] == marker)
+                    length++;
+                if (length >= 3)
+                {
+                    if (_marker == '\0')
+                    {
+                        _marker = marker;
+                        _length = length;
+                    }
+                    else if (marker == _marker && length >= _length && string.IsNullOrWhiteSpace(trimmed[length..]))
+                    {
+                        _marker = '\0';
+                    }
+
+                    return true;
+                }
+            }
+
+            return _marker != '\0';
+        }
+    }
+
+    private sealed record Doc(string Path, GuidanceUsage Usage, string Text);
 }

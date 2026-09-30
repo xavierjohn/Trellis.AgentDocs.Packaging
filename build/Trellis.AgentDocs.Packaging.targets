@@ -119,6 +119,8 @@
         {
             var ok = true;
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var prefixes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var paths = new List<string>();
             var entries = new List<string>();
             var anyListed = false;
             foreach (var item in Documents)
@@ -144,6 +146,30 @@
                     ok = false;
                     continue;
                 }
+
+                // Every directory prefix must have one spelling (compared after NFC, ignoring case), because
+                // consumers install into case-insensitive file systems and reject portable aliases.
+                var segments = path.Split('/');
+                string aliased = null;
+                for (var i = 1; i <= segments.Length && aliased == null; i++)
+                {
+                    var original = string.Join("/", segments, 0, i);
+                    var normalized = original.Normalize(NormalizationForm.FormC);
+                    string previous;
+                    if (prefixes.TryGetValue(normalized, out previous) && previous != original)
+                        aliased = previous + "' and '" + original;
+                    else
+                        prefixes[normalized] = original;
+                }
+
+                if (aliased != null)
+                {
+                    Log.LogError("PackageGuidanceItem '" + name + "': PackagePath '" + path + "' collides with a differently spelled path ('" + aliased + "'); portable aliases are rejected.");
+                    ok = false;
+                    continue;
+                }
+
+                paths.Add(path.Normalize(NormalizationForm.FormC));
 
                 if (usage != "required" && usage != "onDemand" && usage != "supporting")
                 {
@@ -209,6 +235,18 @@
 
                 json.Append('}');
                 entries.Add(json.ToString());
+            }
+
+            foreach (var path in paths)
+            {
+                foreach (var other in paths)
+                {
+                    if (other.StartsWith(path + "/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Log.LogError("PackagePath '" + path + "' is also used as a directory by '" + other + "'.");
+                        ok = false;
+                    }
+                }
             }
 
             if (ok && entries.Count > 0 && !anyListed)

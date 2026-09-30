@@ -90,7 +90,8 @@ public sealed class ValidateCommandTests : IDisposable
         var root = document.RootElement;
         root.GetProperty("ok").GetBoolean().Should().BeFalse();
         root.GetProperty("errors").GetInt32().Should().Be(1);
-        var finding = root.GetProperty("diagnostics").EnumerateArray().Single();
+        var finding = root.GetProperty("diagnostics").EnumerateArray()
+            .Single(d => d.GetProperty("severity").GetString() == "error");
         finding.GetProperty("code").GetString().Should().Be("AD005");
         finding.GetProperty("severity").GetString().Should().Be("error");
         finding.GetProperty("path").GetString().Should().Be("guide/start.md");

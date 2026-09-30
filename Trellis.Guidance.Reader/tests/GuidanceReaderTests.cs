@@ -549,6 +549,71 @@ public sealed class GuidanceReaderTests
         File.WriteAllText(Path.Combine(graph.Root, "cache", "other", "1.0.0", "guidance", "reference-manifest.json"),
             "{\"schemaVersion\":1,\"documents\":[" + documentsJson + "]}");
 
+    [Fact]
+    public void The_validator_and_the_reader_agree_on_which_manifests_are_acceptable()
+    {
+        var cafeDecomposed = string.Concat("cafe", (char)0x301);
+        var cafeComposed = string.Concat("caf", (char)0xE9);
+        (string Name, bool Acceptable, (string Path, string Usage, object? Description)[] Docs)[] cases =
+        [
+            ("plain", true, [("guide/start.md", "required", "Read first.")]),
+            ("backslash spelling", true, [("guide\\start.md", "required", "Read first.")]),
+            ("two siblings", true, [("docs/one.md", "required", "Read first."), ("docs/two.md", "supporting", null)]),
+            ("directory case alias", false, [("Docs/one.md", "required", "Read first."), ("docs/two.md", "onDemand", "Open when two.")]),
+            ("directory nfc alias", false, [(cafeDecomposed + "/one.md", "required", "Read first."), (cafeComposed + "/two.md", "onDemand", "Open when two.")]),
+            ("document reused as directory", false, [("guide.md", "required", "Read first."), ("guide.md/inner.md", "onDemand", "Open when inner.")]),
+            ("duplicate by case", false, [("guide/A.md", "required", "Read first."), ("guide/a.md", "onDemand", "Open when a.")]),
+            ("non-string description on supporting", false, [("guide/start.md", "required", "Read first."), ("guide/http.md", "supporting", 42)]),
+            ("blank description", false, [("guide/start.md", "required", "   ")]),
+            ("required without description", false, [("guide/start.md", "required", null)]),
+            ("only supporting", false, [("guide/http.md", "supporting", null)]),
+            ("unknown usage", false, [("guide/start.md", "always", "Read first.")]),
+            ("traversal", false, [("../start.md", "required", "Read first.")]),
+        ];
+
+        foreach (var (name, acceptable, docs) in cases)
+        {
+            using var graph = new Graph();
+            graph.Package("Other.Publisher", "1.0.0", manifest: Manifest(docs));
+            var packageRoot = Path.Combine(graph.Root, "cache", "other.publisher", "1.0.0");
+            foreach (var (path, _, _) in docs)
+            {
+                var file = Path.GetFullPath(Path.Combine(packageRoot, path.Replace('\\', '/')));
+                if (!file.StartsWith(packageRoot, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+                    File.WriteAllText(file, "# Doc\n");
+                }
+                catch (IOException)
+                {
+                    // A document reused as a directory cannot exist on disk; the manifest is rejected first.
+                }
+            }
+
+            var reader = GuidanceReader.Discover([graph.Assets]).Packages.Single();
+            var validation = GuidanceValidator.ValidatePackage(packageRoot);
+            (reader.Status == GuidanceStatus.Valid).Should().Be(acceptable, $"{name}: reader said {reader.Status} {reader.Diagnostic}");
+            validation.Diagnostics.Where(d => d.Severity == GuidanceSeverity.Error).Should().HaveCount(acceptable ? 0 : validation.ErrorCount,
+                $"{name}: {string.Join("; ", validation.Diagnostics.Select(d => d.Code + " " + d.Message))}");
+            validation.HasErrors.Should().Be(!acceptable, $"{name}: {string.Join("; ", validation.Diagnostics.Select(d => d.Code + " " + d.Message))}");
+        }
+
+        static string Manifest((string Path, string Usage, object? Description)[] docs)
+        {
+            var entries = docs.Select(doc =>
+            {
+                var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("# Doc\n"))).ToLowerInvariant();
+                var entry = new Dictionary<string, object?> { ["path"] = doc.Path, ["sha256"] = hash, ["usage"] = doc.Usage };
+                if (doc.Description is not null)
+                    entry["description"] = doc.Description;
+                return entry;
+            });
+            return JsonSerializer.Serialize(new { schemaVersion = 1, documents = entries });
+        }
+    }
+
     private sealed class Graph : IDisposable
     {
         private readonly Dictionary<string, object> _libraries = new();

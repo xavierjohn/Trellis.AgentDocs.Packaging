@@ -129,9 +129,9 @@ missing.
 | `agentdocs validate <package.nupkg\|directory>` | For authors: check a package's guidance before publishing. Read-only; needs no repository, restore or policy. |
 
 `validate` is the publisher-side check, so a mistake is caught before a consumer
-meets it. It reports errors for contract violations (`AD001`-`AD007`: manifest
+meets it. It reports errors for contract violations (`AD001`-`AD008`: manifest
 shape, unsafe or missing paths, hash mismatches, usage, descriptions, at least
-one required or on-demand document, duplicates) and warnings for guidance that
+one required or on-demand document, duplicate or aliased paths, non-UTF-8 documents) and warnings for guidance that
 is valid but hard to use (`AD101`-`AD104`, `AD105`: an oversized required set,
 broken relative links, supporting documents nothing links to, malformed front
 matter, Markdown files beside the guidance that the manifest does not list).

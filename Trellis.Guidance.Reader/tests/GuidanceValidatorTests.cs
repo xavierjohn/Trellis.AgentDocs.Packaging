@@ -211,7 +211,7 @@ public sealed class GuidanceValidatorTests
     {
         var package = new Package().Doc(Start, "# S\n\n[x](extra.md)\n", "required", "Read first.");
         package.Files["guide/extra.md"] = Encoding.UTF8.GetBytes("# Extra\n");
-        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD102" && d.Message.Contains("not listed"));
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD102" && d.Message.Contains("not an installed guidance document"));
     }
 
     [Fact]
@@ -268,8 +268,9 @@ public sealed class GuidanceValidatorTests
     [Fact]
     public void Front_matter_with_a_misplaced_or_missing_closing_fence_warns_AD104()
     {
-        var misplaced = new Package().Doc(Start, "---\ntitle: x\n\n# Heading inside\n\nbody\n---\n", "required", "Read first.");
-        misplaced.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD104").Which.Line.Should().Be(4);
+        // The real failure: the closing fence landed after the body, so prose sits inside the YAML block.
+        var misplaced = new Package().Doc(Start, "---\ntitle: x\n\n# Heading inside\n\nYou are looking at the guide.\n---\n", "required", "Read first.");
+        misplaced.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD104").Which.Line.Should().Be(6);
 
         var unclosed = new Package().Doc(Start, "---\ntitle: x\nagent_usage: required\n", "required", "Read first.");
         unclosed.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD104");
@@ -279,6 +280,15 @@ public sealed class GuidanceValidatorTests
 
         var crlf = new Package().Doc(Start, "﻿---\r\ntitle: x\r\n---\r\n\r\n# Heading\r\n", "required", "Read first.");
         crlf.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Yaml_comments_lists_and_indented_values_in_front_matter_are_not_reported()
+    {
+        var package = new Package().Doc(Start,
+            "---\n# a YAML comment\ntitle: x\ntags:\n  - a\n  - b\nrelated: [a, b]\nquoted: \"a: b\"\n\n---\n\n# Heading\n",
+            "required", "Read first.");
+        package.Validate().Diagnostics.Should().BeEmpty();
     }
 
     [Fact]
@@ -337,6 +347,165 @@ public sealed class GuidanceValidatorTests
         }
     }
 
+    [Fact]
+    public void A_cycle_of_supporting_documents_that_no_discoverable_document_reaches_warns_AD103()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n", "required", "Read first.")
+            .Doc("guide/a.md", "# A\n\n[b](b.md)\n", "supporting")
+            .Doc("guide/b.md", "# B\n\n[a](a.md)\n", "supporting");
+        package.Validate().Diagnostics.Where(d => d.Code == "AD103").Select(d => d.Path)
+            .Should().BeEquivalentTo("guide/a.md", "guide/b.md");
+    }
+
+    [Fact]
+    public void A_supporting_document_reached_through_another_supporting_document_is_discoverable()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\n[a](a.md)\n", "required", "Read first.")
+            .Doc("guide/a.md", "# A\n\n[b](b.md)\n", "supporting")
+            .Doc("guide/b.md", "# B\n", "supporting");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_document_that_is_not_valid_utf8_is_AD008()
+    {
+        var package = new Package().DocBytes(Start, [0x23, 0x20, 0xC3, 0x28, 0x0A], "required", "Read first.");
+        package.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD008").Which.Path.Should().Be(Start);
+    }
+
+    [Fact]
+    public void Backslash_separated_manifest_paths_are_found_and_hash_checked()
+    {
+        var package = new Package().Doc("guide\\start.md", "# S\n", "required", "Read first.", pack: false);
+        package.Files["guide/start.md"] = Encoding.UTF8.GetBytes("# S\n");
+        package.Validate().Diagnostics.Should().BeEmpty();
+
+        package.Files["guide/start.md"] = Encoding.UTF8.GetBytes("# Tampered\n");
+        package.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD003");
+    }
+
+    [Fact]
+    public void A_supporting_description_that_is_not_a_string_is_AD005()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\n[h](http.md)\n", "required", "Read first.")
+            .Doc(Http, "# H\n", "supporting", extra: "\"description\":42");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD005" && d.Path == Http);
+    }
+
+    [Fact]
+    public void Directory_aliases_and_documents_reused_as_directories_are_AD007()
+    {
+        new Package()
+            .Doc("Docs/one.md", "# One\n", "required", "Read first.")
+            .Doc("docs/two.md", "# Two\n", "onDemand", "Open when two.")
+            .Validate().Diagnostics.Should().Contain(d => d.Code == "AD007");
+    }
+
+    [Fact]
+    public void Headings_inside_a_longer_fence_are_not_anchors_and_setext_headings_are()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\n[fake](http.md#fake-heading) [real](http.md#setext-title) [sub](http.md#second-level)\n", "required", "Read first.")
+            .Doc(Http, "# H\n\n````md\n```\n## Fake heading\n```\n## Also fake\n````\n\nSetext title\n============\n\nSecond level\n------------\n", "supporting");
+        package.Validate().Diagnostics.Where(d => d.Code == "AD102").Should().ContainSingle()
+            .Which.Message.Should().Contain("fake-heading");
+    }
+
+    [Fact]
+    public void Links_in_inline_code_are_ignored_and_parentheses_and_angle_brackets_are_understood()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\nUse `[x](missing.md)` syntax, see [h](http.md) and [p](paren_(1).md) and [a](<spaced name.md>).\n", "required", "Read first.")
+            .Doc(Http, "# H\n", "supporting")
+            .Doc("guide/paren_(1).md", "# P\n", "onDemand", "Open when parens.")
+            .Doc("guide/spaced name.md", "# S\n", "onDemand", "Open when spaces.");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_percent_in_a_zip_entry_name_is_kept_as_written_and_the_decoded_spelling_also_resolves()
+    {
+        var bytes = Encoding.UTF8.GetBytes("# S\n");
+        var package = new Package().Doc("guide/100%25.md", "# S\n", "required", "Read first.", pack: false);
+        package.Files["guide/100%25.md"] = bytes;
+        package.Validate().Diagnostics.Should().BeEmpty("the literal spelling resolves");
+
+        var nupkg = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".nupkg");
+        try
+        {
+            package.Files["guidance/reference-manifest.json"] = package.Manifest();
+            using (var archive = ZipFile.Open(nupkg, ZipArchiveMode.Create))
+            {
+                foreach (var (name, content) in package.Files)
+                {
+                    using var entry = archive.CreateEntry(name).Open();
+                    entry.Write(content);
+                }
+            }
+
+            GuidanceValidator.ValidatePackage(nupkg).Diagnostics.Should().BeEmpty();
+        }
+        finally
+        {
+            File.Delete(nupkg);
+        }
+    }
+
+    [Fact]
+    public void Linked_documents_and_linked_manifests_in_a_directory_are_rejected_without_being_followed()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "agentdocs-links-" + Guid.NewGuid().ToString("N"));
+        var outside = Path.Combine(Path.GetTempPath(), "agentdocs-outside-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "guidance"));
+            Directory.CreateDirectory(outside);
+            File.WriteAllText(Path.Combine(outside, "start.md"), "# Outside\n");
+            var package = new Package().Doc("guide/start.md", "# Outside\n", "required", "Read first.", pack: false);
+            File.WriteAllBytes(Path.Combine(root, "guidance", "reference-manifest.json"), package.Manifest());
+            Assert.SkipUnless(TryCreateDirectoryLink(Path.Combine(root, "guide"), outside), "Directory links are unavailable here.");
+
+            var result = GuidanceValidator.ValidatePackage(root);
+
+            result.Diagnostics.Should().Contain(d => d.Code == "AD002" && d.Message.Contains("link"));
+        }
+        finally
+        {
+            foreach (var link in new[] { Path.Combine(root, "guide") })
+                if (Directory.Exists(link) && (File.GetAttributes(link) & FileAttributes.ReparsePoint) != 0)
+                    Directory.Delete(link);
+            if (Directory.Exists(root))
+                Directory.Delete(root, true);
+            Directory.Delete(outside, true);
+        }
+    }
+
+    private static bool TryCreateDirectoryLink(string link, string target)
+    {
+        try
+        {
+            Directory.CreateSymbolicLink(link, target);
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            try
+            {
+                using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe",
+                    $"/c mklink /J \"{link}\" \"{target}\"") { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true });
+                process?.WaitForExit();
+                return Directory.Exists(link);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+    }
+
     private sealed class Package
     {
         private readonly List<string> _documents = [];
@@ -344,9 +513,12 @@ public sealed class GuidanceValidatorTests
         public Dictionary<string, byte[]> Files { get; } = new(StringComparer.Ordinal);
 
         public Package Doc(string path, string text, string usage, string? description = null,
+            string? sha = null, string? extra = null, bool pack = true) =>
+            DocBytes(path, Encoding.UTF8.GetBytes(text), usage, description, sha, extra, pack);
+
+        public Package DocBytes(string path, byte[] bytes, string usage, string? description = null,
             string? sha = null, string? extra = null, bool pack = true)
         {
-            var bytes = Encoding.UTF8.GetBytes(text);
             if (pack)
                 Files[path] = bytes;
             var hash = sha ?? Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();

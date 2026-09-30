@@ -190,7 +190,51 @@ $Items
         -- validate (Join-Path $Feed 'Multi.Good.1.0.0.nupkg') --strict 2>&1
     if ($LASTEXITCODE -ne 0) { throw "agentdocs validate rejected the helper's output: $($validation | Out-String)" }
 
+    # Conformance: a consumer's own tool must accept and install what the helper produced, not only the validator.
+    $consumer = Join-Path $work 'consumer'
+    New-Item -ItemType Directory -Path $consumer | Out-Null
+    & git init -q $consumer
+    [System.IO.File]::WriteAllText((Join-Path $consumer 'Consumer.csproj'), @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <ItemGroup><PackageReference Include="Multi.Good" Version="1.0.0" /></ItemGroup>
+</Project>
+"@)
+    [System.IO.File]::WriteAllText((Join-Path $consumer 'NuGet.Config'),
+        "<configuration><packageSources><clear/><add key=`"feed`" value=`"$Feed`"/></packageSources></configuration>")
+    & dotnet restore (Join-Path $consumer 'Consumer.csproj') "-p:RestorePackagesPath=$(Join-Path $work 'consumer-packages')" --nologo -v:q
+    if ($LASTEXITCODE -ne 0) { throw 'Consumer restore of the multi-document package failed.' }
+    # The tool insists on being pinned at the consumer's Git root, so install the freshly packed one as a consumer would.
+    $toolProject = Join-Path $root 'Trellis.AgentDocs\src\Trellis.AgentDocs.csproj'
+    & dotnet pack $toolProject -c Release -o $Feed --nologo -v:q
+    if ($LASTEXITCODE -ne 0) { throw 'Tool pack failed.' }
+    $toolVersion = Get-NuGetPackageVersion $toolProject
+    Push-Location $consumer
+    try {
+        & dotnet new tool-manifest --output .config | Out-Null
+        & dotnet tool install Trellis.AgentDocs --version $toolVersion --add-source $Feed --tool-manifest .config/dotnet-tools.json | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Installing the packed tool failed.' }
+        $init = & dotnet tool run agentdocs init Consumer.csproj 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Consumer init failed for the multi-document package: $($init | Out-String)" }
+        [System.IO.File]::WriteAllText((Join-Path $consumer '.agentdocs\policy.json'),
+            '{ "schemaVersion": 1, "approvedPackages": ["Multi.Good"] }')
+        $sync = & dotnet tool run agentdocs sync 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Consumer sync rejected the helper's output: $($sync | Out-String)" }
+    }
+    finally { Pop-Location }
+    foreach ($installed in 'start.md', 'cookbook.md', 'http.md') {
+        if (-not (Test-Path (Join-Path $consumer ".agentdocs\packages\multi.good\guide\$installed"))) {
+            throw "Consumer did not install $installed from the multi-document package."
+        }
+    }
+    $index = Get-Content -LiteralPath (Join-Path $consumer '.agentdocs\README.md') -Raw
+    if ($index -notmatch 'guide/start\.md' -or $index -notmatch 'guide/cookbook\.md' -or $index -match 'guide/http\.md') {
+        throw 'Consumer index must list the required and on-demand documents, and not the supporting one.'
+    }
+
     $multiInvalid = [ordered]@{
+        'DirAlias' = @{ Items = '<PackageGuidanceItem Include="start.md" PackagePath="Docs/one.md" Usage="required" Description="x" /><PackageGuidanceItem Include="http.md" PackagePath="docs/two.md" Description="y" />'; Match = 'portable aliases' }
+        'DocAsDirectory' = @{ Items = '<PackageGuidanceItem Include="start.md" PackagePath="guide.md" Usage="required" Description="x" /><PackageGuidanceItem Include="http.md" PackagePath="guide.md/inner.md" Description="y" />'; Match = 'also used as a directory' }
         'Duplicate' = @{ Items = ($validItems + '<PackageGuidanceItem Include="http.md" PackagePath="guide/start.md" Usage="supporting" />'); Match = 'listed more than once' }
         'NoDescription' = @{ Items = '<PackageGuidanceItem Include="start.md" PackagePath="guide/start.md" Usage="required" />'; Match = 'not blank' }
         'OnlySupporting' = @{ Items = '<PackageGuidanceItem Include="http.md" PackagePath="guide/http.md" Usage="supporting" />'; Match = 'at least one required or onDemand' }

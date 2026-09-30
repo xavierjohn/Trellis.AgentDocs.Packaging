@@ -247,82 +247,12 @@ public static class GuidanceReader
                     ? Outcome(GuidanceStatus.MissingAssets, "manifest listed by NuGet is missing from the package cache.")
                     : Outcome(GuidanceStatus.NoManifest);
 
-            var manifestBytes = File.ReadAllBytes(manifestFile);
-            using var parsed = JsonDocument.Parse(manifestBytes.AsMemory(
-                manifestBytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? 3 : 0));
-            var manifest = parsed.RootElement;
-            if (!Object(manifest) || DuplicateProperties(manifest))
-                return Outcome(GuidanceStatus.InvalidManifest, "manifest must be an object with unique properties.");
-            if (!manifest.TryGetProperty("schemaVersion", out var schema) || schema.ValueKind != JsonValueKind.Number ||
-                !schema.TryGetInt64(out var versionNumber) || versionNumber < 1)
-                return Outcome(GuidanceStatus.InvalidManifest, "schemaVersion must be an integer.");
-            if (versionNumber != 1)
-                return Outcome(GuidanceStatus.UnsupportedSchema, $"unsupported schemaVersion {versionNumber}.");
-            if (manifest.EnumerateObject().Any(p => p.Name is not ("schemaVersion" or "documents" or "publisherMetadata")) ||
-                !TryArray(manifest, "documents", out var rawDocuments))
-                return Outcome(GuidanceStatus.InvalidManifest, "unknown field or missing documents array.");
-
-            var metadata = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
-            if (manifest.TryGetProperty("publisherMetadata", out var extensions))
-            {
-                if (!Object(extensions) || DuplicateProperties(extensions))
-                    return Outcome(GuidanceStatus.InvalidManifest, "publisherMetadata must be an object with unique keys.");
-                foreach (var extension in extensions.EnumerateObject())
-                {
-                    if (!Namespaced(extension.Name))
-                        return Outcome(GuidanceStatus.InvalidManifest, $"publisher metadata key '{extension.Name}' is not namespaced.");
-                    metadata.Add(extension.Name, extension.Value.Clone());
-                }
-            }
-
-            var declaredDocuments = new List<(string Path, string Hash, GuidanceUsage Usage, string? Description)>();
-            var prefixes = new Dictionary<string, string>(PortableComparer);
-            var declared = new HashSet<string>(StringComparer.Ordinal);
-            var normalizedDocuments = new HashSet<string>(PortableComparer);
-            foreach (var raw in rawDocuments.EnumerateArray())
-            {
-                if (!Object(raw) || DuplicateProperties(raw) ||
-                    raw.EnumerateObject().Any(p => p.Name is not ("path" or "sha256" or "usage" or "description")) ||
-                    !TryString(raw, "path", out var path) || !SafePath(path) ||
-                    !TryString(raw, "sha256", out var hash) || hash.Length != 64 ||
-                    !hash.All(c => c is (>= '0' and <= '9') or (>= 'a' and <= 'f')))
-                    return Outcome(GuidanceStatus.InvalidManifest, "invalid document path, hash, or field.");
-                if (!TryString(raw, "usage", out var usageText) || !TryUsage(usageText, out var usage))
-                    return Outcome(GuidanceStatus.InvalidManifest, $"usage for '{path}' must be required, onDemand, or supporting.");
-                string? description = null;
-                if (raw.TryGetProperty("description", out var descriptionValue))
-                {
-                    if (descriptionValue.ValueKind != JsonValueKind.String ||
-                        !ValidDescription(descriptionValue.GetString()!, out description))
-                        return Outcome(GuidanceStatus.InvalidManifest,
-                            $"invalid description for '{path}': one line of at most {MaxDescriptionScalars} characters without control or format characters.");
-                }
-                if (usage != GuidanceUsage.Supporting && description is null)
-                    return Outcome(GuidanceStatus.InvalidManifest, $"'{path}' is {usageText} and requires a description.");
-
-                var parts = path.Replace('\\', '/').Split('/');
-                for (var i = 1; i <= parts.Length; i++)
-                {
-                    var original = string.Join('/', parts.Take(i));
-                    var normalized = original.Normalize(NormalizationForm.FormC);
-                    if (prefixes.TryGetValue(normalized, out var previous) && previous != original)
-                        return Outcome(GuidanceStatus.InvalidManifest, $"portable directory or document alias: '{previous}' and '{original}'.");
-                    prefixes[normalized] = original;
-                }
-
-                if (!declared.Add(path) ||
-                    !normalizedDocuments.Add(path.Replace('\\', '/').Normalize(NormalizationForm.FormC)))
-                    return Outcome(GuidanceStatus.InvalidManifest, $"portable document alias: '{path}'.");
-
-                declaredDocuments.Add((path, hash, usage, description));
-            }
-
-            if (declaredDocuments.Any(doc => prefixes.Keys.Any(prefix =>
-                prefix.StartsWith(doc.Path.Replace('\\', '/').Normalize(NormalizationForm.FormC) + "/", StringComparison.OrdinalIgnoreCase))))
-                return Outcome(GuidanceStatus.InvalidManifest, "a document is also used as a directory prefix.");
-
-            if (declaredDocuments.Count > 0 && declaredDocuments.All(doc => doc.Usage == GuidanceUsage.Supporting))
-                return Outcome(GuidanceStatus.InvalidManifest, "non-empty documents require at least one required or onDemand document.");
+            var parse = ManifestCheck.Parse(File.ReadAllBytes(manifestFile));
+            if (parse.Issues.Count > 0)
+                return Outcome(parse.UnsupportedSchema ? GuidanceStatus.UnsupportedSchema : GuidanceStatus.InvalidManifest,
+                    parse.Issues[0].Message);
+            var metadata = parse.PublisherMetadata;
+            var declaredDocuments = parse.Documents.Select(doc => (doc.Path, Hash: doc.Sha256, doc.Usage, doc.Description)).ToList();
 
             var documents = new List<GuidanceDocument>();
             foreach (var (path, hash, usage, description) in declaredDocuments)
