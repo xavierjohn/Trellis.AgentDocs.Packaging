@@ -26,21 +26,27 @@ public static partial class AgentDocsCommand
                 continue;
             using var reader = new StringReader(DecodeInstruction(bytes));
             var lineNumber = 0;
-            var fence = '\0';
+            var fenceChar = '\0';
+            var fenceLength = 0;
             while (reader.ReadLine() is { } line)
             {
                 lineNumber++;
                 var trimmed = line.TrimStart();
-                if (trimmed.StartsWith("```", StringComparison.Ordinal) ||
-                    trimmed.StartsWith("~~~", StringComparison.Ordinal))
+                var run = FenceRun(trimmed);
+                if (run.Length >= 3)
                 {
-                    if (fence == '\0')
-                        fence = trimmed[0];
-                    else if (fence == trimmed[0])
-                        fence = '\0';
+                    if (fenceChar == '\0')
+                    {
+                        fenceChar = run.Marker;
+                        fenceLength = run.Length;
+                    }
+                    else if (run.Marker == fenceChar && run.Length >= fenceLength && run.Closing)
+                    {
+                        fenceChar = '\0';
+                    }
                     continue;
                 }
-                if (fence != '\0')
+                if (fenceChar != '\0')
                     continue;
 
                 foreach (Match match in InstructionLinks.Matches(line))
@@ -72,7 +78,17 @@ public static partial class AgentDocsCommand
                 if (File.Exists(path))
                     instructions.Add(path);
             }
-            foreach (var child in Directory.EnumerateDirectories(directory).OrderBy(path => path, StringComparer.Ordinal))
+            string[] children;
+            try
+            {
+                children = Directory.EnumerateDirectories(directory).OrderBy(path => path, StringComparer.Ordinal).ToArray();
+            }
+            catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+            {
+                // The scan only produces warnings, so a directory we cannot list must not abort the command.
+                return;
+            }
+            foreach (var child in children)
             {
                 var name = Path.GetFileName(child);
                 if (name.Equals(".git", StringComparison.OrdinalIgnoreCase) ||
@@ -81,11 +97,42 @@ public static partial class AgentDocsCommand
                     name.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
                     name.Equals("node_modules", StringComparison.OrdinalIgnoreCase) ||
                     name.Equals(".vs", StringComparison.OrdinalIgnoreCase) ||
-                    File.GetAttributes(child).HasFlag(FileAttributes.ReparsePoint) ||
+                    IsUninspectableOrLink(child) ||
                     File.Exists(Path.Combine(child, ".git")) || Directory.Exists(Path.Combine(child, ".git")))
                     continue;
                 Visit(child);
             }
+        }
+    }
+
+    /// <summary>
+    /// Reads a Markdown fence marker: a run of three or more backticks or tildes. A run can close a fence
+    /// only when nothing but whitespace follows it, and only when it is at least as long as the opener.
+    /// </summary>
+    private static (char Marker, int Length, bool Closing) FenceRun(string trimmed)
+    {
+        if (trimmed.Length < 3 || (trimmed[0] != '`' && trimmed[0] != '~'))
+            return ('\0', 0, false);
+        var marker = trimmed[0];
+        var length = 0;
+        while (length < trimmed.Length && trimmed[length] == marker)
+            length++;
+        return (marker, length, string.IsNullOrWhiteSpace(trimmed[length..]));
+    }
+
+    /// <summary>
+    /// True for a reparse point, and also for a directory whose attributes cannot be read (denied or
+    /// removed while scanning): the scan only produces warnings, so such a directory is skipped, not fatal.
+    /// </summary>
+    private static bool IsUninspectableOrLink(string directory)
+    {
+        try
+        {
+            return File.GetAttributes(directory).HasFlag(FileAttributes.ReparsePoint);
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+        {
+            return true;
         }
     }
 
