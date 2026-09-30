@@ -107,7 +107,8 @@ public static class GuidanceValidator
     {
         ArgumentNullException.ThrowIfNull(files);
         var problems = new List<GuidanceDiagnostic>();
-        return Validate(new HashSet<string>(files.Keys, StringComparer.Ordinal), path =>
+        var aliases = new PathAliases(problems);
+        return Validate(files.Keys.Where(aliases.Add).ToHashSet(StringComparer.Ordinal), path =>
         {
             var bytes = files[path];
             if (bytes.Length <= LimitFor(path))
@@ -509,19 +510,22 @@ public static class GuidanceValidator
 
             // Extraction resolves '.', '..' and empty segments (Path.GetFullPath), so entries are tracked by the path
             // they land on; an entry that climbs out of the package root is rejected outright.
-            var decoded = Unescape(entry.FullName).Replace('\\', '/');
+            // NuGet strips exactly one raw leading '/', then percent-decodes, and treats only '/' as a separator. A
+            // backslash is therefore a separator on Windows but a literal filename character elsewhere: not portable.
+            var raw = entry.FullName.StartsWith('/') ? entry.FullName[1..] : entry.FullName;
+            var decoded = Unescape(raw);
+            if (decoded.Contains('\\'))
+            {
+                problems.Add(new GuidanceDiagnostic("AD009", GuidanceSeverity.Error, decoded, null,
+                    "This entry's path contains a backslash, which is a separator on Windows but an ordinary character on other systems, so it extracts to different paths."));
+                continue;
+            }
+
             var logical = IsRooted(decoded) ? null : Canonical(decoded);
             if (logical is null)
             {
                 problems.Add(new GuidanceDiagnostic("AD009", GuidanceSeverity.Error, decoded, null,
                     "This entry's path is rooted, escapes the package root or is empty, so NuGet cannot extract it."));
-                continue;
-            }
-
-            if (logical.Split('/').FirstOrDefault(IsUnportableSegment) is { } unportable)
-            {
-                problems.Add(new GuidanceDiagnostic("AD009", GuidanceSeverity.Error, logical, null,
-                    $"The segment '{unportable}' cannot be extracted portably: Windows drops trailing dots and spaces, so it lands on a different path, and rejects device names and characters such as : * ? \" < > |."));
                 continue;
             }
 
@@ -598,10 +602,20 @@ public static class GuidanceValidator
     {
         private readonly Dictionary<string, bool> _seen = new(StringComparer.OrdinalIgnoreCase);
 
-        /// <summary>Returns false, after reporting AD009, when the path collides with one already added.</summary>
+        /// <summary>
+        /// Returns false, after reporting AD009, when a segment cannot be extracted portably or the path collides with one
+        /// already added. Every input form (archive, directory, in-memory) goes through here, so they agree.
+        /// </summary>
         public bool Add(string logical)
         {
             var parts = logical.Split('/');
+            if (parts.FirstOrDefault(IsUnportableSegment) is { } unportable)
+            {
+                problems.Add(new GuidanceDiagnostic("AD009", GuidanceSeverity.Error, logical, null,
+                    $"The segment '{unportable}' cannot be extracted portably: Windows drops trailing dots and spaces, so it lands on a different path, and rejects device names and characters such as : * ? \" < > |."));
+                return false;
+            }
+
             for (var i = 1; i < parts.Length; i++)
             {
                 var prefix = Normalise(string.Join('/', parts.Take(i)));

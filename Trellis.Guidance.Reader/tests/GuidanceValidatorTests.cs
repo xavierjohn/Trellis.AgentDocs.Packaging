@@ -553,7 +553,7 @@ public sealed class GuidanceValidatorTests
         var bytes = Encoding.UTF8.GetBytes("# S\n");
         var manifest = new Package().DocBytes("guide/start.md", bytes, "required", "Read first.", pack: false);
 
-        foreach (var rooted in new[] { "/guide/start.md", "%2Fguide/start.md", "\\guide\\start.md", "C:/guide/start.md", "//server/share/start.md" })
+        foreach (var rooted in new[] { "%2Fguide/start.md", "C:/guide/start.md", "//server/share/start.md" })
             Nupkg([("guide/start.md", bytes), (rooted, bytes)], manifest).Diagnostics
                 .Should().Contain(d => d.Code == "AD009", $"'{rooted}' is rooted");
 
@@ -563,6 +563,66 @@ public sealed class GuidanceValidatorTests
 
         Nupkg([("guide/start.md", bytes), ("lib/net8.0/My.Package.dll", bytes), ("[Content_Types].xml", bytes)], manifest).Diagnostics
             .Should().NotContain(d => d.Code == "AD009", "ordinary package entries are fine");
+    }
+
+    [Fact]
+    public void One_raw_leading_slash_is_accepted_as_NuGet_does_but_backslashes_are_not_portable()
+    {
+        var bytes = Encoding.UTF8.GetBytes("# S\n");
+        var manifest = new Package().DocBytes("guide/start.md", bytes, "required", "Read first.", pack: false);
+
+        // NuGet strips exactly one raw leading '/', so this restores as guide/start.md.
+        Nupkg([("/guide/start.md", bytes)], manifest).Diagnostics.Should().BeEmpty();
+
+        // A backslash is a separator on Windows but a literal filename character elsewhere, so these extract to
+        // different places on different systems and guide/start.md is missing on Unix.
+        foreach (var name in new[] { "guide\\start.md", "guide%5Cstart.md" })
+        {
+            var diagnostics = Nupkg([(name, bytes)], manifest).Diagnostics;
+            diagnostics.Should().Contain(d => d.Code == "AD009" && d.Message.Contains("backslash"), name);
+            diagnostics.Should().Contain(d => d.Code == "AD002", $"{name} leaves guide/start.md missing");
+        }
+    }
+
+    [Fact]
+    public void Non_portable_names_are_reported_the_same_for_an_archive_a_directory_and_in_memory_files()
+    {
+        var bytes = Encoding.UTF8.GetBytes("# S\n");
+        var package = new Package().DocBytes("guide/start.md", bytes, "required", "Read first.");
+        package.Files["guidance/reference-manifest.json"] = package.Manifest();
+        package.Files["lib/CON"] = bytes;
+
+        GuidanceValidator.Validate(package.Files).Diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "lib/CON");
+        Nupkg(package.Files.Select(pair => (pair.Key, pair.Value)), new Package().DocBytes("guide/start.md", bytes, "required", "Read first.", pack: false))
+            .Diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "lib/CON");
+
+        var root = Path.Combine(Path.GetTempPath(), "agentdocs-portable-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            foreach (var (path, content) in package.Files.Where(pair => pair.Key != "lib/CON"))
+            {
+                var target = Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                File.WriteAllBytes(target, content);
+            }
+
+            // A directory cannot hold lib/CON on Windows, so the in-memory and archive forms carry the assertion there;
+            // where the file system allows it, the directory form must agree.
+            if (!OperatingSystem.IsWindows())
+            {
+                Directory.CreateDirectory(Path.Combine(root, "lib"));
+                File.WriteAllBytes(Path.Combine(root, "lib", "CON"), bytes);
+                GuidanceValidator.ValidatePackage(root).Diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "lib/CON");
+            }
+            else
+            {
+                GuidanceValidator.ValidatePackage(root).Diagnostics.Should().BeEmpty();
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
     }
 
     [Fact]
