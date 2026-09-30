@@ -132,17 +132,17 @@ missing.
 meets it. It reports errors for contract violations (`AD001`-`AD010`: manifest
 shape, unsafe or missing paths, hash mismatches, usage, descriptions, at least
 one required or on-demand document, duplicate or aliased paths, non-UTF-8
-documents, archive entries that decode to the same path, files over the
+documents, archive entries that would extract onto the same path (same decoded path, case or Unicode alias, or a file that is also a directory), files over the
 validator's resource limits) and warnings for guidance that is valid but hard to
 use (`AD101`-`AD108`): an oversized required set, links that will not resolve
 once installed (missing files, headings that do not exist, root-relative paths,
-and targets that are not installed Markdown such as images or code samples),
+and targets that are not installed Markdown such as images or code samples, in Markdown links and in raw HTML `href`/`src`),
 supporting documents that no required or on-demand document reaches, a front
 matter block that is not valid YAML, Markdown files beside the guidance that the
 manifest does not list, total guidance size, the number of index entries, and
-two indexed documents with the identical description. Documents are read with a
+two on-demand documents with the identical description. Documents are read with a
 Markdown parser (GitHub heading anchors) and a YAML parser, and only the
-manifest and Markdown files are read from a package, each within a size limit.
+manifest and the documents it declares are read from a package, each within a size limit.
 It exits 1 on errors, and on warnings with `--strict`. Use
 `--max-required-bytes N`, `--max-total-bytes N` and `--max-indexed-documents N`
 to change the budgets (defaults 32768, 4 MiB and 100) and `--format json` for

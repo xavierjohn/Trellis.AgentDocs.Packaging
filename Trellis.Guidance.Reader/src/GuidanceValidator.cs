@@ -22,7 +22,7 @@ public enum GuidanceSeverity
 }
 
 /// <summary>One finding from <see cref="GuidanceValidator"/>.</summary>
-/// <param name="Code">Stable identifier: AD001-AD008 for errors, AD101 and up for warnings.</param>
+/// <param name="Code">Stable identifier: AD001-AD010 for errors, AD101 and up for warnings.</param>
 /// <param name="Severity">Error or warning.</param>
 /// <param name="Path">Package-relative path the finding concerns, when there is one.</param>
 /// <param name="Line">One-based line in <paramref name="Path"/>, when known.</param>
@@ -75,6 +75,10 @@ public static class GuidanceValidator
 {
     private const string ManifestPath = "guidance/reference-manifest.json";
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+    private static readonly System.Text.RegularExpressions.Regex HtmlAttribute = new(
+        @"\b(?:href|src)\s*=\s*(?:""(?<value>[^""]*)""|'(?<value>[^']*)')",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled,
+        TimeSpan.FromSeconds(1));
     private static readonly MarkdownPipeline Pipeline = new MarkdownPipelineBuilder()
         .UsePreciseSourceLocation()
         .UseYamlFrontMatter()
@@ -87,32 +91,51 @@ public static class GuidanceValidator
         ArgumentException.ThrowIfNullOrEmpty(path);
         var problems = new List<GuidanceDiagnostic>();
         if (!Directory.Exists(path))
-            return Validate(ReadPackageFile(path, problems), options, null, problems);
+        {
+            using var archive = ZipFile.OpenRead(path);
+            var package = ArchiveSource(archive, problems);
+            return Validate(package.Names, package.Read, options, null, problems);
+        }
 
         if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
             return new GuidanceValidation(
                 [new GuidanceDiagnostic("AD001", GuidanceSeverity.Error, null, null, "The package directory is itself a link; validate the real directory.")], 0, 0);
         var linked = new HashSet<string>(StringComparer.Ordinal);
-        return Validate(ReadDirectory(Path.GetFullPath(path), linked, problems), options, linked, problems);
+        var directory = DirectorySource(Path.GetFullPath(path), linked, problems);
+        return Validate(directory.Names, directory.Read, options, linked, problems);
     }
 
     /// <summary>Validates package contents keyed by package-relative path with forward slashes.</summary>
-    public static GuidanceValidation Validate(IReadOnlyDictionary<string, byte[]> files, GuidanceValidationOptions? options = null) =>
-        Validate(files, options, null, []);
-
-    private static GuidanceValidation Validate(IReadOnlyDictionary<string, byte[]> files, GuidanceValidationOptions? options,
-        IReadOnlySet<string>? linked, List<GuidanceDiagnostic> problems)
+    public static GuidanceValidation Validate(IReadOnlyDictionary<string, byte[]> files, GuidanceValidationOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(files);
+        var problems = new List<GuidanceDiagnostic>();
+        return Validate(new HashSet<string>(files.Keys, StringComparer.Ordinal), path =>
+        {
+            var bytes = files[path];
+            if (bytes.Length <= LimitFor(path))
+                return bytes;
+            problems.Add(TooLarge(path));
+            return null;
+        }, options, null, problems);
+    }
+
+    /// <summary>
+    /// Validates a package presented as the names it contains and a way to read a named file. Nothing is read until the
+    /// manifest says it is guidance, so unrelated files never cost memory or time.
+    /// </summary>
+    private static GuidanceValidation Validate(IReadOnlySet<string> names, Func<string, byte[]?> read,
+        GuidanceValidationOptions? options, IReadOnlySet<string>? linked, List<GuidanceDiagnostic> problems)
+    {
         options ??= new GuidanceValidationOptions();
-        var diagnostics = new List<GuidanceDiagnostic>(problems);
+        var diagnostics = problems;
         void Error(string code, string? path, string message, int? line = null) =>
             diagnostics.Add(new GuidanceDiagnostic(code, GuidanceSeverity.Error, path, line, message));
         void Warn(string code, string? path, string message, int? line = null) =>
             diagnostics.Add(new GuidanceDiagnostic(code, GuidanceSeverity.Warning, path, line, message));
         bool IsLinked(string path) => linked is not null && PathChain(path).Any(linked.Contains);
 
-        if (!files.TryGetValue(ManifestPath, out var manifestBytes))
+        if (!names.Contains(ManifestPath))
         {
             Error("AD001", ManifestPath, "The package has no guidance manifest.");
             return new GuidanceValidation(diagnostics, 0, 0);
@@ -124,6 +147,8 @@ public static class GuidanceValidator
             return new GuidanceValidation(diagnostics, 0, 0);
         }
 
+        if (read(ManifestPath) is not { } manifestBytes)
+            return new GuidanceValidation(diagnostics, 0, 0);
         var parse = ManifestCheck.Parse(manifestBytes);
         foreach (var issue in parse.Issues)
             Error(issue.Code, issue.Path ?? ManifestPath, issue.Message);
@@ -146,11 +171,14 @@ public static class GuidanceValidator
                 continue;
             }
 
-            if (!files.TryGetValue(canonical, out var bytes))
+            if (!names.Contains(canonical))
             {
                 Error("AD002", path, "The document is listed in the manifest but is not in the package.");
                 continue;
             }
+
+            if (read(canonical) is not { } bytes)
+                continue;
 
             if (document.Usage == GuidanceUsage.Required)
                 requiredBytes += bytes.Length;
@@ -174,11 +202,11 @@ public static class GuidanceValidator
             readable.Add(new Doc(canonical, document.Usage, text, document.Description, bytes.Length));
         }
 
-        AnalyseDocuments(files, readable, requiredBytes, options, Warn);
+        AnalyseDocuments(names, readable, requiredBytes, options, Warn);
         return new GuidanceValidation(diagnostics, parse.Documents.Count, requiredBytes);
     }
 
-    private static void AnalyseDocuments(IReadOnlyDictionary<string, byte[]> files, List<Doc> documents,
+    private static void AnalyseDocuments(IReadOnlySet<string> names, List<Doc> documents,
         long requiredBytes, GuidanceValidationOptions options, Action<string, string?, string, int?> warn)
     {
         if (requiredBytes > options.MaxRequiredBytes)
@@ -194,7 +222,7 @@ public static class GuidanceValidator
         if (indexed.Length > options.MaxIndexedDocuments)
             warn("AD107", null,
                 $"{indexed.Length:N0} documents are listed in consumers' indexes, above the budget of {options.MaxIndexedDocuments:N0}. Mark detail documents supporting and link to them.", null);
-        foreach (var duplicate in indexed.Where(d => d.Description is not null).GroupBy(d => d.Description!, StringComparer.Ordinal)
+        foreach (var duplicate in indexed.Where(d => d.Usage == GuidanceUsage.OnDemand && d.Description is not null).GroupBy(d => d.Description!, StringComparer.Ordinal)
                      .Where(g => g.Count() > 1))
             warn("AD108", null,
                 $"{string.Join(", ", duplicate.Select(d => d.Path))} share the description '{duplicate.Key}', so an agent cannot tell which to open.", null);
@@ -244,7 +272,7 @@ public static class GuidanceValidator
                     }
 
                     resolved = combined;
-                    if (!files.ContainsKey(resolved))
+                    if (!names.Contains(resolved))
                     {
                         warn("AD102", path, $"Link '{target}' points to '{resolved}', which is not in the package.", line);
                         continue;
@@ -282,7 +310,7 @@ public static class GuidanceValidator
 
         var listed = new HashSet<string>(documents.Select(d => d.Path), StringComparer.Ordinal);
         var directories = documents.Select(d => DirectoryOf(d.Path)).Where(d => d.Length > 0).ToHashSet(StringComparer.Ordinal);
-        foreach (var file in files.Keys.Where(f => f.EndsWith(".md", StringComparison.OrdinalIgnoreCase) &&
+        foreach (var file in names.Where(f => f.EndsWith(".md", StringComparison.OrdinalIgnoreCase) &&
                      !listed.Contains(f) && directories.Contains(DirectoryOf(f))).Order(StringComparer.Ordinal))
             warn("AD105", file, "This Markdown file sits beside listed guidance but is not in the manifest, so it is not installed. List it or move it.", null);
     }
@@ -325,6 +353,23 @@ public static class GuidanceValidator
                 yield return (target, link.Line + 1);
         }
 
+        // Markdown allows raw HTML, and <img src> and <a href> are local links too. The targets are read from the
+        // parsed HTML nodes (inline tags, and the lines of HTML blocks), never from the whole document text.
+        foreach (var html in document.Descendants<HtmlInline>())
+            foreach (var target in HtmlTargets(html.Tag))
+                if (Filter(target) is { } found)
+                    yield return (found, html.Line + 1);
+        foreach (var block in document.Descendants<HtmlBlock>())
+        {
+            for (var i = 0; i < block.Lines.Count; i++)
+                foreach (var target in HtmlTargets(block.Lines.Lines[i].Slice.ToString()))
+                    if (Filter(target) is { } found)
+                        yield return (found, block.Line + 1 + i);
+        }
+
+        static IEnumerable<string> HtmlTargets(string html) =>
+            HtmlAttribute.Matches(html).Select(m => m.Groups["value"].Value);
+
         static string? Filter(string? target)
         {
             if (string.IsNullOrEmpty(target) || target.StartsWith("//", StringComparison.Ordinal))
@@ -364,32 +409,42 @@ public static class GuidanceValidator
     }
 
     // Resource limits: a package can be a large native library, and an archive can lie about how much it expands to.
-    // Only the manifest and Markdown files are ever read, each bounded, and the total is bounded too.
+    // Names are enumerated under a hard entry cap, and a file is read only when the manifest declares it, bounded per file
+    // and in total against the bytes actually streamed, never against the size an archive claims.
     private const long MaxManifestBytes = 1024 * 1024;
     private const long MaxDocumentBytes = 8 * 1024 * 1024;
     private const long MaxTotalReadBytes = 64 * 1024 * 1024;
-    private const int MaxReadFiles = 10_000;
-
-    private static bool IsRead(string logicalPath) =>
-        logicalPath == ManifestPath || logicalPath.EndsWith(".md", StringComparison.OrdinalIgnoreCase);
+    private const int MaxEntries = 100_000;
 
     private static long LimitFor(string logicalPath) => logicalPath == ManifestPath ? MaxManifestBytes : MaxDocumentBytes;
 
-    private static Dictionary<string, byte[]> ReadDirectory(string root, HashSet<string> linked, List<GuidanceDiagnostic> problems)
+    /// <summary>The names a package contains and a way to read one of them, which reports a problem and returns null when it cannot.</summary>
+    private sealed record Source(HashSet<string> Names, Func<string, byte[]?> Read);
+
+    private static Source DirectorySource(string root, HashSet<string> linked, List<GuidanceDiagnostic> problems)
     {
-        var files = new Dictionary<string, byte[]>(StringComparer.Ordinal);
-        var total = 0L;
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var aliases = new PathAliases(problems);
+        var tooMany = false;
         void Walk(string directory, string prefix)
         {
             foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos().OrderBy(e => e.Name, StringComparer.Ordinal))
             {
+                if (names.Count >= MaxEntries)
+                {
+                    if (!tooMany)
+                        problems.Add(TooMany());
+                    tooMany = true;
+                    return;
+                }
+
                 var relative = prefix.Length == 0 ? entry.Name : prefix + "/" + entry.Name;
                 if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
                 {
                     // Never follow a link: its target may be outside the package, and consumers reject linked paths.
                     linked.Add(relative);
                     if (entry is FileInfo)
-                        files[relative] = [];
+                        names.Add(relative);
                     continue;
                 }
 
@@ -399,80 +454,131 @@ public static class GuidanceValidator
                     continue;
                 }
 
-                if (!IsRead(relative))
-                    continue;
-                var length = ((FileInfo)entry).Length;
-                if (length > LimitFor(relative) || total + length > MaxTotalReadBytes || files.Count >= MaxReadFiles)
-                {
-                    problems.Add(TooLarge(relative));
-                    continue;
-                }
-
-                total += length;
-                files[relative] = File.ReadAllBytes(entry.FullName);
+                if (aliases.Add(relative))
+                    names.Add(relative);
             }
         }
 
         Walk(root, "");
-        return files;
+        var total = 0L;
+        return new Source(names, path =>
+        {
+            var info = new FileInfo(Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar)));
+            if (!info.Exists)
+                return null;
+            if (info.Length > LimitFor(path) || total + info.Length > MaxTotalReadBytes)
+            {
+                problems.Add(TooLarge(path));
+                return null;
+            }
+
+            var bytes = File.ReadAllBytes(info.FullName);
+            total += bytes.Length;
+            return bytes;
+        });
     }
 
     /// <summary>
-    /// Reads a package the way NuGet exposes it: entries are addressed by their percent-decoded logical path. Two entries
-    /// that decode to the same path are ambiguous, so they are an error rather than a silent choice of bytes.
+    /// Presents a package the way NuGet exposes it: entries are addressed by their percent-decoded logical path, and two
+    /// entries that would extract to the same place (the same path, a case or Unicode-normalisation alias, or a file that
+    /// is also a directory) are an error rather than a silent choice of bytes.
     /// </summary>
-    private static Dictionary<string, byte[]> ReadPackageFile(string path, List<GuidanceDiagnostic> problems)
+    private static Source ArchiveSource(ZipArchive archive, List<GuidanceDiagnostic> problems)
     {
-        var files = new Dictionary<string, byte[]>(StringComparer.Ordinal);
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        var total = 0L;
-        using var archive = ZipFile.OpenRead(path);
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var entries = new Dictionary<string, ZipArchiveEntry>(StringComparer.Ordinal);
+        var aliases = new PathAliases(problems);
+        var count = 0;
         foreach (var entry in archive.Entries.Where(e => !e.FullName.EndsWith('/')))
         {
-            var logical = Unescape(entry.FullName).Replace('\\', '/');
-            if (!seen.Add(logical))
+            if (++count > MaxEntries)
             {
-                problems.Add(new GuidanceDiagnostic("AD009", GuidanceSeverity.Error, logical, null,
-                    "Two archive entries decode to this path, so NuGet's extracted copy is ambiguous. Remove the duplicate."));
-                files.Remove(logical);
-                continue;
+                problems.Add(TooMany());
+                break;
             }
 
-            if (!IsRead(logical))
+            var logical = Unescape(entry.FullName).Replace('\\', '/');
+            if (!aliases.Add(logical))
                 continue;
-            if (entry.Length > LimitFor(logical) || total + entry.Length > MaxTotalReadBytes || files.Count >= MaxReadFiles)
+            names.Add(logical);
+            entries[logical] = entry;
+        }
+
+        var total = 0L;
+        return new Source(names, path =>
+        {
+            if (!entries.TryGetValue(path, out var entry))
+                return null;
+            var limit = LimitFor(path);
+            if (entry.Length > limit || total + entry.Length > MaxTotalReadBytes)
             {
-                problems.Add(TooLarge(logical));
-                continue;
+                problems.Add(TooLarge(path));
+                return null;
             }
 
             using var stream = entry.Open();
             using var buffer = new MemoryStream();
-            // The declared length is not trusted: stop copying once the limit is passed.
             var chunk = new byte[81920];
             int read;
             while ((read = stream.Read(chunk, 0, chunk.Length)) > 0)
             {
                 buffer.Write(chunk, 0, read);
-                if (buffer.Length > LimitFor(logical))
-                    break;
-            }
-
-            if (buffer.Length > LimitFor(logical))
-            {
-                problems.Add(TooLarge(logical));
-                continue;
+                if (buffer.Length > limit || total + buffer.Length > MaxTotalReadBytes)
+                {
+                    problems.Add(TooLarge(path));
+                    return null;
+                }
             }
 
             total += buffer.Length;
-            files[logical] = buffer.ToArray();
+            return buffer.ToArray();
+        });
+    }
+
+    /// <summary>Tracks normalised, case-insensitive paths so entries that extract onto one another are reported once.</summary>
+    private sealed class PathAliases(List<GuidanceDiagnostic> problems)
+    {
+        private readonly Dictionary<string, bool> _seen = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Returns false, after reporting AD009, when the path collides with one already added.</summary>
+        public bool Add(string logical)
+        {
+            var parts = logical.Split('/');
+            for (var i = 1; i < parts.Length; i++)
+            {
+                var prefix = Normalise(string.Join('/', parts.Take(i)));
+                if (!_seen.TryGetValue(prefix, out var isFile))
+                    _seen[prefix] = false;
+                else if (isFile)
+                    return Collide(logical, prefix);
+            }
+
+            var full = Normalise(logical);
+            if (_seen.ContainsKey(full))
+                return Collide(logical, full);
+            _seen[full] = true;
+            return true;
         }
 
-        return files;
+        private bool Collide(string logical, string other)
+        {
+            problems.Add(new GuidanceDiagnostic("AD009", GuidanceSeverity.Error, logical, null,
+                $"This entry collides with '{other}' when the package is extracted: the same path after decoding, case or Unicode normalisation, or a file that is also a directory. NuGet's extracted copy would be ambiguous."));
+            return false;
+        }
+
+        private static string Normalise(string path)
+        {
+            try { return path.Normalize(NormalizationForm.FormC); }
+            catch (ArgumentException) { return path; }
+        }
     }
 
     private static GuidanceDiagnostic TooLarge(string path) => new("AD010", GuidanceSeverity.Error, path, null,
-        "The file exceeds the validator's resource limits (manifest 1 MiB, document 8 MiB, 64 MiB and 10,000 files in total) and was not read.");
+        "The file exceeds the validator's resource limits (manifest 1 MiB, document 8 MiB, 64 MiB read in total) and was not read.");
+
+    private static GuidanceDiagnostic TooMany() => new("AD010", GuidanceSeverity.Error, null, null,
+        $"The package has more than {MaxEntries:N0} entries, which is over the validator's resource limit; the rest were not examined.");
 
     private static string Decode(byte[] bytes) =>
         StrictUtf8.GetString(bytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? bytes[3..] : bytes);

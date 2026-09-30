@@ -474,7 +474,10 @@ public sealed class GuidanceValidatorTests
     [Fact]
     public void Large_unrelated_entries_are_never_read_and_oversized_guidance_is_AD010()
     {
-        var package = new Package().Doc(Start, "# S\n", "required", "Read first.");
+        // guide/huge.md is declared, so it is read and refused; CHANGELOG.md and the native library are not declared, so
+        // they are never read however large they are.
+        var package = new Package().Doc(Start, "# S\n", "required", "Read first.")
+            .Doc("guide/huge.md", "x", "onDemand", "Open when huge.", sha: new string('0', 64), pack: false);
         package.Files["guidance/reference-manifest.json"] = package.Manifest();
         var nupkg = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".nupkg");
         try
@@ -491,16 +494,58 @@ public sealed class GuidanceValidatorTests
                     native.Write(new byte[20 * 1024 * 1024]);
                 using (var huge = archive.CreateEntry("guide/huge.md").Open())
                     huge.Write(new byte[9 * 1024 * 1024]);
+                using (var changelog = archive.CreateEntry("CHANGELOG.md").Open())
+                    changelog.Write(new byte[9 * 1024 * 1024]);
             }
 
             var diagnostics = GuidanceValidator.ValidatePackage(nupkg).Diagnostics;
-            diagnostics.Should().Contain(d => d.Code == "AD010" && d.Path == "guide/huge.md");
-            diagnostics.Should().NotContain(d => d.Path == "runtimes/native.dll");
+            diagnostics.Should().ContainSingle(d => d.Code == "AD010").Which.Path.Should().Be("guide/huge.md");
+            diagnostics.Should().NotContain(d => d.Path == "runtimes/native.dll" || d.Path == "CHANGELOG.md");
         }
         finally
         {
             File.Delete(nupkg);
         }
+    }
+
+    [Fact]
+    public void Archive_entries_that_extract_onto_each_other_are_AD009()
+    {
+        var bytes = Encoding.UTF8.GetBytes("# S\n");
+        var manifest = new Package().DocBytes("guide/start.md", bytes, "required", "Read first.", pack: false);
+        var cafeDecomposed = string.Concat("cafe", (char)0x301);
+        var cafeComposed = string.Concat("caf", (char)0xE9);
+
+        Nupkg([("guide/start.md", bytes), ("Guide/Start.md", bytes)], manifest).Diagnostics
+            .Should().Contain(d => d.Code == "AD009", "a case alias overwrites the first document on Windows");
+        Nupkg([("guide/a", bytes), ("guide/a/b.md", bytes)], manifest).Diagnostics
+            .Should().Contain(d => d.Code == "AD009", "a file cannot also be a directory");
+        Nupkg([("guide/a/b.md", bytes), ("guide/a", bytes)], manifest).Diagnostics
+            .Should().Contain(d => d.Code == "AD009", "the order of the conflicting entries does not matter");
+        Nupkg([(cafeDecomposed + "/x.md", bytes), (cafeComposed + "/x.md", bytes)], manifest).Diagnostics
+            .Should().Contain(d => d.Code == "AD009", "Unicode-equivalent names are one path");
+        Nupkg([("guide/start.md", bytes), ("guide/other.md", bytes), ("Guide/sub/deep.md", bytes)], manifest).Diagnostics
+            .Should().NotContain(d => d.Code == "AD009", "different files in directories that differ only by case do not collide");
+    }
+
+    [Fact]
+    public void Identical_descriptions_on_required_documents_are_not_a_routing_ambiguity()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n\n[b](b.md)\n", "required", "Read before using X.")
+            .Doc("guide/b.md", "# B\n", "required", "Read before using X.");
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Raw_html_links_are_checked_like_markdown_links()
+    {
+        var package = new Package().Doc(Start,
+            "# S\n\nInline <img src=\"missing.png\"> and <a href='gone.md'>gone</a>.\n\n<div>\n  <a href=\"../up.md\">up</a>\n</div>\n\n<a href=\"https://example.com/a.md\">external</a>\n",
+            "required", "Read first.");
+        var findings = package.Validate().Diagnostics.Where(d => d.Code == "AD102").ToArray();
+        findings.Should().HaveCount(3);
+        findings.Select(d => d.Line).Should().BeEquivalentTo([3, 3, 6]);
     }
 
     [Fact]
