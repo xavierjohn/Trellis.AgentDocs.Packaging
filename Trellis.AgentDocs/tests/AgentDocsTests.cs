@@ -36,100 +36,10 @@ public sealed class AgentDocsTests
             .And.Contain("<!-- agentdocs:start -->");
         File.Exists(fixture.Path(".agentdocs", "README.md")).Should().BeTrue();
         File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides", "overview.md")).Should().BeTrue();
-        using (var state = JsonDocument.Parse(File.ReadAllText(fixture.Path(".agentdocs", "agent-context.json"))))
-            state.RootElement.TryGetProperty("Scope", out _).Should().BeFalse();
         fixture.Run("check").Should().Be(0);
         fixture.Run("sync").Should().Be(0);
         fixture.Run("remove").Should().Be(0);
         File.ReadAllBytes(fixture.Path("AGENTS.md")).Should().Equal(originalBytes);
-    }
-
-    [Fact]
-    public void Init_creates_restore_opt_in_and_remove_prunes_only_owned_files()
-    {
-        using var fixture = new Fixture();
-        fixture.Run("init", "App.csproj").Should().Be(0);
-        File.Exists(fixture.Path(".agentdocs", "restore.targets")).Should().BeTrue();
-        File.ReadAllText(fixture.Path("Directory.Build.targets")).Should().Contain("agentdocs:restore:start");
-        File.ReadAllText(fixture.Path("Directory.Solution.targets")).Should().Contain("agentdocs:restore:start");
-        fixture.Run("check").Should().Be(0);
-        fixture.Run("remove").Should().Be(0);
-        File.Exists(fixture.Path("Directory.Build.targets")).Should().BeFalse();
-        File.Exists(fixture.Path("Directory.Solution.targets")).Should().BeFalse();
-        File.Exists(fixture.Path(".agentdocs", "restore.targets")).Should().BeFalse();
-    }
-
-    [Fact]
-    public void Init_preserves_existing_build_and_solution_targets_outside_owned_blocks()
-    {
-        using var fixture = new Fixture();
-        fixture.Write("Directory.Build.targets", "<Project>\r\n  <Target Name=\"CustomerBuild\" />\r\n</Project>\r\n");
-        fixture.Write("Directory.Solution.targets", "<Project>\n  <Target Name=\"CustomerSolution\" />\n</Project>\n");
-        var build = File.ReadAllBytes(fixture.Path("Directory.Build.targets"));
-        var solution = File.ReadAllBytes(fixture.Path("Directory.Solution.targets"));
-        fixture.Run("init", "App.csproj").Should().Be(0);
-        fixture.Run("check").Should().Be(0);
-        fixture.Run("remove").Should().Be(0);
-        File.ReadAllBytes(fixture.Path("Directory.Build.targets")).Should().Equal(build);
-        File.ReadAllBytes(fixture.Path("Directory.Solution.targets")).Should().Equal(solution);
-    }
-
-    [Theory]
-    [InlineData("<Project/>")]
-    [InlineData("<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Project />\r\n<!-- Customer -->\r\n")]
-    [InlineData("<!-- <Project/> -->\n<Project DefaultTargets=\"Build>Release\" />\n")]
-    public void Init_preserves_self_closing_restore_targets_on_remove(string original)
-    {
-        using var fixture = new Fixture();
-        fixture.Write("Directory.Build.targets", original);
-        fixture.Write("Directory.Solution.targets", original);
-        var build = File.ReadAllBytes(fixture.Path("Directory.Build.targets"));
-        var solution = File.ReadAllBytes(fixture.Path("Directory.Solution.targets"));
-        fixture.Run("init", "App.csproj").Should().Be(0);
-        fixture.Run("check").Should().Be(0);
-        fixture.Run("remove").Should().Be(0);
-        File.ReadAllBytes(fixture.Path("Directory.Build.targets")).Should().Equal(build);
-        File.ReadAllBytes(fixture.Path("Directory.Solution.targets")).Should().Equal(solution);
-    }
-
-    [Fact]
-    public void Init_imports_restore_hook_through_nested_build_targets()
-    {
-        using var fixture = new Fixture();
-        fixture.Scope("backend");
-        File.Delete(fixture.Path("backend", ".config", "dotnet-tools.json"));
-        fixture.Write("backend/Directory.Build.targets", "<Project>\n  <Target Name=\"Customer\" />\n</Project>\n");
-        var original = File.ReadAllBytes(fixture.Path("backend", "Directory.Build.targets"));
-        fixture.Run("init", "App.csproj").Should().Be(0);
-        File.ReadAllText(fixture.Path("backend", "Directory.Build.targets"))
-            .Should().Contain("../.agentdocs/restore.targets");
-        File.Exists(fixture.Path("Directory.Build.targets")).Should().BeFalse();
-        fixture.Run("check").Should().Be(0);
-        fixture.Run("remove").Should().Be(0);
-        File.ReadAllBytes(fixture.Path("backend", "Directory.Build.targets")).Should().Equal(original);
-    }
-
-    [Fact]
-    public void Init_preserves_comments_after_the_MSBuild_project()
-    {
-        using var fixture = new Fixture();
-        fixture.Write("Directory.Build.targets", "<Project>\n</Project>\n<!-- example </Project> -->\n");
-        var original = File.ReadAllBytes(fixture.Path("Directory.Build.targets"));
-        fixture.Run("init", "App.csproj").Should().Be(0);
-        fixture.Run("remove").Should().Be(0);
-        File.ReadAllBytes(fixture.Path("Directory.Build.targets")).Should().Equal(original);
-    }
-
-    [Fact]
-    public void Refresh_rejects_modified_restore_opt_in_without_replacing_customer_edits()
-    {
-        using var fixture = new Fixture();
-        fixture.Run("init", "App.csproj").Should().Be(0);
-        var path = fixture.Path("Directory.Build.targets");
-        var modified = File.ReadAllText(path).Replace("restore.targets", "modified.targets");
-        File.WriteAllText(path, modified);
-        fixture.Run("refresh").Should().NotBe(0);
-        File.ReadAllText(path).Should().Be(modified);
     }
 
     [Fact]
@@ -233,6 +143,157 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
+    public void Init_uses_one_imperative_template_for_root_Copilot_and_nested_pointers()
+    {
+        using var fixture = new Fixture();
+        fixture.Scope("backend");
+        File.Delete(fixture.Path("backend", ".config", "dotnet-tools.json"));
+        fixture.EnterRoot();
+
+        fixture.Run("init", "backend/App.csproj").Should().Be(0, fixture.LastOutput);
+        var rootPointer = Pointer(".agentdocs/README.md");
+        var nestedPointer = Pointer("../.agentdocs/README.md");
+        File.ReadAllText(fixture.Path("AGENTS.md")).Should().Be(rootPointer);
+        File.ReadAllText(fixture.Path(".github", "copilot-instructions.md")).Should().Be(nestedPointer);
+        File.ReadAllText(fixture.Path("backend", "AGENTS.md")).Should().Be(nestedPointer);
+        fixture.Run("sync").Should().Be(0);
+        File.ReadAllText(fixture.Path("backend", "AGENTS.md")).Should().Be(nestedPointer);
+        fixture.Run("check").Should().Be(0);
+
+        static string Pointer(string guide) => "<!-- agentdocs:start -->\n" +
+            $"**Read `{guide}` now.** " +
+            "The path is relative to this instruction file (repository-root path: `.agentdocs/README.md`).\n" +
+            "<!-- agentdocs:end -->\n";
+    }
+
+    [Fact]
+    public void Init_separates_managed_block_from_existing_text_and_restores_it_on_remove()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("AGENTS.md", "# Instructions\nCustomer text.\n");
+        var original = File.ReadAllBytes(fixture.Path("AGENTS.md"));
+        fixture.Run("init", "App.csproj").Should().Be(0);
+        File.ReadAllText(fixture.Path("AGENTS.md")).Should().Be(
+            "# Instructions\n<!-- agentdocs:start -->\n" +
+            "**Read `.agentdocs/README.md` now.** " +
+            "The path is relative to this instruction file (repository-root path: `.agentdocs/README.md`).\n" +
+            "<!-- agentdocs:end -->\n\nCustomer text.\n");
+        fixture.Run("remove").Should().Be(0);
+        File.ReadAllBytes(fixture.Path("AGENTS.md")).Should().Equal(original);
+    }
+
+    [Fact]
+    public void Sync_lists_guides_by_usage_and_warns_about_stale_instruction_links()
+    {
+        using var fixture = new Fixture { OverviewDescription = "Choose the right guide." };
+        fixture.Scope("backend");
+        File.Delete(fixture.Path("backend", ".config", "dotnet-tools.json"));
+        fixture.EnterRoot();
+        fixture.Write("AGENTS.md", "# Instructions\nRead `backend/.github/missing.md`.\n");
+        fixture.Write("backend/CLAUDE.md", "# Instructions\nRead [old](../missing.md).\n");
+
+        fixture.Run("init", "backend/App.csproj").Should().Be(0, fixture.LastOutput);
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        index.Should().Contain("## Required reading by project")
+            .And.Contain("`.agentdocs/packages/example.library/guides/start-here.md`")
+            .And.Contain("## On-demand documents")
+            .And.Contain("`Choose the right guide.`");
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("AGENTS.md:6").And.Contain("backend/.github/missing.md")
+            .And.Contain("backend/CLAUDE.md:2").And.Contain("../missing.md");
+        var rootPointer = File.ReadAllBytes(fixture.Path("AGENTS.md"));
+        var copilotPointer = File.ReadAllBytes(fixture.Path(".github", "copilot-instructions.md"));
+        var nestedPointer = File.ReadAllBytes(fixture.Path("backend", "AGENTS.md"));
+        var indexBytes = File.ReadAllBytes(fixture.Path(".agentdocs", "README.md"));
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        File.ReadAllBytes(fixture.Path("AGENTS.md")).Should().Equal(rootPointer);
+        File.ReadAllBytes(fixture.Path(".github", "copilot-instructions.md")).Should().Equal(copilotPointer);
+        File.ReadAllBytes(fixture.Path("backend", "AGENTS.md")).Should().Equal(nestedPointer);
+        File.ReadAllBytes(fixture.Path(".agentdocs", "README.md")).Should().Equal(indexBytes);
+        fixture.Run("sync", "--strict").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("AGENTS.md:6");
+    }
+
+    [Fact]
+    public void Init_lists_required_documents_per_group_and_on_demand_documents_separately()
+    {
+        using var fixture = new Fixture { OverviewDescription = "Choose the overview." };
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        var required = index[index.IndexOf("Required documents:", StringComparison.Ordinal)..
+            index.IndexOf("## On-demand documents", StringComparison.Ordinal)];
+        required.Should().Contain("start-here.md").And.Contain("`Start here.`")
+            .And.NotContain("overview.md").And.NotContain("details.md");
+        File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides", "details.md"))
+            .Should().BeTrue("supporting documents are installed even though the index does not list them");
+        var onDemand = index[index.IndexOf("## On-demand documents", StringComparison.Ordinal)..];
+        onDemand.Should().Contain("overview.md").And.Contain("`Choose the overview.`")
+            .And.NotContain("start-here.md").And.NotContain("details.md");
+        fixture.Run("check").Should().Be(0);
+    }
+
+    [Fact]
+    public void Sync_warns_when_it_removes_a_linked_owned_guide()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("AGENTS.md", "# Instructions\nSee [the guide](.agentdocs/packages/example.library/guides/overview.md).\n");
+        fixture.Run("init", "App.csproj").Should().Be(0);
+        fixture.DefaultHasManifest = false;
+
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("AGENTS.md:6")
+            .And.Contain(".agentdocs/packages/example.library/guides/overview.md");
+        File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides", "overview.md"))
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void Strict_init_rejects_missing_links_before_creating_owned_files()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("CLAUDE.md", "See [missing](missing.md).\n");
+        fixture.Run("init", "--strict", "App.csproj").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("CLAUDE.md:1").And.Contain("missing.md");
+        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Strict_init_accepts_existing_relative_root_and_encoded_links()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("docs/local guide.md", "# Local\n");
+        fixture.Write("nested/CLAUDE.md", """
+            [relative](../docs/local%20guide.md)
+            [root](docs/local%20guide.md)
+            [remote](https://example.com/missing.md)
+            ```md
+            [example](missing.md)
+            ```
+            """);
+
+        fixture.Run("init", "--strict", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().NotContain("agentdocs warning:");
+    }
+
+    [Fact]
+    public void Strict_sync_rejects_links_to_guides_planned_for_removal()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0);
+        var guide = fixture.Path(".agentdocs", "packages", "example.library", "guides", "overview.md");
+        fixture.Write("CLAUDE.md", "Read [.NET guide](.agentdocs/packages/example.library/guides/overview.md).\n");
+        fixture.DefaultHasManifest = false;
+        fixture.DefaultPackageVersion = "2.0.0";
+
+        fixture.Run("sync", "--strict").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("CLAUDE.md:1").And.Contain("overview.md");
+        File.Exists(guide).Should().BeTrue();
+        fixture.Run("sync").Should().Be(0);
+        File.Exists(guide).Should().BeFalse();
+    }
+
+    [Fact]
     public void Init_rejects_solution_in_nested_worktree_with_project_outside_it()
     {
         using var fixture = new Fixture();
@@ -277,7 +338,7 @@ public sealed class AgentDocsTests
         fixture.Write(".github/copilot-instructions.md", "# Customer\n");
         fixture.Run("init", "App.csproj").Should().Be(0);
         var path = fixture.Path(".github", "copilot-instructions.md");
-        var modified = File.ReadAllText(path).Replace("before using package APIs", "before coding");
+        var modified = File.ReadAllText(path).Replace("Read `../.agentdocs/README.md` now", "Skip package guidance");
         File.WriteAllText(path, modified, new UTF8Encoding(true));
         fixture.Run("check").Should().NotBe(0);
         fixture.Run("remove").Should().NotBe(0);
@@ -333,8 +394,7 @@ public sealed class AgentDocsTests
     [Fact]
     public void Init_accepts_case_variant_of_existing_graph_entry_on_Windows()
     {
-        if (!OperatingSystem.IsWindows())
-            return;
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "Windows-only case-insensitivity behavior.");
 
         using var fixture = new Fixture();
         fixture.Run("init", "App.csproj").Should().Be(0);
@@ -352,47 +412,6 @@ public sealed class AgentDocsTests
         fixture.Run("init", "App.csproj").Should().NotBe(0);
         File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
         File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
-    }
-
-    [Fact]
-    public void Directory_safety_rejects_linked_repository_root()
-    {
-        using var fixture = new Fixture();
-        var linked = fixture.Path("linked");
-        try
-        {
-            Directory.CreateSymbolicLink(linked, fixture.Path(".git"));
-        }
-        catch (Exception e) when (e is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
-        {
-            return;
-        }
-
-        var method = typeof(AgentDocsCommand).GetMethod("EnsureDirectoriesSafe",
-            BindingFlags.Static | BindingFlags.NonPublic)!;
-        Action check = () => method.Invoke(null, [linked, linked]);
-        check.Should().Throw<TargetInvocationException>().WithInnerException<InvalidOperationException>();
-    }
-
-    [Fact]
-    public void Directory_safety_rejects_dangling_directory_link()
-    {
-        using var fixture = new Fixture();
-        var linked = fixture.Path("dangling");
-        var missing = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "missing-" + Guid.NewGuid().ToString("N"));
-        try
-        {
-            Directory.CreateSymbolicLink(linked, missing);
-        }
-        catch (Exception e) when (e is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
-        {
-            return;
-        }
-
-        var method = typeof(AgentDocsCommand).GetMethod("EnsureDirectoriesSafe",
-            BindingFlags.Static | BindingFlags.NonPublic)!;
-        Action check = () => method.Invoke(null, [fixture.Path(), fixture.Path("dangling", "AGENTS.md")]);
-        check.Should().Throw<TargetInvocationException>().WithInnerException<InvalidOperationException>();
     }
 
     [Fact]
@@ -497,6 +516,43 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
+    public void Generated_files_are_line_feed_only_and_check_tolerates_a_windows_checkout()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var files = new[]
+        {
+            fixture.Path(".agentdocs", "README.md"),
+            fixture.Path(".agentdocs", "agent-context.json"),
+            fixture.Path(".agentdocs", "policy.json"),
+            fixture.Path("AGENTS.md")
+        };
+        foreach (var file in files)
+            File.ReadAllText(file).Should().NotContain("\r", "generated content is line-feed only: " + file);
+
+        // A Windows checkout with autocrlf turns every text file into CRLF.
+        foreach (var file in files)
+            File.WriteAllText(file, File.ReadAllText(file).Replace("\n", "\r\n"), new UTF8Encoding(true));
+        var converted = files.Select(File.ReadAllBytes).ToArray();
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        files.Select(File.ReadAllBytes).Should().BeEquivalentTo(converted, options => options.WithStrictOrdering());
+    }
+
+    [Fact]
+    public void Description_line_separators_cannot_break_the_index_line()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("package-two/guide/README.md", "# Other\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md",
+            description: "one\u2028two\u2029three\u0085four");
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        index.Should().Contain("`one two three four`")
+            .And.NotContain("\u2028").And.NotContain("\u2029").And.NotContain("\u0085");
+    }
+
+    [Fact]
     public void Init_does_not_claim_unowned_identical_document()
     {
         using var fixture = new Fixture();
@@ -517,23 +573,7 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
-    public void Init_does_not_impose_publisher_specific_target_rules()
-    {
-        using var fixture = new Fixture();
-        fixture.Write("package/build/Example.Library.targets", "<Target Name=\"PublisherTarget\" />");
-        fixture.Run("init", "App.csproj").Should().Be(0);
-    }
-
-    [Fact]
-    public void Init_allows_compatible_bootstrap_target()
-    {
-        using var fixture = new Fixture();
-        fixture.Write("package/build/Example.Library.targets", "<Target Name=\"PublisherBootstrap\" />");
-        fixture.Run("init", "App.csproj").Should().Be(0);
-    }
-
-    [Fact]
-    public void Init_accepts_one_guide_as_its_only_entry_point()
+    public void Init_installs_a_single_on_demand_guide()
     {
         using var fixture = new Fixture { ShortGuideOnly = true };
         fixture.Run("init", "App.csproj").Should().Be(0);
@@ -542,28 +582,24 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
-    public void Init_does_not_require_publisher_metadata()
-    {
-        using var fixture = new Fixture { OmitPublisherMetadata = true };
-        fixture.Run("init", "App.csproj").Should().Be(0);
-    }
-
-    [Fact]
-    public void Init_ignores_unrelated_packages_without_manifests()
+    public void Packages_without_a_manifest_are_neither_listed_nor_pending()
     {
         using var fixture = new Fixture();
         fixture.AddWithoutManifest("Other.Dependency", "package-old");
         fixture.Run("init", "App.csproj").Should().Be(0);
+        File.ReadAllText(fixture.Path(".agentdocs", "README.md")).Should().NotContain("Other.Dependency")
+            .And.NotContain("Pending review");
+        fixture.LastOutput.Should().NotContain("pending");
     }
 
     [Fact]
-    public void Refresh_removes_guidance_when_a_package_stops_publishing_it()
+    public void Sync_removes_guidance_when_a_package_stops_publishing_it()
     {
         using var fixture = new Fixture();
         fixture.Run("init", "App.csproj").Should().Be(0);
         fixture.DefaultHasManifest = false;
         fixture.DefaultPackageVersion = "2.0.0";
-        fixture.Run("refresh").Should().Be(0);
+        fixture.Run("sync").Should().Be(0);
         fixture.LastOutput.Should().Contain("no longer publishes guidance");
         File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides",
             "overview.md")).Should().BeFalse();
@@ -708,8 +744,7 @@ public sealed class AgentDocsTests
     [Fact]
     public void Boundary_check_distinguishes_case_distinct_unix_trees()
     {
-        if (OperatingSystem.IsWindows())
-            return;
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "Needs a case-sensitive file system.");
 
         using var fixture = new Fixture();
         var root = fixture.Path();
@@ -728,25 +763,6 @@ public sealed class AgentDocsTests
         fixture.EnterRoot();
         fixture.Run("init", "service/App.csproj").Should().NotBe(0);
         File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
-        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
-    }
-
-    [Fact]
-    public void Init_rejects_linked_explicit_source_root()
-    {
-        using var fixture = new Fixture();
-        fixture.Write("elsewhere/AGENTS.md", "# Elsewhere\n");
-        try
-        {
-            Directory.CreateSymbolicLink(fixture.Path("shared"), fixture.Path("elsewhere"));
-        }
-        catch (Exception e) when (e is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
-        {
-            return;
-        }
-
-        fixture.Run("init", "--source-root", "shared", "App.csproj").Should().NotBe(0);
-        File.ReadAllText(fixture.Path("elsewhere", "AGENTS.md")).Should().Be("# Elsewhere\n");
         File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
     }
 
@@ -779,25 +795,6 @@ public sealed class AgentDocsTests
         fixture.Run("check").Should().NotBe(0);
         fixture.Run("sync", "--force").Should().Be(0);
         File.ReadAllText(file).Should().NotContain("tampered line");
-    }
-
-    [Fact]
-    public void Init_rejects_linked_context_before_following_repository_manifest()
-    {
-        using var fixture = new Fixture();
-        Directory.CreateDirectory(fixture.Path("elsewhere"));
-        fixture.Write("elsewhere/agent-context.json", "not a context");
-        try
-        {
-            Directory.CreateSymbolicLink(fixture.Path(".agentdocs"), fixture.Path("elsewhere"));
-        }
-        catch (Exception e) when (e is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
-        {
-            return;
-        }
-
-        fixture.Run("init", "App.csproj").Should().NotBe(0);
-        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
     }
 
     [Fact]
@@ -875,27 +872,14 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
-    public void Init_unrelated_guidance_retains_nested_namespace()
-    {
-        using var fixture = new Fixture();
-        fixture.Write("package-two/guide/README.md", "# Other\n");
-        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md");
-        fixture.Run("init", "App.csproj").Should().Be(0);
-        File.Exists(fixture.Path(".agentdocs", "packages", "other.publisher", "guide", "README.md"))
-            .Should().BeTrue();
-        File.ReadAllText(fixture.Path(".agentdocs", "README.md")).Should().Contain("Start here")
-            .And.Contain("packages/other.publisher/guide/README.md");
-        fixture.Run("check").Should().Be(0);
-    }
-
-    [Fact]
     public void Generated_index_escapes_package_supplied_markdown_label_characters()
     {
         using var fixture = new Fixture();
-        fixture.Write("package-two/guide/R]eadme.md", "# Other\n");
+        fixture.Write("package-two/guide/R]eadme.md", "# R]eadme\n");
         fixture.AddPackage("Other.Publisher", "package-two", "guide/R]eadme.md");
         fixture.Run("init", "App.csproj").Should().Be(0);
-        File.ReadAllText(fixture.Path(".agentdocs", "README.md")).Should().Contain("R\\]eadme.md");
+        File.ReadAllText(fixture.Path(".agentdocs", "README.md")).Should().Contain("guide/R]eadme.md`](")
+            .And.Contain("guide/R%5Deadme.md");
     }
 
     [Fact]
@@ -1012,15 +996,6 @@ public sealed class AgentDocsTests
         fixture.Scope("service");
         fixture.Run("init", "App.csproj").Should().NotBe(0);
         File.Exists(fixture.Path("service", ".agentdocs", "agent-context.json")).Should().BeFalse();
-        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
-    }
-
-    [Fact]
-    public void Init_rejects_removed_scope_switch()
-    {
-        using var fixture = new Fixture();
-        fixture.Run("init", "--scope", ".", "App.csproj").Should().NotBe(0);
-        fixture.LastOutput.Should().Contain("Unknown option '--scope'");
         File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
     }
 
@@ -1408,9 +1383,10 @@ public sealed class AgentDocsTests
                 {
                     path = "guides/" + name,
                     sha256 = Convert.ToHexString(SHA256.HashData(
-                        File.ReadAllBytes(System.IO.Path.Combine(package, "guides", name)))).ToLowerInvariant()
+                        File.ReadAllBytes(System.IO.Path.Combine(package, "guides", name)))).ToLowerInvariant(),
+                    usage = name == "start-here.md" ? "required" : "onDemand",
+                    description = "About " + name
                 }).ToArray(),
-                entryPoints = new List<string> { "guides/start-here.md" },
                 publisherMetadata = new Dictionary<string, object>
                 {
                     ["com.example"] = new { labels = ExampleMetadata }
@@ -1456,6 +1432,548 @@ public sealed class AgentDocsTests
         File.Exists(fixture.Path("obj", "project.assets.json")).Should().BeTrue();
     }
 
+    [Fact]
+    public void Init_installs_no_restore_hooks_and_refresh_is_not_a_verb()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        File.Exists(fixture.Path("Directory.Build.targets")).Should().BeFalse();
+        File.Exists(fixture.Path("Directory.Solution.targets")).Should().BeFalse();
+        File.Exists(fixture.Path(".agentdocs", "restore.targets")).Should().BeFalse();
+        fixture.Run("refresh").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Usage: agentdocs init|sync|check|remove");
+    }
+
+    [Fact]
+    public void Legacy_state_with_restore_hooks_is_rejected_with_guidance()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var state = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(fixture.Path(".agentdocs", "agent-context.json")))!;
+        state["RestoreEntries"] = System.Text.Json.Nodes.JsonNode.Parse(
+            "[{\"InstructionFile\":\"Directory.Build.targets\",\"CanonicalSha256\":\"" + new string('0', 64) +
+            "\",\"ExistedBefore\":false}]");
+        File.WriteAllText(fixture.Path(".agentdocs", "agent-context.json"), state.ToJsonString());
+
+        fixture.Run("sync").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("restore hooks");
+    }
+
+    [Fact]
+    public void Init_creates_an_empty_policy_and_leaves_every_package_pending()
+    {
+        using var fixture = new Fixture();
+        fixture.RemovePolicy();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var policy = File.ReadAllText(fixture.Path(".agentdocs", "policy.json"));
+        using (var json = JsonDocument.Parse(policy))
+            json.RootElement.GetProperty("approvedPackages").GetArrayLength().Should().Be(0);
+        File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides", "start-here.md")).Should().BeFalse();
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        index.Should().Contain("No package guidance is enabled").And.Contain("## Pending review")
+            .And.Contain("Example.Library").And.NotContain("## Rules").And.NotContain("start-here");
+        fixture.LastOutput.Should().Contain("approvedPackages").And.Contain("\"Example.Library\"");
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+
+        fixture.Approve("Example.Library");
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides", "start-here.md")).Should().BeTrue();
+        File.ReadAllText(fixture.Path(".agentdocs", "README.md")).Should().NotContain("## Pending review");
+    }
+
+    [Fact]
+    public void Existing_policy_is_never_rewritten_or_removed()
+    {
+        using var fixture = new Fixture();
+        var policy = File.ReadAllBytes(fixture.Path(".agentdocs", "policy.json"));
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        File.ReadAllBytes(fixture.Path(".agentdocs", "policy.json")).Should().Equal(policy);
+        fixture.Run("sync").Should().Be(0);
+        fixture.Run("check").Should().Be(0);
+        fixture.Run("remove").Should().Be(0);
+        File.ReadAllBytes(fixture.Path(".agentdocs", "policy.json")).Should().Equal(policy);
+        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Discovery_is_asked_to_load_only_approved_packages()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.LastShouldLoad.Should().NotBeNull();
+        fixture.LastShouldLoad!("Example.Library").Should().BeTrue();
+        fixture.LastShouldLoad("example.library").Should().BeTrue();
+        fixture.LastShouldLoad("Other.Package").Should().BeFalse();
+    }
+
+    [Fact]
+    public void Unapproved_packages_are_pending_and_never_installed()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("package-two/guide/README.md", "# Other\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md", approve: false);
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        File.Exists(fixture.Path(".agentdocs", "packages", "other.publisher", "guide", "README.md")).Should().BeFalse();
+        File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides", "start-here.md")).Should().BeTrue();
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        index.Should().Contain("## Pending review").And.Contain("Other.Publisher 2.0.0")
+            .And.NotContain("Guide for Other.Publisher");
+        fixture.LastOutput.Should().Contain("pending Other.Publisher 2.0.0")
+            .And.Contain("\"Other.Publisher\"");
+        fixture.Run("check").Should().Be(0);
+    }
+
+    [Fact]
+    public void Mixed_versions_of_a_pending_package_do_not_block_init()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("package-two/guide/README.md", "# Other\n");
+        fixture.Write("package-three/guide/README.md", "# Other\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md", approve: false);
+        fixture.AddPackage("Other.Publisher", "package-three", "guide/README.md", "3.0.0", approve: false);
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        File.ReadAllText(fixture.Path(".agentdocs", "README.md")).Should().Contain("Other.Publisher 2.0.0, 3.0.0");
+    }
+
+    [Fact]
+    public void Withdrawing_approval_removes_the_owned_guide()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var guide = fixture.Path(".agentdocs", "packages", "example.library", "guides", "start-here.md");
+        File.Exists(guide).Should().BeTrue();
+        fixture.Unapprove("Example.Library");
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("is not approved");
+        File.Exists(guide).Should().BeFalse();
+        fixture.Run("check").Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData("{not json")]
+    [InlineData("{\"schemaVersion\":2,\"approvedPackages\":[]}")]
+    [InlineData("{\"schemaVersion\":1,\"approvedPackages\":[\"A\",\"a\"]}")]
+    [InlineData("{\"schemaVersion\":1,\"approvedPackages\":[\"bad id\"]}")]
+    [InlineData("{\"schemaVersion\":1,\"approvedPackages\":[],\"extra\":1}")]
+    [InlineData("{\"schemaVersion\":1}")]
+    public void Init_rejects_an_invalid_policy_before_writing(string policy)
+    {
+        using var fixture = new Fixture();
+        fixture.Write(".agentdocs/policy.json", policy);
+        fixture.Run("init", "App.csproj").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Invalid .agentdocs/policy.json");
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Index_without_enabled_guidance_issues_no_read_instructions()
+    {
+        using var fixture = new Fixture { DefaultHasManifest = false };
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        index.Should().Contain("No package guidance is enabled")
+            .And.NotContain("## Rules").And.NotContain("Required").And.NotContain("packages/");
+    }
+
+    [Fact]
+    public void Projects_are_grouped_by_the_enabled_packages_they_restore()
+    {
+        using var fixture = new Fixture();
+        AddSecondProject(fixture);
+        fixture.Write("package-two/guide/README.md", "# Other\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md", scope: OtherScope(fixture));
+
+        fixture.Run("init", "Apps.slnx").Should().Be(0, fixture.LastOutput);
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        var first = index[index.IndexOf("### Group 1", StringComparison.Ordinal)..index.IndexOf("### Group 2", StringComparison.Ordinal)];
+        first.Should().Contain("`App.csproj`").And.Contain("Example.Library").And.NotContain("Other.Publisher");
+        var second = index[index.IndexOf("### Group 2", StringComparison.Ordinal)..
+            index.IndexOf("## On-demand documents", StringComparison.Ordinal)];
+        second.Should().Contain("`Other/Other.csproj`").And.Contain("Other.Publisher").And.NotContain("Example.Library");
+        index.Should().Contain("Restored by: Group 2");
+    }
+
+    [Fact]
+    public void Projects_restoring_the_same_enabled_packages_share_one_group()
+    {
+        using var fixture = new Fixture { DefaultHasManifest = false };
+        AddSecondProject(fixture);
+        fixture.Write("package-two/guide/README.md", "# Other\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md", scope: OtherScope(fixture));
+
+        fixture.Run("init", "Apps.slnx").Should().Be(0, fixture.LastOutput);
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        index.Should().Contain("### Group 1").And.NotContain("### Group 2")
+            .And.Contain("`App.csproj`, `Other/Other.csproj`");
+    }
+
+    [Fact]
+    public void Projects_without_enabled_guidance_are_listed_separately()
+    {
+        using var fixture = new Fixture();
+        AddSecondProject(fixture);
+        fixture.AddWithoutManifest("Azure.Core", "package-two", "1.53.0", OtherScope(fixture));
+
+        fixture.Run("init", "Apps.slnx").Should().Be(0, fixture.LastOutput);
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        index[index.IndexOf("### Projects without enabled guidance", StringComparison.Ordinal)..]
+            .Should().Contain("`Other/Other.csproj`").And.NotContain("`App.csproj`");
+    }
+
+    [Fact]
+    public void Printed_summary_reports_required_bytes_and_index_size()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("AgentDocs: group 1: 1 project(s)")
+            .And.Contain("1 required document(s), 12 bytes.")
+            .And.Contain("AgentDocs: index is ");
+    }
+
+    [Fact]
+    public void Descriptions_render_as_inert_code_spans()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("package-two/guide/README.md", "# Other\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md",
+            description: "See [x](http://e.example) `tick` <b>bold</b>");
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        File.ReadAllText(fixture.Path(".agentdocs", "README.md"))
+            .Should().Contain("``See [x](http://e.example) `tick` <b>bold</b>``");
+    }
+
+    private static void AddSecondProject(Fixture fixture)
+    {
+        fixture.Write("Other/Other.csproj", File.ReadAllText(fixture.Path("App.csproj")));
+        fixture.Write("Other/obj/project.assets.json", File.ReadAllText(fixture.Path("obj", "project.assets.json")));
+        fixture.Write("Apps.slnx", """
+            <Solution>
+              <Project Path="App.csproj" />
+              <Project Path="Other/Other.csproj" />
+            </Solution>
+            """);
+    }
+
+    private static GuidanceScope OtherScope(Fixture fixture) =>
+        new(fixture.Path("Other", "obj", "project.assets.json"), fixture.Path("Other", "Other.csproj"), "net10.0", null);
+
+    [Fact]
+    public void Directory_safety_rejects_linked_repository_root()
+    {
+        using var fixture = new Fixture();
+        var linked = fixture.Path("linked");
+        Assert.SkipUnless(TryCreateDirectoryLink(linked, fixture.Path(".git")), LinksUnavailable);
+
+        var method = typeof(AgentDocsCommand).GetMethod("EnsureDirectoriesSafe",
+            BindingFlags.Static | BindingFlags.NonPublic)!;
+        Action check = () => method.Invoke(null, [linked, linked]);
+        check.Should().Throw<TargetInvocationException>().WithInnerException<InvalidOperationException>();
+    }
+
+    [Fact]
+    public void Directory_safety_rejects_dangling_directory_link()
+    {
+        using var fixture = new Fixture();
+        var linked = fixture.Path("dangling");
+        var target = fixture.Path("dangling-target");
+        Directory.CreateDirectory(target);
+        Assert.SkipUnless(TryCreateDirectoryLink(linked, target), LinksUnavailable);
+        Directory.Delete(target);
+
+        var method = typeof(AgentDocsCommand).GetMethod("EnsureDirectoriesSafe",
+            BindingFlags.Static | BindingFlags.NonPublic)!;
+        Action check = () => method.Invoke(null, [fixture.Path(), fixture.Path("dangling", "AGENTS.md")]);
+        check.Should().Throw<TargetInvocationException>().WithInnerException<InvalidOperationException>();
+    }
+
+    [Fact]
+    public void Init_rejects_linked_explicit_source_root()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("elsewhere/AGENTS.md", "# Elsewhere\n");
+        Assert.SkipUnless(TryCreateDirectoryLink(fixture.Path("shared"), fixture.Path("elsewhere")), LinksUnavailable);
+
+        fixture.Run("init", "--source-root", "shared", "App.csproj").Should().NotBe(0);
+        File.ReadAllText(fixture.Path("elsewhere", "AGENTS.md")).Should().Be("# Elsewhere\n");
+        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Init_rejects_linked_context_before_following_repository_manifest()
+    {
+        using var fixture = new Fixture();
+        Directory.CreateDirectory(fixture.Path("elsewhere"));
+        fixture.Write("elsewhere/agent-context.json", "not a context");
+        // The fixture wrote the policy into .agentdocs; replace that directory with a link.
+        Directory.Delete(fixture.Path(".agentdocs"), recursive: true);
+        Assert.SkipUnless(TryCreateDirectoryLink(fixture.Path(".agentdocs"), fixture.Path("elsewhere")), LinksUnavailable);
+
+        fixture.Run("init", "App.csproj").Should().NotBe(0);
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Init_rejects_non_markdown_guidance_before_writing()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("package-two/guide/notes.txt", "notes\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/notes.txt");
+
+        fixture.Run("init", "App.csproj").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Non-Markdown guidance");
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Init_reverifies_each_document_hash_before_installing_it()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("package-two/guide/README.md", "# Original\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md");
+        fixture.Write("package-two/guide/README.md", "# Tampered after discovery\n");
+
+        fixture.Run("init", "App.csproj").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Package hash mismatch");
+        File.Exists(fixture.Path(".agentdocs", "packages", "other.publisher", "guide", "README.md")).Should().BeFalse();
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Init_rejects_one_package_contributing_different_bytes_from_two_projects()
+    {
+        using var fixture = new Fixture();
+        AddSecondProject(fixture);
+        fixture.Write("package-two/guide/README.md", "# One\n");
+        fixture.Write("package-three/guide/README.md", "# Two\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md");
+        fixture.AddPackage("Other.Publisher", "package-three", "guide/README.md", scope: OtherScope(fixture));
+
+        fixture.Run("init", "Apps.slnx").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Conflicting contributions");
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Init_rejects_one_package_describing_the_same_document_differently_in_two_projects()
+    {
+        using var fixture = new Fixture();
+        AddSecondProject(fixture);
+        fixture.Write("package-two/guide/README.md", "# One\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md", description: "First description.");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md", description: "Second description.",
+            scope: OtherScope(fixture));
+
+        fixture.Run("init", "Apps.slnx").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Conflicting guidance metadata");
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("schema-version", "Unsupported or invalid context manifest")]
+    [InlineData("tool-owned-path", "Conflicting or invalid tool-owned paths")]
+    [InlineData("owned-hash", "Invalid owned-file hash")]
+    [InlineData("reference-outside-packages", "outside the guidance namespaces")]
+    [InlineData("duplicate-instruction-entry", "Duplicate instruction ownership entry")]
+    [InlineData("foreign-instruction-file", "Invalid instruction ownership entry")]
+    public void Check_rejects_an_invalid_context_state(string defect, string message)
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var path = fixture.Path(".agentdocs", "agent-context.json");
+        var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!;
+        switch (defect)
+        {
+            case "schema-version":
+                node["SchemaVersion"] = 3;
+                break;
+            case "tool-owned-path":
+                node["ToolOwnedFiles"]![0]!["Path"] = "notes.md";
+                break;
+            case "owned-hash":
+                node["ToolOwnedFiles"]![0]!["CanonicalSha256"] = "zz";
+                break;
+            case "reference-outside-packages":
+                node["References"]![0]!["Path"] = "elsewhere/guide.md";
+                break;
+            case "duplicate-instruction-entry":
+                node["InstructionEntries"]!.AsArray().Add(node["InstructionEntries"]![0]!.DeepClone());
+                break;
+            case "foreign-instruction-file":
+                node["InstructionEntries"]![0]!["InstructionFile"] = "notes.txt";
+                break;
+        }
+
+        File.WriteAllText(path, node.ToJsonString());
+        fixture.Run("check").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain(message);
+    }
+
+    [Fact]
+    public void State_with_the_entry_point_list_of_an_earlier_preview_still_loads()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var path = fixture.Path(".agentdocs", "agent-context.json");
+        var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!;
+        node["EntryPoints"] = new System.Text.Json.Nodes.JsonArray();
+        File.WriteAllText(path, node.ToJsonString());
+
+        // The old file loads (it is not rejected as invalid) and is reported as drift; sync rewrites it.
+        fixture.Run("check").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Update manifest").And.NotContain("Unsupported or invalid");
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+    }
+
+    [Fact]
+    public void Init_dry_run_writes_nothing_including_the_policy()
+    {
+        using var fixture = new Fixture();
+        fixture.RemovePolicy();
+
+        fixture.Run("init", "--dry-run", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("Would Create policy");
+        File.Exists(fixture.Path(".agentdocs", "policy.json")).Should().BeFalse();
+        File.Exists(fixture.Path(".agentdocs", "README.md")).Should().BeFalse();
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Policy_may_list_packages_that_are_not_in_the_graph()
+    {
+        using var fixture = new Fixture();
+        fixture.Write(".agentdocs/policy.json",
+            "{\"schemaVersion\":1,\"approvedPackages\":[\"Example.Library\",\"Ghost.Package\"]}");
+
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides", "start-here.md")).Should().BeTrue();
+        fixture.Run("check").Should().Be(0);
+    }
+
+    [Fact]
+    public void Policy_with_a_byte_order_mark_is_accepted()
+    {
+        using var fixture = new Fixture();
+        File.WriteAllText(fixture.Path(".agentdocs", "policy.json"),
+            "{\"schemaVersion\":1,\"approvedPackages\":[\"Example.Library\"]}", new UTF8Encoding(true));
+
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        File.Exists(fixture.Path(".agentdocs", "packages", "example.library", "guides", "start-here.md")).Should().BeTrue();
+    }
+
+    [Fact]
+    public void A_package_restored_by_two_groups_lists_every_group_that_restores_it()
+    {
+        using var fixture = new Fixture();
+        AddSecondProject(fixture);
+        fixture.Write("package-two/guide/README.md", "# Other\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md", scope: OtherScope(fixture));
+
+        fixture.Run("init", "Apps.slnx").Should().Be(0, fixture.LastOutput);
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        index.Should().Contain("### Group 2");
+        index[index.IndexOf("### Other.Publisher", StringComparison.Ordinal)..]
+            .Should().Contain("Restored by: Group 1, Group 2");
+    }
+
+    [Fact]
+    public void A_project_restoring_packages_in_different_targets_forms_one_group_with_their_union()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("package-two/guide/README.md", "# Other\n");
+        fixture.AddPackage("Other.Publisher", "package-two", "guide/README.md",
+            scope: new GuidanceScope(fixture.Path("obj", "project.assets.json"), fixture.Path("App.csproj"), "net9.0", null));
+
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var index = File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        index.Should().Contain("### Group 1").And.NotContain("### Group 2");
+        var group = index[index.IndexOf("### Group 1", StringComparison.Ordinal)..
+            index.IndexOf("## On-demand documents", StringComparison.Ordinal)];
+        group.Should().Contain("Example.Library").And.Contain("Other.Publisher");
+        group.Split("`App.csproj`").Length.Should().Be(2, "the project is listed once");
+    }
+
+    [Fact]
+    public void Index_is_identical_whatever_order_packages_are_discovered_in()
+    {
+        var forward = IndexWith("Alpha.Publisher", "Zeta.Publisher");
+        var reverse = IndexWith("Zeta.Publisher", "Alpha.Publisher");
+
+        forward.Should().Be(reverse);
+        forward.IndexOf("Alpha.Publisher", StringComparison.Ordinal)
+            .Should().BeLessThan(forward.IndexOf("Zeta.Publisher", StringComparison.Ordinal));
+
+        static string IndexWith(params string[] ids)
+        {
+            using var fixture = new Fixture { DefaultHasManifest = false };
+            foreach (var id in ids)
+            {
+                fixture.Write($"pkg-{id}/guide/README.md", "# " + id + "\n");
+                fixture.AddPackage(id, $"pkg-{id}", "guide/README.md");
+            }
+
+            fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+            return File.ReadAllText(fixture.Path(".agentdocs", "README.md"));
+        }
+    }
+
+    [Fact]
+    public void Init_ignores_a_percent_encoded_nul_in_a_hand_written_link_instead_of_failing()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("CLAUDE.md", "See [nul](%00.md).\n");
+
+        fixture.Run("init", "--strict", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().NotContain("agentdocs warning:");
+    }
+
+    [Fact]
+    public void Init_is_not_blocked_by_a_pending_package_whose_cache_is_incomplete()
+    {
+        using var fixture = new Fixture();
+        fixture.AddNotLoaded("Pending.Publisher", "1.0.0", "cache-that-was-never-restored");
+
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        File.ReadAllText(fixture.Path(".agentdocs", "README.md")).Should().Contain("Pending.Publisher 1.0.0");
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+    }
+
+    private const string LinksUnavailable = "This machine cannot create the file-system links this test needs.";
+
+    /// <summary>Creates a directory link: a symbolic link, or on Windows without privilege a junction, which also carries the reparse-point attribute.</summary>
+    private static bool TryCreateDirectoryLink(string link, string target)
+    {
+        try
+        {
+            Directory.CreateSymbolicLink(link, target);
+            return true;
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+        {
+        }
+
+        if (!OperatingSystem.IsWindows() || !Directory.Exists(target))
+            return false;
+        var start = new ProcessStartInfo("cmd")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        foreach (var argument in new[] { "/c", "mklink", "/J", link, target })
+            start.ArgumentList.Add(argument);
+        using var process = Process.Start(start)!;
+        process.StandardOutput.ReadToEnd();
+        process.StandardError.ReadToEnd();
+        process.WaitForExit(10000);
+        return process.ExitCode == 0;
+    }
+
     private sealed class Fixture : IDisposable
     {
         private readonly string _root;
@@ -1463,12 +1981,14 @@ public sealed class AgentDocsTests
         private readonly List<GuidancePackage> _extraPackages = [];
         private string _project = "App.csproj";
         private string _assets = "obj/project.assets.json";
+        private readonly HashSet<string> _approved = new(StringComparer.OrdinalIgnoreCase) { "Example.Library" };
         public bool ShortGuideOnly { get; set; }
-        public bool OmitPublisherMetadata { get; set; }
         public bool DefaultHasManifest { get; set; } = true;
         public string DefaultPackageVersion { get; set; } = ToolVersion();
+        public string OverviewDescription { get; set; } = "Overview of the library.";
         public string? ReaderDiagnostic { get; set; }
         public string LastOutput { get; private set; } = "";
+        public Func<string, bool>? LastShouldLoad { get; private set; }
 
         public Fixture()
         {
@@ -1494,7 +2014,28 @@ public sealed class AgentDocsTests
             Write("package/guides/overview.md", "# Guide\n");
             Write("package/guides/details.md", "# Cookbook\n");
             Write("package/guides/start-here.md", "Start here.\n");
+            WritePolicy();
         }
+
+        public void WritePolicy() => Write(".agentdocs/policy.json", JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            approvedPackages = _approved.OrderBy(id => id, StringComparer.OrdinalIgnoreCase).ToArray()
+        }));
+
+        public void Approve(string id)
+        {
+            _approved.Add(id);
+            WritePolicy();
+        }
+
+        public void Unapprove(string id)
+        {
+            _approved.Remove(id);
+            WritePolicy();
+        }
+
+        public void RemovePolicy() => File.Delete(Path(".agentdocs", "policy.json"));
 
         public string Path(params string[] pieces) => System.IO.Path.Combine([_root, .. pieces]);
         public void EnterRoot() => Environment.CurrentDirectory = _root;
@@ -1510,16 +2051,20 @@ public sealed class AgentDocsTests
             Environment.CurrentDirectory = Path(relative);
         }
 
-        public void AddPackage(string id, string root, string document, string version = "2.0.0")
+        public void AddPackage(string id, string root, string document, string version = "2.0.0",
+            string? description = null, GuidanceScope? scope = null, bool approve = true)
         {
             var file = Path(root, document.Replace('/', System.IO.Path.DirectorySeparatorChar));
             var sha = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file))).ToLowerInvariant();
             var guidance = new GuidanceContribution(
-                [new GuidanceDocument(new GuidanceIdentity(id, version, document), file, sha, null)],
-                [document], new Dictionary<string, JsonElement>());
-            _extraPackages.Add(new GuidancePackage(new GuidanceScope(Path(_assets.Replace('/', System.IO.Path.DirectorySeparatorChar)),
+                [new GuidanceDocument(new GuidanceIdentity(id, version, document), file, sha, GuidanceUsage.OnDemand,
+                    description ?? "Guide for " + id)],
+                new Dictionary<string, JsonElement>());
+            _extraPackages.Add(new GuidancePackage(scope ?? new GuidanceScope(Path(_assets.Replace('/', System.IO.Path.DirectorySeparatorChar)),
                 Path(_project.Replace('/', System.IO.Path.DirectorySeparatorChar)), "net10.0", null),
                 id, version, Path(root), GuidanceStatus.Valid, guidance, null));
+            if (approve)
+                Approve(id);
         }
 
         public void AddWithoutManifest(string id, string root, string version = "1.0.0", GuidanceScope? scope = null)
@@ -1533,6 +2078,12 @@ public sealed class AgentDocsTests
 
         public void RemovePackage(string id) => _extraPackages.RemoveAll(p => p.PackageId == id);
 
+        /// <summary>A package the caller declined to read: no contribution, and its cache entry may be absent.</summary>
+        public void AddNotLoaded(string id, string version, string root) =>
+            _extraPackages.Add(new GuidancePackage(new GuidanceScope(Path(_assets.Replace('/', System.IO.Path.DirectorySeparatorChar)),
+                Path(_project.Replace('/', System.IO.Path.DirectorySeparatorChar)), "net10.0", null),
+                id, version, Path(root), GuidanceStatus.NotLoaded, null, null) { ManifestDeclared = true });
+
         public void Write(string path, string content)
         {
             var fullPath = System.IO.Path.Combine(_root, path.Replace('/', System.IO.Path.DirectorySeparatorChar));
@@ -1544,19 +2095,21 @@ public sealed class AgentDocsTests
         {
             var sha = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Path("package", "guides", "overview.md")))).ToLowerInvariant();
             var doc = new GuidanceDocument(new GuidanceIdentity("Example.Library", DefaultPackageVersion,
-                "guides/overview.md"), Path("package", "guides", "overview.md"), sha, null);
+                "guides/overview.md"), Path("package", "guides", "overview.md"), sha, GuidanceUsage.OnDemand,
+                OverviewDescription);
             var documents = new List<GuidanceDocument> { doc };
             if (!ShortGuideOnly)
                 foreach (var name in new[] { "details.md", "start-here.md" })
                 {
                     var path = Path("package", "guides", name);
                     documents.Add(new GuidanceDocument(new GuidanceIdentity("Example.Library", ToolVersion(), "guides/" + name),
-                        path, Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant(), null));
+                        path, Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant(),
+                        name == "details.md" ? GuidanceUsage.Supporting : GuidanceUsage.Required,
+                        name == "details.md" ? null : "Start here."));
                 }
 
             var contribution = new GuidanceContribution(documents,
-                ShortGuideOnly ? ["guides/overview.md"] : ["guides/start-here.md"],
-                OmitPublisherMetadata ? new Dictionary<string, JsonElement>() : new Dictionary<string, JsonElement>
+                new Dictionary<string, JsonElement>
                 {
                     ["com.example"] = JsonSerializer.SerializeToElement(new { labels = ExampleMetadata })
                 });
@@ -1568,7 +2121,11 @@ public sealed class AgentDocsTests
                 DefaultHasManifest ? contribution : null, null),
                 .. _extraPackages], ReaderDiagnostic is null ? [] : [ReaderDiagnostic]);
             using var output = new StringWriter();
-            var result = AgentDocsCommand.Run(args, output, _ => guidance);
+            var result = AgentDocsCommand.Run(args, output, (_, load) =>
+            {
+                LastShouldLoad = load;
+                return guidance;
+            });
             LastOutput = output.ToString();
             if (result != 0)
                 Console.Error.WriteLine(LastOutput);
@@ -1590,7 +2147,7 @@ public sealed class AgentDocsTests
             Environment.CurrentDirectory = _root;
             using var output = new StringWriter();
             var result = AgentDocsCommand.Run(args, output,
-                _ => throw new InvalidOperationException("Remove must not discover package assets."));
+                (_, _) => throw new InvalidOperationException("Remove must not discover package assets."));
             if (result != 0)
                 Console.Error.WriteLine(output.ToString());
             return result;
@@ -1599,6 +2156,11 @@ public sealed class AgentDocsTests
         public void Dispose()
         {
             Environment.CurrentDirectory = _previous;
+            // Remove links first (deepest first): deleting a link never touches its target.
+            foreach (var directory in Directory.EnumerateDirectories(_root, "*", SearchOption.AllDirectories)
+                .OrderByDescending(d => d.Length).ToArray())
+                if (Directory.Exists(directory) && (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+                    Directory.Delete(directory);
             Directory.Delete(_root, recursive: true);
         }
     }

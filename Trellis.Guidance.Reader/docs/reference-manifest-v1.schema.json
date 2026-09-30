@@ -1,10 +1,10 @@
-﻿{
+{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xavierjohn/Trellis.AgentDocs.Packaging/blob/main/Trellis.Guidance.Reader/docs/reference-manifest-v1.schema.json",
-  "title": "Experimental NuGet package guidance manifest, version 1",
+  "title": "Experimental NuGet package guidance manifest, version 1 (preview)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "documents", "entryPoints"],
+  "required": ["schemaVersion", "documents"],
   "properties": {
     "schemaVersion": { "const": 1 },
     "documents": {
@@ -12,18 +12,21 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["path", "sha256"],
+        "required": ["path", "sha256", "usage"],
         "properties": {
           "path": { "$ref": "#/$defs/packagePath" },
           "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-          "role": { "type": "string", "minLength": 1, "pattern": "\\S" }
-        }
+          "usage": { "enum": ["required", "onDemand", "supporting"] },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]*\\S[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]*$",
+            "description": "One line. Readers also enforce a limit of 200 Unicode scalar values counted after NFC normalization; JSON Schema cannot express that, so it is not a maxLength here."
+          }
+        },
+        "if": { "properties": { "usage": { "enum": ["required", "onDemand"] } } },
+        "then": { "required": ["description"] }
       }
-    },
-    "entryPoints": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/packagePath" },
-      "uniqueItems": true
     },
     "publisherMetadata": {
       "type": "object",

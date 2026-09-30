@@ -36,6 +36,8 @@ try {
     <NoWarn>NU5128</NoWarn>
     <PackageGuidanceDocument>`$(MSBuildProjectDirectory)/overview.md</PackageGuidanceDocument>
     <PackageGuidancePath>guides/overview.md</PackageGuidancePath>
+    <PackageGuidanceUsage>required</PackageGuidanceUsage>
+    <PackageGuidanceDescription>Open for "Independent" APIs; it's C:\docs &amp; 100% of cases.</PackageGuidanceDescription>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Trellis.AgentDocs.Packaging" Version="$version" PrivateAssets="all" />
@@ -66,8 +68,9 @@ try {
         if ($metadata.schemaVersion -ne 1 -or @($metadata.documents).Count -ne 1 -or
             $metadata.documents[0].path -ne 'guides/overview.md' -or
             $metadata.documents[0].sha256 -ne $hash -or
-            @($metadata.entryPoints).Count -ne 1 -or
-            $metadata.entryPoints[0] -ne 'guides/overview.md') {
+            $metadata.documents[0].usage -ne 'required' -or
+            $metadata.documents[0].description -cne 'Open for "Independent" APIs; it''s C:\docs & 100% of cases.' -or
+            $null -ne $metadata.PSObject.Properties['entryPoints']) {
             throw 'Publisher manifest does not describe the packed guide.'
         }
         if (@($zip.Entries | Where-Object { $_.FullName -match '^(build|buildTransitive)/' }).Count -ne 0) {
@@ -88,6 +91,34 @@ try {
         $output = & dotnet pack $project --no-restore "-p:PackageGuidancePath=$invalid" -o $Feed --nologo -v:q 2>&1
         if ($LASTEXITCODE -eq 0 -or ($output | Out-String) -notmatch 'PackageGuidancePath must be a portable relative Markdown path') {
             throw "Unsafe path was not rejected: $invalid : $($output | Out-String)"
+        }
+    }
+    # Length is counted in Unicode scalar values after NFC, exactly as the reader counts it.
+    $validDescriptions = [ordered]@{
+        '200 emoji (400 UTF-16 units)' = ([char]::ConvertFromUtf32(0x1F600) * 200)
+        '101 decomposed letters (202 UTF-16 units, 101 after NFC)' = (('e' + [char]0x0301) * 101)
+        "an apostrophe like it's here" = "an apostrophe like it's here"
+    }
+    foreach ($name in $validDescriptions.Keys) {
+        $output = & dotnet pack $project --no-restore "-p:PackageGuidanceDescription=$($validDescriptions[$name])" -o $Feed --nologo -v:q 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Valid description was rejected: $name : $($output | Out-String)"
+        }
+    }
+    $invalidInputs = [ordered]@{
+        'PackageGuidanceUsage=supporting' = 'PackageGuidanceUsage must be required or onDemand'
+        'PackageGuidanceUsage=always' = 'PackageGuidanceUsage must be required or onDemand'
+        'PackageGuidanceDescription=' = 'Set PackageGuidanceDescription'
+        "PackageGuidanceDescription=$('x' * 201)" = 'at most 200 characters'
+        "PackageGuidanceDescription=zero$([char]0x200B)width" = 'at most 200 characters'
+        "PackageGuidanceDescription=line$([char]0x2028)break" = 'at most 200 characters'
+        "PackageGuidanceDescription=$([char]0x00A0)" = 'at most 200 characters'
+        "PackageGuidanceDescription=$([char]::ConvertFromUtf32(0x1F600) * 201)" = 'at most 200 characters'
+    }
+    foreach ($property in $invalidInputs.Keys) {
+        $output = & dotnet pack $project --no-restore "-p:$property" -o $Feed --nologo -v:q 2>&1
+        if ($LASTEXITCODE -eq 0 -or ($output | Out-String) -notmatch $invalidInputs[$property]) {
+            throw "Invalid guidance property was not rejected: $property : $($output | Out-String)"
         }
     }
     $output = & dotnet pack $project --no-restore "-p:PackageGuidanceDocument=$(Join-Path $publisher 'missing.md')" -o $Feed --nologo -v:q 2>&1
