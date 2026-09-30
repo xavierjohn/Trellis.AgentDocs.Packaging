@@ -75,10 +75,7 @@ public static class GuidanceValidator
 {
     private const string ManifestPath = "guidance/reference-manifest.json";
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
-    private static readonly System.Text.RegularExpressions.Regex HtmlAttribute = new(
-        @"\b(?:href|src)\s*=\s*(?:""(?<value>[^""]*)""|'(?<value>[^']*)')",
-        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled,
-        TimeSpan.FromSeconds(1));
+    private static readonly AngleSharp.Html.Parser.HtmlParser HtmlParser = new();
     private static readonly MarkdownPipeline Pipeline = new MarkdownPipelineBuilder()
         .UsePreciseSourceLocation()
         .UseYamlFrontMatter()
@@ -353,22 +350,35 @@ public static class GuidanceValidator
                 yield return (target, link.Line + 1);
         }
 
-        // Markdown allows raw HTML, and <img src> and <a href> are local links too. The targets are read from the
-        // parsed HTML nodes (inline tags, and the lines of HTML blocks), never from the whole document text.
+        // Markdown allows raw HTML, and <img src> and <a href> are local links too. Each HTML node Markdown found (an
+        // inline tag, or a whole HTML block) goes through a real HTML parser, so attribute boundaries, unquoted values,
+        // comments and script/style content are handled as a browser would, and data-href is not href.
         foreach (var html in document.Descendants<HtmlInline>())
             foreach (var target in HtmlTargets(html.Tag))
                 if (Filter(target) is { } found)
                     yield return (found, html.Line + 1);
         foreach (var block in document.Descendants<HtmlBlock>())
         {
-            for (var i = 0; i < block.Lines.Count; i++)
-                foreach (var target in HtmlTargets(block.Lines.Lines[i].Slice.ToString()))
-                    if (Filter(target) is { } found)
-                        yield return (found, block.Line + 1 + i);
+            var lines = Enumerable.Range(0, block.Lines.Count).Select(i => block.Lines.Lines[i].Slice.ToString()).ToArray();
+            foreach (var target in HtmlTargets(string.Join("\n", lines)))
+                if (Filter(target) is { } found)
+                {
+                    // The parser does not report positions: point at the first line that mentions the target.
+                    var index = Array.FindIndex(lines, l => l.Contains(target, StringComparison.Ordinal));
+                    yield return (found, block.Line + 1 + Math.Max(index, 0));
+                }
         }
 
-        static IEnumerable<string> HtmlTargets(string html) =>
-            HtmlAttribute.Matches(html).Select(m => m.Groups["value"].Value);
+        static IEnumerable<string> HtmlTargets(string html)
+        {
+            foreach (var element in HtmlParser.ParseDocument(html).All)
+            {
+                if (element.GetAttribute("href") is { Length: > 0 } href)
+                    yield return href;
+                if (element.GetAttribute("src") is { Length: > 0 } src)
+                    yield return src;
+            }
+        }
 
         static string? Filter(string? target)
         {
@@ -497,7 +507,17 @@ public static class GuidanceValidator
                 break;
             }
 
-            var logical = Unescape(entry.FullName).Replace('\\', '/');
+            // Extraction resolves '.', '..' and empty segments (Path.GetFullPath), so entries are tracked by the path
+            // they land on; an entry that climbs out of the package root is rejected outright.
+            var decoded = Unescape(entry.FullName).Replace('\\', '/');
+            var logical = Canonical(decoded);
+            if (logical is null)
+            {
+                problems.Add(new GuidanceDiagnostic("AD009", GuidanceSeverity.Error, decoded, null,
+                    "This entry's path escapes the package root or is empty, so it cannot be extracted safely."));
+                continue;
+            }
+
             if (!aliases.Add(logical))
                 continue;
             names.Add(logical);
@@ -533,6 +553,25 @@ public static class GuidanceValidator
             total += buffer.Length;
             return buffer.ToArray();
         });
+    }
+
+    /// <summary>Collapses empty, '.' and '..' segments; null when the path climbs out of the root or nothing is left.</summary>
+    private static string? Canonical(string path)
+    {
+        var parts = new List<string>();
+        foreach (var segment in path.Split('/'))
+        {
+            if (segment.Length == 0 || segment == ".")
+                continue;
+            if (segment != "..")
+                parts.Add(segment);
+            else if (parts.Count == 0)
+                return null;
+            else
+                parts.RemoveAt(parts.Count - 1);
+        }
+
+        return parts.Count == 0 ? null : string.Join('/', parts);
     }
 
     /// <summary>Tracks normalised, case-insensitive paths so entries that extract onto one another are reported once.</summary>

@@ -529,6 +529,39 @@ public sealed class GuidanceValidatorTests
     }
 
     [Fact]
+    public void Entries_whose_paths_resolve_onto_the_same_file_are_AD009_and_escapes_are_rejected()
+    {
+        var bytes = Encoding.UTF8.GetBytes("# S\n");
+        var manifest = new Package().DocBytes("guide/start.md", bytes, "required", "Read first.", pack: false);
+
+        foreach (var alias in new[] { "guide/x/../start.md", "guide/./start.md", "guide//start.md", "./guide/start.md" })
+            Nupkg([("guide/start.md", bytes), (alias, bytes)], manifest).Diagnostics
+                .Should().Contain(d => d.Code == "AD009", $"'{alias}' extracts onto guide/start.md");
+
+        Nupkg([("guide/start.md", bytes), ("../outside.md", bytes)], manifest).Diagnostics
+            .Should().Contain(d => d.Code == "AD009" && d.Message.Contains("escapes"));
+        Nupkg([("guide/start.md", bytes), ("guide/../../outside.md", bytes)], manifest).Diagnostics
+            .Should().Contain(d => d.Code == "AD009" && d.Message.Contains("escapes"));
+
+        // A lone non-canonical spelling lands where the manifest expects, so it is not an error by itself.
+        Nupkg([("guide/./start.md", bytes)], manifest).Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Html_links_are_read_with_an_html_parser_not_pattern_matching()
+    {
+        var package = new Package().Doc(Start,
+            "# S\n\n<img src=missing.png> <span data-href=\"not-a-link.md\" data-src='also-not.md'>x</span>\n\n" +
+            "<div>\n<script>var a = '<img src=\"in-script.md\">';</script>\n<!-- <a href=\"in-comment.md\">c</a> -->\n" +
+            "<a class=x href=unquoted.md>u</a>\n</div>\n",
+            "required", "Read first.");
+        var messages = package.Validate().Diagnostics.Where(d => d.Code == "AD102").Select(d => d.Message).ToArray();
+        messages.Should().HaveCount(2);
+        messages.Should().Contain(m => m.Contains("missing.png"));
+        messages.Should().Contain(m => m.Contains("unquoted.md"));
+    }
+
+    [Fact]
     public void Identical_descriptions_on_required_documents_are_not_a_routing_ambiguity()
     {
         var package = new Package()
