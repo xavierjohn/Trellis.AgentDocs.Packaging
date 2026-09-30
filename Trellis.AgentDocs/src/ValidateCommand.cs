@@ -8,7 +8,7 @@ using Trellis.Guidance.Reader;
 public static partial class AgentDocsCommand
 {
     private const string ValidateUsage =
-        "Usage: agentdocs validate <package.nupkg|directory> [--strict] [--max-required-bytes N] [--format text|json]";
+        "Usage: agentdocs validate <package.nupkg|directory> [--strict] [--max-required-bytes N] [--max-total-bytes N] [--max-indexed-documents N] [--format text|json]";
 
     /// <summary>
     /// Validates a package's guidance for its author. Read-only and independent of any repository: it needs no
@@ -29,6 +29,16 @@ public static partial class AgentDocsCommand
                     if (++i == args.Length || !long.TryParse(args[i], NumberStyles.None, CultureInfo.InvariantCulture, out var bytes))
                         throw new ArgumentException("--max-required-bytes requires a non-negative integer.");
                     options = options with { MaxRequiredBytes = bytes };
+                    break;
+                case "--max-total-bytes":
+                    if (++i == args.Length || !long.TryParse(args[i], NumberStyles.None, CultureInfo.InvariantCulture, out var total))
+                        throw new ArgumentException("--max-total-bytes requires a non-negative integer.");
+                    options = options with { MaxTotalGuidanceBytes = total };
+                    break;
+                case "--max-indexed-documents":
+                    if (++i == args.Length || !int.TryParse(args[i], NumberStyles.None, CultureInfo.InvariantCulture, out var indexed))
+                        throw new ArgumentException("--max-indexed-documents requires a non-negative integer.");
+                    options = options with { MaxIndexedDocuments = indexed };
                     break;
                 case "--format":
                     if (++i == args.Length || args[i] is not ("text" or "json"))

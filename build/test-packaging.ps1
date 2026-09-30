@@ -227,6 +227,43 @@ $Items
             throw "Consumer did not install $installed from the multi-document package."
         }
     }
+    # Three-way conformance: the raw nupkg, the directory NuGet extracted from it, and what the consumer's reader
+    # installed must agree on acceptance and on the bytes of every document.
+    $extracted = Join-Path $work 'consumer-packages\multi.good\1.0.0'
+    Push-Location $consumer
+    try {
+        $extractedValidation = & dotnet tool run agentdocs validate $extracted --strict 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Validator rejected NuGet's extracted copy: $($extractedValidation | Out-String)" }
+    }
+    finally { Pop-Location }
+    $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $Feed 'Multi.Good.1.0.0.nupkg'))
+    try {
+        foreach ($installed in 'start.md', 'cookbook.md', 'http.md') {
+            $entry = $zip.GetEntry("guide/$installed")
+            $stream = $entry.Open()
+            try {
+                $memory = [System.IO.MemoryStream]::new()
+                $stream.CopyTo($memory)
+                $packedBytes = $memory.ToArray()
+            }
+            finally { $stream.Dispose() }
+            # The tool installs canonical text (no BOM, LF), so compare canonical content, not raw bytes.
+            function Get-CanonicalHash([byte[]] $bytes) {
+                $text = [System.Text.UTF8Encoding]::new($false).GetString($bytes).TrimStart([char] 0xFEFF).Replace("`r`n", "`n")
+                [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($text)))
+            }
+            $packed = Get-CanonicalHash $packedBytes
+            $onDisk = Get-CanonicalHash ([System.IO.File]::ReadAllBytes((Join-Path $extracted "guide\$installed")))
+            $delivered = Get-CanonicalHash ([System.IO.File]::ReadAllBytes((Join-Path $consumer ".agentdocs\packages\multi.good\guide\$installed")))
+            if ($packedBytes.Length -ne [System.IO.File]::ReadAllBytes((Join-Path $extracted "guide\$installed")).Length) {
+                throw "NuGet's extracted guide/$installed differs in size from the nupkg entry."
+            }
+            if ($packed -ne $onDisk -or $packed -ne $delivered) {
+                throw "Bytes of guide/$installed differ between the nupkg, NuGet's extraction and the installed copy."
+            }
+        }
+    }
+    finally { $zip.Dispose() }
     $index = Get-Content -LiteralPath (Join-Path $consumer '.agentdocs\README.md') -Raw
     if ($index -notmatch 'guide/start\.md' -or $index -notmatch 'guide/cookbook\.md' -or $index -match 'guide/http\.md') {
         throw 'Consumer index must list the required and on-demand documents, and not the supporting one.'

@@ -129,15 +129,24 @@ missing.
 | `agentdocs validate <package.nupkg\|directory>` | For authors: check a package's guidance before publishing. Read-only; needs no repository, restore or policy. |
 
 `validate` is the publisher-side check, so a mistake is caught before a consumer
-meets it. It reports errors for contract violations (`AD001`-`AD008`: manifest
+meets it. It reports errors for contract violations (`AD001`-`AD010`: manifest
 shape, unsafe or missing paths, hash mismatches, usage, descriptions, at least
-one required or on-demand document, duplicate or aliased paths, non-UTF-8 documents) and warnings for guidance that
-is valid but hard to use (`AD101`-`AD104`, `AD105`: an oversized required set,
-broken relative links, supporting documents nothing links to, malformed front
-matter, Markdown files beside the guidance that the manifest does not list).
+one required or on-demand document, duplicate or aliased paths, non-UTF-8
+documents, archive entries that decode to the same path, files over the
+validator's resource limits) and warnings for guidance that is valid but hard to
+use (`AD101`-`AD108`): an oversized required set, links that will not resolve
+once installed (missing files, headings that do not exist, root-relative paths,
+and targets that are not installed Markdown such as images or code samples),
+supporting documents that no required or on-demand document reaches, a front
+matter block that is not valid YAML, Markdown files beside the guidance that the
+manifest does not list, total guidance size, the number of index entries, and
+two indexed documents with the identical description. Documents are read with a
+Markdown parser (GitHub heading anchors) and a YAML parser, and only the
+manifest and Markdown files are read from a package, each within a size limit.
 It exits 1 on errors, and on warnings with `--strict`. Use
-`--max-required-bytes N` to change the required-size threshold (default 32768)
-and `--format json` for machine-readable output on standard output.
+`--max-required-bytes N`, `--max-total-bytes N` and `--max-indexed-documents N`
+to change the budgets (defaults 32768, 4 MiB and 100) and `--format json` for
+machine-readable output on standard output.
 
 `init` accepts `--restore` if the selected project has not yet been restored,
 `--source-root DIR` for additional source directories, and `--dry-run` to

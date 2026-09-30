@@ -215,10 +215,10 @@ public sealed class GuidanceValidatorTests
     }
 
     [Fact]
-    public void Links_that_are_not_relative_documents_are_ignored()
+    public void External_links_are_ignored()
     {
         var package = new Package().Doc(Start,
-            "# S\n\n[web](https://example.com/a.md) [mail](mailto:a@b.c) [proto](//cdn/x.md) [img](pic.png) [code](x.cs)\n",
+            "# S\n\n[web](https://example.com/a.md) [mail](mailto:a@b.c) [proto](//cdn/x.md) [tel](tel:+15550100)\n",
             "required", "Read first.");
         package.Validate().Diagnostics.Should().BeEmpty();
     }
@@ -439,16 +439,82 @@ public sealed class GuidanceValidatorTests
     }
 
     [Fact]
-    public void When_two_zip_entries_decode_to_the_same_path_the_first_one_is_what_consumers_receive()
+    public void Two_zip_entries_that_decode_to_the_same_path_are_an_error_rather_than_a_silent_choice()
     {
         var first = Encoding.UTF8.GetBytes("# First\n");
         var second = Encoding.UTF8.GetBytes("# Second\n");
-        var entries = new[] { ("guide/start%2Emd", first), ("guide/start.md", second) };
 
-        Nupkg(entries, new Package().DocBytes("guide/start.md", first, "required", "Read first.", pack: false))
-            .Diagnostics.Should().BeEmpty();
-        Nupkg(entries, new Package().DocBytes("guide/start.md", second, "required", "Read first.", pack: false))
-            .Diagnostics.Should().ContainSingle(d => d.Code == "AD003");
+        var encoded = new[] { ("guide/start%2Emd", first), ("guide/start.md", second) };
+        Nupkg(encoded, new Package().DocBytes("guide/start.md", first, "required", "Read first.", pack: false))
+            .Diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "guide/start.md");
+
+        var exact = new[] { ("guide/a.md", first), ("guide/a.md", second) };
+        Nupkg(exact, new Package().DocBytes("guide/a.md", first, "required", "Read first.", pack: false))
+            .Diagnostics.Should().Contain(d => d.Code == "AD009");
+
+        var slash = new[] { ("guide%2Fb.md", first), ("guide/b.md", second) };
+        Nupkg(slash, new Package().DocBytes("guide/b.md", first, "required", "Read first.", pack: false))
+            .Diagnostics.Should().Contain(d => d.Code == "AD009");
+    }
+
+    [Fact]
+    public void Links_to_files_that_are_not_installed_markdown_warn_AD102()
+    {
+        var package = new Package().Doc(Start,
+            "# S\n\n![diagram](img/flow.png) [sample](../src/Example.cs) [root](/guide/http.md) [ok](http.md)\n",
+            "required", "Read first.")
+            .Doc(Http, "# H\n", "supporting");
+        var messages = package.Validate().Diagnostics.Where(d => d.Code == "AD102").Select(d => d.Message).ToArray();
+        messages.Should().HaveCount(3);
+        messages.Should().Contain(m => m.Contains("flow.png") && m.Contains("not a Markdown document"));
+        messages.Should().Contain(m => m.Contains("Example.cs"));
+        messages.Should().Contain(m => m.Contains("root-relative"));
+    }
+
+    [Fact]
+    public void Large_unrelated_entries_are_never_read_and_oversized_guidance_is_AD010()
+    {
+        var package = new Package().Doc(Start, "# S\n", "required", "Read first.");
+        package.Files["guidance/reference-manifest.json"] = package.Manifest();
+        var nupkg = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".nupkg");
+        try
+        {
+            using (var archive = ZipFile.Open(nupkg, ZipArchiveMode.Create))
+            {
+                foreach (var (name, content) in package.Files)
+                {
+                    using var entry = archive.CreateEntry(name).Open();
+                    entry.Write(content);
+                }
+
+                using (var native = archive.CreateEntry("runtimes/native.dll", CompressionLevel.NoCompression).Open())
+                    native.Write(new byte[20 * 1024 * 1024]);
+                using (var huge = archive.CreateEntry("guide/huge.md").Open())
+                    huge.Write(new byte[9 * 1024 * 1024]);
+            }
+
+            var diagnostics = GuidanceValidator.ValidatePackage(nupkg).Diagnostics;
+            diagnostics.Should().Contain(d => d.Code == "AD010" && d.Path == "guide/huge.md");
+            diagnostics.Should().NotContain(d => d.Path == "runtimes/native.dll");
+        }
+        finally
+        {
+            File.Delete(nupkg);
+        }
+    }
+
+    [Fact]
+    public void The_total_size_index_size_and_duplicate_description_budgets_warn()
+    {
+        var package = new Package()
+            .Doc(Start, "# S\n", "required", "Read first.")
+            .Doc("guide/a.md", "# A\n" + new string('x', 3000), "onDemand", "Open when using A.")
+            .Doc("guide/b.md", "# B\n", "onDemand", "Open when using A.");
+        var diagnostics = package.Validate(new GuidanceValidationOptions { MaxTotalGuidanceBytes = 1000, MaxIndexedDocuments = 2 }).Diagnostics;
+        diagnostics.Should().Contain(d => d.Code == "AD106");
+        diagnostics.Should().Contain(d => d.Code == "AD107");
+        diagnostics.Should().ContainSingle(d => d.Code == "AD108").Which.Message.Should().Contain("guide/a.md").And.Contain("guide/b.md");
+        package.Validate().Diagnostics.Where(d => d.Code is "AD106" or "AD107").Should().BeEmpty("the defaults are generous");
     }
 
     [Fact]
