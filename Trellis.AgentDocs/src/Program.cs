@@ -575,11 +575,11 @@ public static partial class AgentDocsCommand
                             framework = f.Name,
                             dependencies = f.Value.TryGetProperty("dependencies", out var dependencies)
                                 ? dependencies.EnumerateObject().OrderBy(d => d.Name, StringComparer.Ordinal)
-                                    .Select(d => new { id = d.Name, value = d.Value.GetRawText() }).ToArray()
+                                    .Select(d => new { id = d.Name, value = CanonicalJson(d.Value) }).ToArray()
                                 : [],
                             centralVersions = f.Value.TryGetProperty("centralPackageVersions", out var central)
                                 ? central.EnumerateObject().OrderBy(d => d.Name, StringComparer.Ordinal)
-                                    .Select(d => new { id = d.Name, value = d.Value.GetRawText() }).ToArray()
+                                    .Select(d => new { id = d.Name, value = CanonicalJson(d.Value) }).ToArray()
                                 : []
                         }).ToArray();
                 var projectRoot = GitRoot(Path.GetDirectoryName(entry)!);
@@ -616,6 +616,14 @@ public static partial class AgentDocsCommand
     }
 
     private static string? RestoreSourceText(string root, string file) => Canonical(File.ReadAllBytes(file));
+
+    /// <summary>
+    /// Compact, whitespace-free JSON text for one value from <c>project.assets.json</c>. NuGet writes that file with the
+    /// platform's line endings, so an element's raw text differs between Windows and Linux for the same restore; hashing
+    /// raw text made the recorded graph disagree across operating systems and made <c>check</c> fail in CI on a graph
+    /// recorded on a developer machine.
+    /// </summary>
+    internal static string CanonicalJson(JsonElement element) => JsonSerializer.Serialize(element);
 
     private static JsonDocument Evaluate(string project, string? framework = null)
     {
