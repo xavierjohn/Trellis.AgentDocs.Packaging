@@ -1325,6 +1325,71 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
+    public void Content_only_check_passes_when_only_the_recorded_graph_drifted()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("Directory.Build.props", "<Project><PropertyGroup><MyRestoreChoice>One</MyRestoreChoice></PropertyGroup></Project>");
+        fixture.Run("init", "App.csproj").Should().Be(0);
+        var before = File.ReadAllBytes(fixture.Path(".agentdocs", "agent-context.json"));
+        fixture.Write("Directory.Build.props", "<Project><PropertyGroup><MyRestoreChoice>Two</MyRestoreChoice></PropertyGroup></Project>");
+
+        // The restore inputs changed, but nothing that is installed would, so only the strict check objects.
+        fixture.Run("check").Should().NotBe(0);
+        fixture.Run("check", "--content-only").Should().Be(0, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("Installed guidance is current").And.NotContain("Update manifest");
+        File.ReadAllBytes(fixture.Path(".agentdocs", "agent-context.json")).Should().Equal(before, "check never writes");
+    }
+
+    [Fact]
+    public void Content_only_check_still_fails_when_installed_guidance_is_modified_or_missing()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0);
+        fixture.Run("check", "--content-only").Should().Be(0, fixture.LastOutput);
+
+        var doc = fixture.Path(".agentdocs", "packages", "example.library", "guides", "overview.md");
+        File.WriteAllText(doc, "changed");
+        fixture.Run("check", "--content-only").Should().NotBe(0);
+
+        File.Delete(doc);
+        fixture.Run("check", "--content-only").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("overview.md");
+    }
+
+    [Fact]
+    public void Content_only_check_fails_when_a_sync_would_change_the_index_or_the_installed_guides()
+    {
+        // Unlike a tampered or deleted file, these are planned changes: the restored package now supplies different
+        // guidance than what is installed, so a sync would rewrite the index or add and remove guides.
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0);
+        fixture.Run("check", "--content-only").Should().Be(0, fixture.LastOutput);
+
+        fixture.OverviewDescription = "A different routing description.";
+        fixture.Run("check", "--content-only").Should().Be(1, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("Update: .agentdocs/README.md")
+            .And.Contain("Installed guidance differs from the restored graph")
+            .And.NotContain("Installed guidance is current");
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        fixture.Run("check", "--content-only").Should().Be(0, fixture.LastOutput);
+
+        fixture.ShortGuideOnly = true;
+        fixture.Run("check", "--content-only").Should().Be(1, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("Installed guidance differs from the restored graph");
+    }
+
+    [Theory]
+    [InlineData("sync")]
+    [InlineData("remove")]
+    public void Content_only_is_accepted_only_by_check(string verb)
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0);
+        fixture.Run(verb, "--content-only").Should().NotBe(0);
+        fixture.LastOutput.Should().Contain("Unknown option '--content-only'");
+    }
+
+    [Fact]
     public void Init_requires_complete_restore_framework_snapshot()
     {
         using var fixture = new Fixture();

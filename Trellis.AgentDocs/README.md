@@ -106,6 +106,14 @@ The index tells agents to do the same. In CI, `dotnet restore` followed by
 longer matches the restored packages or when a hand-written instruction links to
 a missing file.
 
+The recorded graph tracks every restore input, so even a bump of a package that
+publishes no guidance changes it and plain `check` fails until someone runs
+`sync`. To fail CI only when the installed guidance, index or pointers would
+actually change, use `dotnet tool run agentdocs check --strict --content-only`:
+a graph that differs only in restore inputs that do not affect what is
+installed passes, with a note suggesting `sync` to refresh the record. A
+modified, missing or outdated installed guide still fails.
+
 If an approved package no longer supplies a guide, or you withdraw its approval,
 `sync` removes its previously owned guides and prints a notice. A malformed
 manifest, bad hash, mixed versions of one approved package, stale selected graph,
@@ -124,7 +132,7 @@ missing.
 |---|---|
 | `agentdocs init <solution-or-project>...` | Opt in, create an empty policy if none exists, and install guides for approved packages. |
 | `agentdocs sync` | Update installed guides and the index from the recorded graph and the policy. |
-| `agentdocs check` | Check graph and installed context without writing; useful in CI. |
+| `agentdocs check` | Check graph and installed context without writing; useful in CI. `--content-only` ignores drift that does not change the installed guidance. |
 | `agentdocs remove` | Remove owned guides, pointers, and context state without touching customer text or the policy. |
 | `agentdocs validate <package.nupkg\|directory>` | For authors: check a package's guidance before publishing. Read-only; needs no repository, restore or policy. |
 

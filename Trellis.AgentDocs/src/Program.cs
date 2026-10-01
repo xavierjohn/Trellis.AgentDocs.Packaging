@@ -20,12 +20,12 @@ public static class Program
 internal enum AgentDocsVerb { Init, Sync, Check, Remove }
 
 internal sealed record AgentDocsRequest(AgentDocsVerb Verb, bool DryRun, bool Force, bool Restore, bool Strict,
-    IReadOnlyList<string> SourceRoots, IReadOnlyList<string> EntryPoints);
+    IReadOnlyList<string> SourceRoots, IReadOnlyList<string> EntryPoints, bool ContentOnly = false);
 
 /// <summary>Declares which options and entry points a verb accepts, so an invalid combination for a
 /// given verb is rejected by construction rather than by a hand-maintained combinatorial check.</summary>
 internal readonly record struct VerbOptions(bool SourceRoot, bool DryRun, bool Force, bool Restore, bool Strict,
-    bool EntryPoints, bool RequireEntryPoints);
+    bool EntryPoints, bool RequireEntryPoints, bool ContentOnly = false);
 
 internal sealed record Source(string Package, string PackageVersion, string PackagePath, string Sha256);
 internal sealed record OwnedFile(string Path, string CanonicalSha256, Source[] Sources);
@@ -91,7 +91,7 @@ public static partial class AgentDocsCommand
 
         if (args.Length < 1 || !TryParseVerb(args[0], out var verb))
         {
-            output.WriteLine("Usage: agentdocs init|sync|check|remove [--source-root DIR] [--dry-run] [--force] [--restore] [--strict] [PROJECT|SOLUTION]");
+            output.WriteLine("Usage: agentdocs init|sync|check|remove [--source-root DIR] [--dry-run] [--force] [--restore] [--strict] [--content-only] [PROJECT|SOLUTION]");
             output.WriteLine(ValidateUsage);
             output.WriteLine("Avoid external edits to affected files during mutation; an edit after the final snapshot check may be lost.");
             return 2;
@@ -123,7 +123,7 @@ public static partial class AgentDocsCommand
         AgentDocsVerb.Remove => new VerbOptions(SourceRoot: false, DryRun: true, Force: true, Restore: false, Strict: false,
             EntryPoints: false, RequireEntryPoints: false),
         AgentDocsVerb.Check => new VerbOptions(SourceRoot: false, DryRun: false,
-            Force: false, Restore: false, Strict: true, EntryPoints: false, RequireEntryPoints: false),
+            Force: false, Restore: false, Strict: true, EntryPoints: false, RequireEntryPoints: false, ContentOnly: true),
         _ => throw new ArgumentOutOfRangeException(nameof(verb))
     };
 
@@ -134,6 +134,7 @@ public static partial class AgentDocsCommand
         var force = false;
         var restore = false;
         var strict = false;
+        var contentOnly = false;
         var sourceRoots = new List<string>();
         var entryPoints = new List<string>();
         for (var i = 1; i < args.Length; i++)
@@ -148,6 +149,7 @@ public static partial class AgentDocsCommand
                 case "--force" when allowed.Force: force = true; break;
                 case "--restore" when allowed.Restore: restore = true; break;
                 case "--strict" when allowed.Strict: strict = true; break;
+                case "--content-only" when allowed.ContentOnly: contentOnly = true; break;
                 default:
                     if (args[i].StartsWith('-'))
                         throw new ArgumentException($"Unknown option '{args[i]}' for '{args[0]}'.");
@@ -163,7 +165,7 @@ public static partial class AgentDocsCommand
         if (allowed.RequireEntryPoints && entryPoints.Count == 0)
             throw new ArgumentException($"{args[0]} requires an explicit project or solution.");
 
-        return new AgentDocsRequest(verb, dryRun, force, restore, strict, sourceRoots, entryPoints);
+        return new AgentDocsRequest(verb, dryRun, force, restore, strict, sourceRoots, entryPoints, contentOnly);
     }
 
     private static int Execute(AgentDocsRequest request, TextWriter output, Func<IEnumerable<string>, Func<string, bool>, GuidanceDiscovery> discover)
@@ -222,6 +224,24 @@ public static partial class AgentDocsCommand
                 return 1;
             }
         }
+        if (request.Verb == AgentDocsVerb.Check && request.ContentOnly)
+        {
+            // The recorded graph also tracks restore inputs that never reach what is installed (an unrelated package bump
+            // changes it), so with --content-only only a change to the installed guidance, index or pointers fails.
+            var content = changes.Where(change => !Physical.Equals(change.Path, manifestPath)).ToList();
+            foreach (var change in content)
+                output.WriteLine($"{change.Description}: {Rel(root, change.Path)}");
+            if (content.Count != 0)
+            {
+                output.WriteLine("Installed guidance differs from the restored graph; run agentdocs sync.");
+                return 1;
+            }
+
+            if (changes.Count != 0)
+                output.WriteLine("Installed guidance is current. Only the recorded context file differs from what sync would write; run agentdocs sync to refresh it.");
+            return 0;
+        }
+
         foreach (var change in changes)
             output.WriteLine($"{(request.DryRun ? "Would " : "")}{change.Description}: {Rel(root, change.Path)}");
         if (request.Verb == AgentDocsVerb.Check)
