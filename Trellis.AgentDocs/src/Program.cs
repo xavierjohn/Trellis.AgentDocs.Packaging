@@ -12,7 +12,9 @@ using Trellis.Guidance.Reader;
 public static class Program
 {
     /// <summary>Runs the agent-context command.</summary>
-    public static int Main(string[] args) => AgentDocsCommand.Run(args, Console.Error, GuidanceReader.Discover);
+    public static int Main(string[] args) => AgentDocsCommand.Run(args,
+        // validate prints its report (and JSON) to standard output so it can be piped; lifecycle commands log to standard error.
+        args.Length > 0 && args[0] == "validate" ? Console.Out : Console.Error, GuidanceReader.Discover);
 }
 
 internal enum AgentDocsVerb { Init, Sync, Check, Remove }
@@ -84,9 +86,13 @@ public static partial class AgentDocsCommand
 
     private static int Execute(string[] args, TextWriter output, Func<IEnumerable<string>, Func<string, bool>, GuidanceDiscovery> discover)
     {
+        if (args.Length >= 1 && args[0] == "validate")
+            return Validate(args[1..], output);
+
         if (args.Length < 1 || !TryParseVerb(args[0], out var verb))
         {
             output.WriteLine("Usage: agentdocs init|sync|check|remove [--source-root DIR] [--dry-run] [--force] [--restore] [--strict] [PROJECT|SOLUTION]");
+            output.WriteLine(ValidateUsage);
             output.WriteLine("Avoid external edits to affected files during mutation; an edit after the final snapshot check may be lost.");
             return 2;
         }

@@ -126,6 +126,170 @@ try {
         throw "Missing guide was not rejected: $($output | Out-String)"
     }
     Write-Host 'PASS independent publisher, package contents, and invalid inputs.'
+
+    # Multi-document publisher: PackageGuidanceItem items with mixed usage, checked by the shipped validator.
+    $multi = Join-Path $work 'multi'
+    New-Item -ItemType Directory -Path $multi | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $multi 'start.md'), "# Start`n`nSee [http](http.md#calling-x).`n")
+    [System.IO.File]::WriteAllText((Join-Path $multi 'http.md'), "# Http`n`n## Calling X`n")
+    [System.IO.File]::WriteAllText((Join-Path $multi 'cookbook.md'), "# Cookbook`n")
+    $validItems = @'
+    <PackageGuidanceItem Include="start.md" PackagePath="guide/start.md" Usage="required"
+                         Description="Read before using X; it's &amp; 100% needed." />
+    <PackageGuidanceItem Include="cookbook.md" PackagePath="guide/cookbook.md"
+                         Description="Open when writing recipes." />
+    <PackageGuidanceItem Include="http.md" PackagePath="guide/http.md" Usage="supporting" />
+'@
+    function New-MultiProject([string] $Name, [string] $Items, [string] $Extra = '') {
+        $dir = Join-Path $multi $Name
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        foreach ($file in 'start.md', 'cookbook.md', 'http.md') { Copy-Item (Join-Path $multi $file) $dir }
+        [System.IO.File]::WriteAllText((Join-Path $dir "$Name.csproj"), @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <PackageId>Multi.$Name</PackageId>
+    <Version>1.0.0</Version>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <NoWarn>NU5128</NoWarn>
+    $Extra
+  </PropertyGroup>
+  <ItemGroup>
+$Items
+    <PackageReference Include="Trellis.AgentDocs.Packaging" Version="$version" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
+"@)
+        & dotnet restore (Join-Path $dir "$Name.csproj") --source $Feed "-p:RestorePackagesPath=$packages" --nologo -v:q | Out-Null
+        return (Join-Path $dir "$Name.csproj")
+    }
+
+    $good = New-MultiProject 'Good' $validItems
+    & dotnet pack $good --no-restore -o $Feed --nologo -v:q
+    if ($LASTEXITCODE -ne 0) { throw 'Multi-document publisher pack failed.' }
+    $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $Feed 'Multi.Good.1.0.0.nupkg'))
+    try {
+        $reader = [System.IO.StreamReader]::new($zip.GetEntry('guidance/reference-manifest.json').Open())
+        try { $metadata = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+        $docs = @($metadata.documents)
+        if ($docs.Count -ne 3 -or
+            @($docs.path) -join ',' -ne 'guide/start.md,guide/cookbook.md,guide/http.md' -or
+            @($docs.usage) -join ',' -ne 'required,onDemand,supporting' -or
+            $docs[0].description -cne 'Read before using X; it''s & 100% needed.' -or
+            $docs[2].PSObject.Properties['description'] -or
+            $null -ne $metadata.PSObject.Properties['entryPoints']) {
+            throw "Multi-document manifest is wrong: $($docs | ConvertTo-Json -Compress)"
+        }
+        foreach ($doc in $docs) {
+            if (-not $zip.GetEntry($doc.path)) { throw "Multi-document package is missing $($doc.path)" }
+        }
+    }
+    finally { $zip.Dispose() }
+    # Round trip: whatever the helper packs must pass the validator that consumers' authors run.
+    $validation = & dotnet run --project (Join-Path $root 'Trellis.AgentDocs\src\Trellis.AgentDocs.csproj') -c Release `
+        -- validate (Join-Path $Feed 'Multi.Good.1.0.0.nupkg') --strict 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "agentdocs validate rejected the helper's output: $($validation | Out-String)" }
+
+    # Conformance: a consumer's own tool must accept and install what the helper produced, not only the validator.
+    $consumer = Join-Path $work 'consumer'
+    New-Item -ItemType Directory -Path $consumer | Out-Null
+    & git init -q $consumer
+    [System.IO.File]::WriteAllText((Join-Path $consumer 'Consumer.csproj'), @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <ItemGroup><PackageReference Include="Multi.Good" Version="1.0.0" /></ItemGroup>
+</Project>
+"@)
+    [System.IO.File]::WriteAllText((Join-Path $consumer 'NuGet.Config'),
+        "<configuration><packageSources><clear/><add key=`"feed`" value=`"$Feed`"/></packageSources></configuration>")
+    & dotnet restore (Join-Path $consumer 'Consumer.csproj') "-p:RestorePackagesPath=$(Join-Path $work 'consumer-packages')" --nologo -v:q
+    if ($LASTEXITCODE -ne 0) { throw 'Consumer restore of the multi-document package failed.' }
+    # The tool insists on being pinned at the consumer's Git root, so install the freshly packed one as a consumer would.
+    $toolProject = Join-Path $root 'Trellis.AgentDocs\src\Trellis.AgentDocs.csproj'
+    & dotnet pack $toolProject -c Release -o $Feed --nologo -v:q
+    if ($LASTEXITCODE -ne 0) { throw 'Tool pack failed.' }
+    $toolVersion = Get-NuGetPackageVersion $toolProject
+    Push-Location $consumer
+    try {
+        & dotnet new tool-manifest --output .config | Out-Null
+        & dotnet tool install Trellis.AgentDocs --version $toolVersion --add-source $Feed --tool-manifest .config/dotnet-tools.json | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Installing the packed tool failed.' }
+        $init = & dotnet tool run agentdocs init Consumer.csproj 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Consumer init failed for the multi-document package: $($init | Out-String)" }
+        [System.IO.File]::WriteAllText((Join-Path $consumer '.agentdocs\policy.json'),
+            '{ "schemaVersion": 1, "approvedPackages": ["Multi.Good"] }')
+        $sync = & dotnet tool run agentdocs sync 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Consumer sync rejected the helper's output: $($sync | Out-String)" }
+    }
+    finally { Pop-Location }
+    foreach ($installed in 'start.md', 'cookbook.md', 'http.md') {
+        if (-not (Test-Path (Join-Path $consumer ".agentdocs\packages\multi.good\guide\$installed"))) {
+            throw "Consumer did not install $installed from the multi-document package."
+        }
+    }
+    # Three-way conformance: the raw nupkg, the directory NuGet extracted from it, and what the consumer's reader
+    # installed must agree on acceptance and on the bytes of every document.
+    $extracted = Join-Path $work 'consumer-packages\multi.good\1.0.0'
+    Push-Location $consumer
+    try {
+        $extractedValidation = & dotnet tool run agentdocs validate $extracted --strict 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Validator rejected NuGet's extracted copy: $($extractedValidation | Out-String)" }
+    }
+    finally { Pop-Location }
+    $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $Feed 'Multi.Good.1.0.0.nupkg'))
+    try {
+        foreach ($installed in 'start.md', 'cookbook.md', 'http.md') {
+            $entry = $zip.GetEntry("guide/$installed")
+            $stream = $entry.Open()
+            try {
+                $memory = [System.IO.MemoryStream]::new()
+                $stream.CopyTo($memory)
+                $packedBytes = $memory.ToArray()
+            }
+            finally { $stream.Dispose() }
+            # The tool installs canonical text (no BOM, LF), so compare canonical content, not raw bytes.
+            function Get-CanonicalHash([byte[]] $bytes) {
+                $text = [System.Text.UTF8Encoding]::new($false).GetString($bytes).TrimStart([char] 0xFEFF).Replace("`r`n", "`n")
+                [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($text)))
+            }
+            $packed = Get-CanonicalHash $packedBytes
+            $onDisk = Get-CanonicalHash ([System.IO.File]::ReadAllBytes((Join-Path $extracted "guide\$installed")))
+            $delivered = Get-CanonicalHash ([System.IO.File]::ReadAllBytes((Join-Path $consumer ".agentdocs\packages\multi.good\guide\$installed")))
+            if ($packedBytes.Length -ne [System.IO.File]::ReadAllBytes((Join-Path $extracted "guide\$installed")).Length) {
+                throw "NuGet's extracted guide/$installed differs in size from the nupkg entry."
+            }
+            if ($packed -ne $onDisk -or $packed -ne $delivered) {
+                throw "Bytes of guide/$installed differ between the nupkg, NuGet's extraction and the installed copy."
+            }
+        }
+    }
+    finally { $zip.Dispose() }
+    $index = Get-Content -LiteralPath (Join-Path $consumer '.agentdocs\README.md') -Raw
+    if ($index -notmatch 'guide/start\.md' -or $index -notmatch 'guide/cookbook\.md' -or $index -match 'guide/http\.md') {
+        throw 'Consumer index must list the required and on-demand documents, and not the supporting one.'
+    }
+
+    $multiInvalid = [ordered]@{
+        'DirAlias' = @{ Items = '<PackageGuidanceItem Include="start.md" PackagePath="Docs/one.md" Usage="required" Description="x" /><PackageGuidanceItem Include="http.md" PackagePath="docs/two.md" Description="y" />'; Match = 'portable aliases' }
+        'DocAsDirectory' = @{ Items = '<PackageGuidanceItem Include="start.md" PackagePath="guide.md" Usage="required" Description="x" /><PackageGuidanceItem Include="http.md" PackagePath="guide.md/inner.md" Description="y" />'; Match = 'also used as a directory' }
+        'Duplicate' = @{ Items = ($validItems + '<PackageGuidanceItem Include="http.md" PackagePath="guide/start.md" Usage="supporting" />'); Match = 'listed more than once' }
+        'NoDescription' = @{ Items = '<PackageGuidanceItem Include="start.md" PackagePath="guide/start.md" Usage="required" />'; Match = 'not blank' }
+        'OnlySupporting' = @{ Items = '<PackageGuidanceItem Include="http.md" PackagePath="guide/http.md" Usage="supporting" />'; Match = 'at least one required or onDemand' }
+        'BadUsage' = @{ Items = '<PackageGuidanceItem Include="http.md" PackagePath="guide/http.md" Usage="always" Description="x" />'; Match = 'Usage must be required, onDemand or supporting' }
+        'BadPath' = @{ Items = '<PackageGuidanceItem Include="http.md" PackagePath="../http.md" Description="x" />'; Match = 'portable relative Markdown path' }
+        'Missing' = @{ Items = '<PackageGuidanceItem Include="nope.md" PackagePath="guide/nope.md" Description="x" />'; Match = 'missing guidance document' }
+        'LongSupportingDescription' = @{ Items = ($validItems + '<PackageGuidanceItem Include="http.md" PackagePath="guide/other.md" Usage="supporting" Description="' + ('x' * 201) + '" />'); Match = 'at most 200 characters' }
+        'BothForms' = @{ Items = $validItems; Extra = '<PackageGuidancePath>guide/x.md</PackageGuidancePath>'; Match = 'not both' }
+    }
+    foreach ($case in $multiInvalid.Keys) {
+        $extra = if ($multiInvalid[$case].ContainsKey('Extra')) { $multiInvalid[$case].Extra } else { '' }
+        $bad = New-MultiProject "Bad$case" $multiInvalid[$case].Items $extra
+        $output = & dotnet pack $bad --no-restore -o $Feed --nologo -v:q 2>&1
+        if ($LASTEXITCODE -eq 0 -or ($output | Out-String) -notmatch $multiInvalid[$case].Match) {
+            throw "Invalid multi-document input was not rejected: $case : $($output | Out-String)"
+        }
+    }
+    Write-Host 'PASS multi-document publisher, validator round trip, and invalid inputs.'
 }
 finally {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
