@@ -1,7 +1,5 @@
 ﻿namespace Trellis.Guidance.Reader;
 
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 
 /// <summary>The result of inspecting one resolved NuGet package in one project/target scope.</summary>
@@ -68,23 +66,12 @@ public sealed record GuidanceDiscovery(IReadOnlyList<GuidancePackage> Packages, 
 /// <summary>Reads only already-restored NuGet assets and verified package payloads; does not run MSBuild or write files.</summary>
 public static class GuidanceReader
 {
-    private const string ManifestPath = "guidance/reference-manifest.json";
-    private static readonly StringComparer PortableComparer = StringComparer.OrdinalIgnoreCase;
-    private static readonly HashSet<string> ReservedNames = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
-    };
-
-    private const int MaxDescriptionScalars = 200;
-
     /// <summary>Discovers every resolved package in each target of the selected assets files, without restore or repository writes.</summary>
     public static GuidanceDiscovery Discover(IEnumerable<string> assetsPaths) => Discover(assetsPaths, _ => true);
 
     /// <summary>
     /// Discovers every resolved package, reading a package's manifest only when <paramref name="shouldLoad"/>
-    /// accepts its package ID. Other packages are reported as <see cref="GuidanceStatus.NotLoaded"/>; their
-    /// manifests and documents are never parsed, hashed, or validated.
+    /// accepts its package ID. Other packages are reported as <see cref="GuidanceStatus.NotLoaded"/>.
     /// </summary>
     public static GuidanceDiscovery Discover(IEnumerable<string> assetsPaths, Func<string, bool> shouldLoad)
     {
@@ -98,10 +85,10 @@ public static class GuidanceReader
             selected = true;
             try
             {
-                var assetBytes = File.ReadAllBytes(assetsPath);
-                using var assets = JsonDocument.Parse(assetBytes.AsMemory(
-                    assetBytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? 3 : 0));
-                ReadAssets(Path.GetFullPath(assetsPath), assets.RootElement, packages, diagnostics, shouldLoad);
+                var bytes = File.ReadAllBytes(assetsPath);
+                using var assets = JsonDocument.Parse(bytes.AsMemory(
+                    bytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? 3 : 0));
+                NuGetAssetsReader.Read(Path.GetFullPath(assetsPath), assets.RootElement, packages, diagnostics, shouldLoad);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
             {
@@ -111,266 +98,6 @@ public static class GuidanceReader
 
         if (!selected)
             diagnostics.Add("No restored NuGet assets files were selected.");
-
         return new GuidanceDiscovery(packages, diagnostics);
-    }
-
-    private static void ReadAssets(string assetsPath, JsonElement root, List<GuidancePackage> packages, List<string> diagnostics,
-        Func<string, bool> shouldLoad)
-    {
-        if (!Object(root) || !TryObject(root, "targets", out var targets) ||
-            !TryObject(root, "libraries", out var libraries) ||
-            !TryObject(root, "packageFolders", out var folders) ||
-            !TryObject(root, "project", out var project) ||
-            !TryObject(project, "restore", out var restore) ||
-            !TryString(restore, "projectPath", out var projectPath) ||
-            !Path.IsPathFullyQualified(projectPath) || !targets.EnumerateObject().Any() ||
-            !folders.EnumerateObject().Any())
-        {
-            diagnostics.Add($"Assets '{assetsPath}': missing or invalid NuGet graph fields.");
-            return;
-        }
-
-        var packageFolders = folders.EnumerateObject().Select(p => p.Name).ToArray();
-        if (packageFolders.Any(p => !Path.IsPathFullyQualified(p)))
-        {
-            diagnostics.Add($"Assets '{assetsPath}': package folder is not absolute.");
-            return;
-        }
-
-        foreach (var target in targets.EnumerateObject())
-        {
-            if (!Object(target.Value))
-            {
-                diagnostics.Add($"Assets '{assetsPath}': invalid target '{target.Name}'.");
-                continue;
-            }
-
-            var slash = target.Name.IndexOf('/');
-            var scope = new GuidanceScope(assetsPath, projectPath, slash < 0 ? target.Name : target.Name[..slash],
-                slash < 0 ? null : target.Name[(slash + 1)..]);
-            foreach (var item in target.Value.EnumerateObject())
-            {
-                if (!Object(item.Value) || !TryString(item.Value, "type", out var type))
-                {
-                    diagnostics.Add($"Assets '{assetsPath}': invalid target library '{item.Name}'.");
-                    continue;
-                }
-
-                if (type != "package")
-                    continue;
-                if (!libraries.TryGetProperty(item.Name, out var library) || !Object(library) ||
-                    !TryString(library, "type", out var libraryType) || libraryType != "package" ||
-                    !TryString(library, "path", out var relative) || !SafePath(relative))
-                {
-                    packages.Add(new GuidancePackage(scope, item.Name, "", null, GuidanceStatus.MissingAssets,
-                        null, $"Package '{item.Name}': invalid or missing resolved library path."));
-                    continue;
-                }
-
-                var index = item.Name.LastIndexOf('/');
-                if (index <= 0 || index == item.Name.Length - 1)
-                {
-                    diagnostics.Add($"Assets '{assetsPath}': invalid package identity '{item.Name}'.");
-                    continue;
-                }
-
-                var id = item.Name[..index];
-                var version = item.Name[(index + 1)..];
-                var roots = packageFolders.Select(folder => Path.Combine(folder, relative.Replace('/', Path.DirectorySeparatorChar)
-                    .Replace('\\', Path.DirectorySeparatorChar))).ToArray();
-                var packageRoot = roots.FirstOrDefault(Directory.Exists);
-                var manifestListed = library.TryGetProperty("files", out var files) &&
-                    files.ValueKind == JsonValueKind.Array &&
-                    files.EnumerateArray().Any(file => file.ValueKind == JsonValueKind.String &&
-                        string.Equals(file.GetString()?.Replace('\\', '/'), ManifestPath, StringComparison.OrdinalIgnoreCase));
-                var contentHash = TryString(library, "sha512", out var hash) ? hash : null;
-                // A package the caller declines is decided before its cache is inspected: nothing about it,
-                // including an incomplete cache entry, may fail discovery.
-                if (!shouldLoad(id))
-                {
-                    packages.Add(new GuidancePackage(scope, id, version, packageRoot ?? roots.FirstOrDefault(),
-                        GuidanceStatus.NotLoaded, null, null)
-                    {
-                        NuGetContentHash = contentHash,
-                        ManifestDeclared = manifestListed || (packageRoot is not null &&
-                            File.Exists(Path.Combine(packageRoot, "guidance", "reference-manifest.json")))
-                    });
-                    continue;
-                }
-
-                if (packageRoot is null)
-                {
-                    packages.Add(new GuidancePackage(scope, id, version, roots.FirstOrDefault(),
-                        GuidanceStatus.MissingAssets, null, $"Package '{id}/{version}': package cache entry is missing."));
-                    continue;
-                }
-
-                if (library.TryGetProperty("files", out var declaredFiles) && declaredFiles.ValueKind == JsonValueKind.Array &&
-                    declaredFiles.EnumerateArray().Any(file => file.ValueKind == JsonValueKind.String &&
-                        file.GetString() == ".nupkg.metadata") &&
-                    !File.Exists(Path.Combine(packageRoot, ".nupkg.metadata")))
-                {
-                    packages.Add(new GuidancePackage(scope, id, version, packageRoot,
-                        GuidanceStatus.MissingAssets, null, $"Package '{id}/{version}': NuGet package cache metadata is missing."));
-                    continue;
-                }
-
-                var read = ReadPackage(scope, id, version, packageRoot, manifestListed);
-                packages.Add(read with
-                {
-                    NuGetContentHash = contentHash,
-                    ManifestDeclared = read.Status != GuidanceStatus.NoManifest
-                });
-            }
-        }
-    }
-
-    private static GuidancePackage ReadPackage(GuidanceScope scope, string id, string version, string packageRoot,
-        bool manifestListed)
-    {
-        GuidancePackage Outcome(GuidanceStatus status, string? diagnostic = null, GuidanceContribution? contribution = null)
-            => new(scope, id, version, packageRoot, status, contribution,
-                diagnostic is null ? null : $"Package '{id}/{version}': {diagnostic}");
-
-        try
-        {
-            if (HasLink(packageRoot))
-                return Outcome(GuidanceStatus.InvalidManifest, "package root contains a link/reparse point.");
-            var manifestFile = Path.Combine(packageRoot, "guidance", "reference-manifest.json");
-            if (HasLink(manifestFile))
-                return Outcome(GuidanceStatus.InvalidManifest, "manifest path contains a link/reparse point.");
-            if (Directory.Exists(manifestFile))
-                return Outcome(GuidanceStatus.InvalidManifest, "manifest path is a directory.");
-            if (!File.Exists(manifestFile))
-                return manifestListed
-                    ? Outcome(GuidanceStatus.MissingAssets, "manifest listed by NuGet is missing from the package cache.")
-                    : Outcome(GuidanceStatus.NoManifest);
-
-            var parse = ManifestCheck.Parse(File.ReadAllBytes(manifestFile));
-            if (parse.Issues.Count > 0)
-                return Outcome(parse.UnsupportedSchema ? GuidanceStatus.UnsupportedSchema : GuidanceStatus.InvalidManifest,
-                    parse.Issues[0].Message);
-            var metadata = parse.PublisherMetadata;
-            var declaredDocuments = parse.Documents.Select(doc => (doc.Path, Hash: doc.Sha256, doc.Usage, doc.Description)).ToList();
-
-            var documents = new List<GuidanceDocument>();
-            foreach (var (path, hash, usage, description) in declaredDocuments)
-            {
-                var location = Path.Combine(packageRoot, Path.Combine(path.Replace('\\', '/').Split('/')));
-                if (HasLink(location))
-                    return Outcome(GuidanceStatus.InvalidManifest, $"document '{path}' contains a link/reparse point.");
-                if (!File.Exists(location))
-                    return Outcome(GuidanceStatus.MissingAssets, $"document '{path}' is missing.");
-                using var stream = File.OpenRead(location);
-                var actual = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
-                if (!string.Equals(hash, actual, StringComparison.Ordinal))
-                    return Outcome(GuidanceStatus.InvalidManifest, $"SHA-256 mismatch for '{path}'.");
-                documents.Add(new GuidanceDocument(new GuidanceIdentity(id, version, path), location, hash,
-                    usage, description));
-            }
-
-            return Outcome(GuidanceStatus.Valid, contribution: new GuidanceContribution(documents, metadata));
-        }
-        catch (JsonException e)
-        {
-            return Outcome(GuidanceStatus.InvalidManifest, $"malformed manifest: {e.Message}");
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            return Outcome(GuidanceStatus.MissingAssets, $"required package asset cannot be read: {e.Message}");
-        }
-    }
-
-    internal static bool TryUsage(string text, out GuidanceUsage usage)
-    {
-        switch (text)
-        {
-            case "required": usage = GuidanceUsage.Required; return true;
-            case "onDemand": usage = GuidanceUsage.OnDemand; return true;
-            case "supporting": usage = GuidanceUsage.Supporting; return true;
-            default: usage = default; return false;
-        }
-    }
-
-    /// <summary>One line, not blank, at most 200 Unicode scalar values after NFC, with no control (Cc), format (Cf), line separator (Zl), or paragraph separator (Zp) characters.</summary>
-    internal static bool ValidDescription(string value, out string? description)
-    {
-        description = null;
-        if (string.IsNullOrWhiteSpace(value))
-            return false;
-        string normalized;
-        try { normalized = value.Trim().Normalize(NormalizationForm.FormC); }
-        catch (ArgumentException) { return false; }
-        var scalars = 0;
-        foreach (var rune in normalized.EnumerateRunes())
-        {
-            var category = Rune.GetUnicodeCategory(rune);
-            if (category is System.Globalization.UnicodeCategory.Control or System.Globalization.UnicodeCategory.Format
-                    or System.Globalization.UnicodeCategory.LineSeparator
-                    or System.Globalization.UnicodeCategory.ParagraphSeparator ||
-                ++scalars > MaxDescriptionScalars)
-                return false;
-        }
-
-        description = normalized;
-        return true;
-    }
-
-    private static bool HasLink(string path)
-    {
-        for (var current = Path.GetFullPath(path); current is not null; current = Path.GetDirectoryName(current))
-        {
-            try
-            {
-                if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
-                    return true;
-            }
-            catch (FileNotFoundException) { }
-            catch (DirectoryNotFoundException) { }
-
-            var parent = Path.GetDirectoryName(current);
-            if (parent is null || parent == current)
-                break;
-        }
-
-        return false;
-    }
-
-    internal static bool SafePath(string path)
-    {
-        if (string.IsNullOrEmpty(path) || path[0] is '/' or '\\' ||
-            path.Any(c => c is < ' ' or '<' or '>' or ':' or '"' or '|' or '?' or '*'))
-            return false;
-        var segments = path.Replace('\\', '/').Split('/');
-        return segments.All(segment => segment.Length > 0 && segment is not ("." or "..") &&
-            !segment.EndsWith(' ') && !segment.EndsWith('.') &&
-            !ReservedNames.Contains(segment.Split('.')[0]));
-    }
-
-    internal static bool Namespaced(string key) =>
-        key.Length > 2 && key.Contains('.') &&
-        key.Split('.').All(p => p.Length > 0 && p.All(c => char.IsAsciiLetterOrDigit(c) || c == '-'));
-
-    internal static bool Object(JsonElement element) => element.ValueKind == JsonValueKind.Object;
-    internal static bool DuplicateProperties(JsonElement element) => element.ValueKind switch
-    {
-        JsonValueKind.Object => element.EnumerateObject().GroupBy(p => p.Name, StringComparer.Ordinal).Any(g => g.Count() > 1) ||
-            element.EnumerateObject().Any(p => DuplicateProperties(p.Value)),
-        JsonValueKind.Array => element.EnumerateArray().Any(DuplicateProperties),
-        _ => false
-    };
-    private static bool TryObject(JsonElement obj, string name, out JsonElement value) =>
-        obj.TryGetProperty(name, out value) && Object(value);
-    internal static bool TryArray(JsonElement obj, string name, out JsonElement value) =>
-        obj.TryGetProperty(name, out value) && value.ValueKind == JsonValueKind.Array;
-    internal static bool TryString(JsonElement obj, string name, out string value)
-    {
-        value = "";
-        if (!obj.TryGetProperty(name, out var element) || element.ValueKind != JsonValueKind.String ||
-            element.GetString() is not { Length: > 0 } text)
-            return false;
-        value = text;
-        return true;
     }
 }

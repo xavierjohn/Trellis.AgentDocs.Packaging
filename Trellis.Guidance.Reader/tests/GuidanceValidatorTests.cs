@@ -548,6 +548,19 @@ public sealed class GuidanceValidatorTests
     }
 
     [Fact]
+    public void Root_directory_markers_are_ignored()
+    {
+        var bytes = Encoding.UTF8.GetBytes("# S\n");
+        var manifest = new Package().DocBytes("guide/start.md", bytes, "required", "Read first.", pack: false);
+
+        foreach (var marker in new[] { "./", "/" })
+            Nupkg([("guide/start.md", bytes), (marker, [])], manifest).Diagnostics.Should().BeEmpty(marker);
+
+        Nupkg([("guide/start.md", bytes), ("../", [])], manifest).Diagnostics
+            .Should().Contain(d => d.Code == "AD009" && d.Message.Contains("escapes"));
+    }
+
+    [Fact]
     public void Rooted_entries_and_windows_aliases_are_AD009()
     {
         var bytes = Encoding.UTF8.GetBytes("# S\n");
@@ -585,21 +598,35 @@ public sealed class GuidanceValidatorTests
     }
 
     [Fact]
+    public void Explicit_directory_entries_cannot_collide_with_files()
+    {
+        var bytes = Encoding.UTF8.GetBytes("# S\n");
+        var manifest = new Package().DocBytes("guide/start.md", bytes, "required", "Read first.", pack: false);
+
+        Nupkg([("guide/start.md", bytes), ("conflict", bytes), ("conflict/", [])], manifest).Diagnostics
+            .Should().Contain(d => d.Code == "AD009" && d.Path == "conflict");
+        Nupkg([("guide/start.md", bytes), ("conflict/", []), ("conflict", bytes)], manifest).Diagnostics
+            .Should().Contain(d => d.Code == "AD009" && d.Path == "conflict");
+    }
+
+    [Fact]
     public void Non_portable_names_are_reported_the_same_for_an_archive_a_directory_and_in_memory_files()
     {
         var bytes = Encoding.UTF8.GetBytes("# S\n");
         var package = new Package().DocBytes("guide/start.md", bytes, "required", "Read first.");
         package.Files["guidance/reference-manifest.json"] = package.Manifest();
         package.Files["lib/CON"] = bytes;
+        package.Files["lib/foo\\bar"] = bytes;
 
         GuidanceValidator.Validate(package.Files).Diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "lib/CON");
+        GuidanceValidator.Validate(package.Files).Diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "lib/foo\\bar");
         Nupkg(package.Files.Select(pair => (pair.Key, pair.Value)), new Package().DocBytes("guide/start.md", bytes, "required", "Read first.", pack: false))
             .Diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "lib/CON");
 
         var root = Path.Combine(Path.GetTempPath(), "agentdocs-portable-" + Guid.NewGuid().ToString("N"));
         try
         {
-            foreach (var (path, content) in package.Files.Where(pair => pair.Key != "lib/CON"))
+            foreach (var (path, content) in package.Files.Where(pair => pair.Key is not ("lib/CON" or "lib/foo\\bar")))
             {
                 var target = Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar));
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
@@ -612,7 +639,10 @@ public sealed class GuidanceValidatorTests
             {
                 Directory.CreateDirectory(Path.Combine(root, "lib"));
                 File.WriteAllBytes(Path.Combine(root, "lib", "CON"), bytes);
-                GuidanceValidator.ValidatePackage(root).Diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "lib/CON");
+                File.WriteAllBytes(Path.Combine(root, "lib", "foo\\bar"), bytes);
+                var diagnostics = GuidanceValidator.ValidatePackage(root).Diagnostics;
+                diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "lib/CON");
+                diagnostics.Should().Contain(d => d.Code == "AD009" && d.Path == "lib/foo\\bar");
             }
             else
             {
@@ -776,8 +806,14 @@ public sealed class GuidanceValidatorTests
         {
             try
             {
-                using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe",
-                    $"/c mklink /J \"{link}\" \"{target}\"") { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true });
+                var startInfo = new System.Diagnostics.ProcessStartInfo("cmd.exe",
+                    $"/c mklink /J \"{link}\" \"{target}\"")
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true
+                };
+                using var process = System.Diagnostics.Process.Start(startInfo);
                 process?.WaitForExit();
                 return Directory.Exists(link);
             }

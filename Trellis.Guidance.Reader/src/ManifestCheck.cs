@@ -20,6 +20,9 @@ internal sealed record ManifestParse(IReadOnlyList<ManifestDocument> Documents,
 /// </summary>
 internal static class ManifestCheck
 {
+    public const string ManifestPath = "guidance/reference-manifest.json";
+    private const int MaxDescriptionScalars = 200;
+
     public static ManifestParse Parse(byte[] bytes)
     {
         var issues = new List<ManifestIssue>();
@@ -32,7 +35,7 @@ internal static class ManifestCheck
         {
             using var parsed = JsonDocument.Parse(bytes.AsMemory(bytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? 3 : 0));
             var manifest = parsed.RootElement;
-            if (!GuidanceReader.Object(manifest) || GuidanceReader.DuplicateProperties(manifest))
+            if (!JsonElementRules.Object(manifest) || JsonElementRules.DuplicateProperties(manifest))
             {
                 Issue("AD001", null, "manifest must be an object with unique properties.");
                 return Done();
@@ -53,7 +56,7 @@ internal static class ManifestCheck
 
             foreach (var property in manifest.EnumerateObject().Where(p => p.Name is not ("schemaVersion" or "documents" or "publisherMetadata")))
                 Issue("AD001", null, $"unknown field '{property.Name}'.");
-            if (!GuidanceReader.TryArray(manifest, "documents", out var rawDocuments))
+            if (!JsonElementRules.TryArray(manifest, "documents", out var rawDocuments))
             {
                 Issue("AD001", null, "missing documents array.");
                 return Done();
@@ -61,7 +64,7 @@ internal static class ManifestCheck
 
             if (manifest.TryGetProperty("publisherMetadata", out var extensions))
             {
-                if (!GuidanceReader.Object(extensions) || GuidanceReader.DuplicateProperties(extensions))
+                if (!JsonElementRules.Object(extensions) || JsonElementRules.DuplicateProperties(extensions))
                 {
                     Issue("AD001", null, "publisherMetadata must be an object with unique keys.");
                 }
@@ -69,7 +72,7 @@ internal static class ManifestCheck
                 {
                     foreach (var extension in extensions.EnumerateObject())
                     {
-                        if (GuidanceReader.Namespaced(extension.Name))
+                        if (Namespaced(extension.Name))
                             metadata[extension.Name] = extension.Value.Clone();
                         else
                             Issue("AD001", null, $"publisher metadata key '{extension.Name}' is not namespaced.");
@@ -82,7 +85,7 @@ internal static class ManifestCheck
             var normalizedDocuments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var raw in rawDocuments.EnumerateArray())
             {
-                if (!GuidanceReader.Object(raw) || GuidanceReader.DuplicateProperties(raw))
+                if (!JsonElementRules.Object(raw) || JsonElementRules.DuplicateProperties(raw))
                 {
                     Issue("AD001", null, "each document must be an object with unique properties.");
                     continue;
@@ -95,13 +98,13 @@ internal static class ManifestCheck
                     ok = false;
                 }
 
-                if (!GuidanceReader.TryString(raw, "path", out var path) || !GuidanceReader.SafePath(path))
+                if (!JsonElementRules.TryString(raw, "path", out var path) || !PackagePath.SafeRelative(path))
                 {
                     Issue("AD002", path, "invalid document path: it must be a portable relative path without rooted, '..', device or trailing-dot segments.");
                     continue;
                 }
 
-                if (!GuidanceReader.TryString(raw, "sha256", out var hash) || hash.Length != 64 ||
+                if (!JsonElementRules.TryString(raw, "sha256", out var hash) || hash.Length != 64 ||
                     !hash.All(c => c is (>= '0' and <= '9') or (>= 'a' and <= 'f')))
                 {
                     Issue("AD003", path, $"invalid sha256 for '{path}': it must be 64 lowercase hexadecimal characters.");
@@ -109,7 +112,7 @@ internal static class ManifestCheck
                 }
 
                 GuidanceUsage usage = default;
-                if (!GuidanceReader.TryString(raw, "usage", out var usageText) || !GuidanceReader.TryUsage(usageText, out usage))
+                if (!JsonElementRules.TryString(raw, "usage", out var usageText) || !TryUsage(usageText, out usage))
                 {
                     Issue("AD004", path, $"usage for '{path}' must be required, onDemand, or supporting.");
                     ok = false;
@@ -119,7 +122,7 @@ internal static class ManifestCheck
                 if (raw.TryGetProperty("description", out var descriptionValue))
                 {
                     if (descriptionValue.ValueKind != JsonValueKind.String ||
-                        !GuidanceReader.ValidDescription(descriptionValue.GetString()!, out description))
+                        !ValidDescription(descriptionValue.GetString()!, out description))
                     {
                         Issue("AD005", path,
                             $"invalid description for '{path}': one line of at most 200 characters without control or format characters.");
@@ -133,12 +136,12 @@ internal static class ManifestCheck
                     ok = false;
                 }
 
-                var parts = path.Replace('\\', '/').Split('/');
+                var parts = PackagePath.Separators(path).Split('/');
                 var alias = false;
                 for (var i = 1; i <= parts.Length; i++)
                 {
                     var original = string.Join('/', parts.Take(i));
-                    var normalized = original.Normalize(NormalizationForm.FormC);
+                    var normalized = PackagePath.NormalizeIdentity(original);
                     if (prefixes.TryGetValue(normalized, out var previous) && previous != original)
                     {
                         Issue("AD007", path, $"portable directory or document alias: '{previous}' and '{original}'.");
@@ -149,7 +152,7 @@ internal static class ManifestCheck
                     prefixes[normalized] = original;
                 }
 
-                if (!alias && (!declared.Add(path) || !normalizedDocuments.Add(path.Replace('\\', '/').Normalize(NormalizationForm.FormC))))
+                if (!alias && (!declared.Add(path) || !normalizedDocuments.Add(PackagePath.NormalizeIdentity(PackagePath.Separators(path)))))
                 {
                     Issue("AD007", path, $"portable document alias: '{path}'.");
                     alias = true;
@@ -160,7 +163,7 @@ internal static class ManifestCheck
             }
 
             foreach (var document in documents.Where(doc => prefixes.Keys.Any(prefix =>
-                         prefix.StartsWith(doc.Path.Replace('\\', '/').Normalize(NormalizationForm.FormC) + "/", StringComparison.OrdinalIgnoreCase))))
+                         prefix.StartsWith(PackagePath.NormalizeIdentity(PackagePath.Separators(doc.Path)) + "/", StringComparison.OrdinalIgnoreCase))))
                 Issue("AD007", document.Path, "a document is also used as a directory prefix.");
 
             // Only meaningful when every entry parsed: a rejected entry could have been the required one.
@@ -175,4 +178,43 @@ internal static class ManifestCheck
             return Done();
         }
     }
+
+    private static bool TryUsage(string text, out GuidanceUsage usage)
+    {
+        switch (text)
+        {
+            case "required": usage = GuidanceUsage.Required; return true;
+            case "onDemand": usage = GuidanceUsage.OnDemand; return true;
+            case "supporting": usage = GuidanceUsage.Supporting; return true;
+            default: usage = default; return false;
+        }
+    }
+
+    private static bool ValidDescription(string value, out string? description)
+    {
+        description = null;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+        string normalized;
+        try { normalized = value.Trim().Normalize(NormalizationForm.FormC); }
+        catch (ArgumentException) { return false; }
+        var scalars = 0;
+        foreach (var rune in normalized.EnumerateRunes())
+        {
+            var category = Rune.GetUnicodeCategory(rune);
+            if (category is System.Globalization.UnicodeCategory.Control or System.Globalization.UnicodeCategory.Format
+                    or System.Globalization.UnicodeCategory.LineSeparator
+                    or System.Globalization.UnicodeCategory.ParagraphSeparator ||
+                ++scalars > MaxDescriptionScalars)
+                return false;
+        }
+
+        description = normalized;
+        return true;
+    }
+
+    private static bool Namespaced(string key) =>
+        key.Length > 2 && key.Contains('.') &&
+        key.Split('.').All(p => p.Length > 0 && p.All(c => char.IsAsciiLetterOrDigit(c) || c == '-'));
+
 }
