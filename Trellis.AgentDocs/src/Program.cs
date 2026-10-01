@@ -238,7 +238,7 @@ public static partial class AgentDocsCommand
             }
 
             if (changes.Count != 0)
-                output.WriteLine("Installed guidance is current. The recorded graph differs only in restore inputs that do not change it; run agentdocs sync to refresh it.");
+                output.WriteLine("Installed guidance is current. Only the recorded context file differs from what sync would write; run agentdocs sync to refresh it.");
             return 0;
         }
 

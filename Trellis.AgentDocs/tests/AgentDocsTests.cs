@@ -1356,6 +1356,28 @@ public sealed class AgentDocsTests
         fixture.LastOutput.Should().Contain("overview.md");
     }
 
+    [Fact]
+    public void Content_only_check_fails_when_a_sync_would_change_the_index_or_the_installed_guides()
+    {
+        // Unlike a tampered or deleted file, these are planned changes: the restored package now supplies different
+        // guidance than what is installed, so a sync would rewrite the index or add and remove guides.
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0);
+        fixture.Run("check", "--content-only").Should().Be(0, fixture.LastOutput);
+
+        fixture.OverviewDescription = "A different routing description.";
+        fixture.Run("check", "--content-only").Should().Be(1, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("Update: .agentdocs/README.md")
+            .And.Contain("Installed guidance differs from the restored graph")
+            .And.NotContain("Installed guidance is current");
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        fixture.Run("check", "--content-only").Should().Be(0, fixture.LastOutput);
+
+        fixture.ShortGuideOnly = true;
+        fixture.Run("check", "--content-only").Should().Be(1, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("Installed guidance differs from the restored graph");
+    }
+
     [Theory]
     [InlineData("sync")]
     [InlineData("remove")]
