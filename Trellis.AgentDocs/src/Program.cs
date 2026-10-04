@@ -73,7 +73,7 @@ public static partial class AgentDocsCommand
     private const string Start = "<!-- agentdocs:start -->";
     private const string End = "<!-- agentdocs:end -->";
     private const string VisualStudioInstructions = ".github/copilot-instructions.md";
-    private const int ContextSchemaVersion = 3;
+    private const int ContextSchemaVersion = 1;
     private const string CanonicalTextTransform = "canonical-text-v1";
     private const string DocumentReferenceTransform = "document-references-v1";
     private const string ReferencePlaceholderTransform = "reference-placeholder-v1";

@@ -257,7 +257,7 @@ $Items
     }
     $state = Get-Content -LiteralPath (Join-Path $consumer '.agentdocs\agent-context.json') -Raw | ConvertFrom-Json
     $sourceState = @($state.References | Where-Object Path -eq 'packages/multi.good/guide/start.md')
-    if ($state.SchemaVersion -ne 3 -or $sourceState.Count -ne 1 -or
+    if ($state.SchemaVersion -ne 1 -or $sourceState.Count -ne 1 -or
         $sourceState[0].TransformVersion -ne 'document-references-v1' -or
         @($sourceState[0].ReferenceDependencies).Count -ne 1 -or
         $sourceState[0].ReferenceDependencies[0].Outcome -ne 'resolved' -or

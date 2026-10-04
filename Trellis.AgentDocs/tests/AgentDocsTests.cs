@@ -2449,7 +2449,7 @@ public sealed class AgentDocsTests
     }
 
     [Theory]
-    [InlineData("schema-version", "Unsupported context schemaVersion 4; expected 3")]
+    [InlineData("schema-version", "Unsupported context schemaVersion 4; expected 1")]
     [InlineData("tool-owned-path", "Conflicting or invalid tool-owned paths")]
     [InlineData("owned-hash", "Invalid owned-file hash")]
     [InlineData("reference-outside-packages", "outside the guidance namespaces")]
@@ -2489,19 +2489,76 @@ public sealed class AgentDocsTests
     }
 
     [Fact]
-    public void Context_schema_two_is_rejected_without_migration()
+    public void Context_schema_one_round_trips_through_the_lifecycle()
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var path = fixture.Path(".agentdocs", "agent-context.json");
+        using (var state = JsonDocument.Parse(File.ReadAllText(path)))
+            state.RootElement.GetProperty("SchemaVersion").GetInt32().Should().Be(1);
+
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        using (var state = JsonDocument.Parse(File.ReadAllText(path)))
+            state.RootElement.GetProperty("SchemaVersion").GetInt32().Should().Be(1);
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+        fixture.Run("remove").Should().Be(0, fixture.LastOutput);
+        File.Exists(path).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("check", 2)]
+    [InlineData("sync", 2)]
+    [InlineData("remove", 2)]
+    [InlineData("check", 3)]
+    [InlineData("sync", 3)]
+    [InlineData("remove", 3)]
+    public void Context_unsupported_schemas_are_rejected_without_writes(string verb, int schemaVersion)
     {
         using var fixture = new Fixture();
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
         var path = fixture.Path(".agentdocs", "agent-context.json");
         var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!;
-        node["SchemaVersion"] = 2;
+        node["SchemaVersion"] = schemaVersion;
         File.WriteAllText(path, node.ToJsonString());
+        var snapshot = Directory.EnumerateFiles(fixture.Path(), "*", SearchOption.AllDirectories)
+            .ToDictionary(file => file, File.ReadAllBytes);
 
-        fixture.Run("check").Should().NotBe(0);
-        fixture.LastOutput.Should().Contain("Unsupported context schemaVersion 2; expected 3");
-        fixture.Run("sync").Should().NotBe(0);
-        fixture.LastOutput.Should().Contain("Unsupported context schemaVersion 2; expected 3");
+        fixture.Run(verb).Should().Be(1);
+
+        fixture.LastOutput.Should().Contain($"Unsupported context schemaVersion {schemaVersion}; expected 1");
+        Directory.EnumerateFiles(fixture.Path(), "*", SearchOption.AllDirectories)
+            .Should().BeEquivalentTo(snapshot.Keys);
+        foreach (var file in snapshot)
+            File.ReadAllBytes(file.Key).Should().Equal(file.Value);
+    }
+
+    [Theory]
+    [InlineData("check", "TransformVersion")]
+    [InlineData("sync", "TransformVersion")]
+    [InlineData("remove", "TransformVersion")]
+    [InlineData("check", "ReferenceDependencies")]
+    [InlineData("sync", "ReferenceDependencies")]
+    [InlineData("remove", "ReferenceDependencies")]
+    public void Context_schema_one_missing_transform_state_is_rejected_without_writes(string verb, string missingField)
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var path = fixture.Path(".agentdocs", "agent-context.json");
+        var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!;
+        node["SchemaVersion"] = 1;
+        node["ToolOwnedFiles"]![0]!.AsObject().Remove(missingField);
+        File.WriteAllText(path, node.ToJsonString());
+        var snapshot = Directory.EnumerateFiles(fixture.Path(), "*", SearchOption.AllDirectories)
+            .ToDictionary(file => file, File.ReadAllBytes);
+
+        fixture.Run(verb).Should().Be(1);
+
+        fixture.LastOutput.Should().Contain("Invalid owned-file transform state");
+        Directory.EnumerateFiles(fixture.Path(), "*", SearchOption.AllDirectories)
+            .Should().BeEquivalentTo(snapshot.Keys);
+        foreach (var file in snapshot)
+            File.ReadAllBytes(file.Key).Should().Equal(file.Value);
     }
 
     [Theory]

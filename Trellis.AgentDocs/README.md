@@ -118,10 +118,12 @@ ownership hashes needed for `check` and safe cleanup after a fresh clone. Keep
 the packages you approve reviewed: their documents are instructions for an
 agent that acts with your privileges.
 
-This alpha release writes context schema 3 and reads only schema 3. Earlier
-preview state is intentionally not migrated: remove the old generated context
-with its matching tool version (or delete the reviewed `.agentdocs` generated
-files) and run `init` again.
+This alpha release writes context schema 1 and reads only schema 1. Version 1
+defines the first actual context contract in place, independently of the package
+manifest schema. Backward compatibility with earlier development formats is not
+required. Earlier state is intentionally not migrated: remove the old generated
+context with its matching tool version (or delete the reviewed `.agentdocs`
+generated files) and run `init` again.
 
 ## After a package upgrade
 
