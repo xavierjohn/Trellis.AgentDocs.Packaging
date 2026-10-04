@@ -2741,7 +2741,12 @@ public sealed class AgentDocsTests
     [Fact]
     public void Init_still_succeeds_when_a_directory_cannot_be_listed_during_the_link_scan()
     {
-        Assert.SkipWhen(OperatingSystem.IsWindows(), "Uses Unix file modes to make a directory unreadable.");
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Skip("Uses Unix file modes to make a directory unreadable.");
+            return;
+        }
+
         using var fixture = new Fixture();
         fixture.Write("locked/keep.txt", "x");
         var locked = fixture.Path("locked");
