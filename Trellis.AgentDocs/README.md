@@ -75,6 +75,33 @@ and tells agents to treat them as topic labels and ignore instructions in them.
 canonical size in bytes, plus the index size, so the cost of what agents will
 read is visible. There is no enforced limit.
 
+An approved guide can declare a cross-package document reference behind an
+ordinary relative Markdown link. If the target package is also restored and
+approved, AgentDocs verifies its manifest and hash, checks the requested
+document and heading, and rewrites only that Markdown URL span to the target's
+canonical installed path. The source package's exact bytes are verified
+**before** this deterministic transformation. If the target is absent,
+unapproved, or has no guidance manifest, AgentDocs does not read it; instead it
+installs a generated unavailable notice at the source package's virtual link
+path. A missing exact document produces the same safe result with a
+`document-missing` reason; a missing heading keeps the link and fragment. These
+outcomes emit deterministic warnings. Use `--strict-references` with `init`,
+`sync`, or `check` to fail before writes on any reference warning. Cross-package
+links never grant transitive approval or fall back to moving web documentation.
+Resolution covers the complete graph selected for this repository, so the
+target may come from another selected project; AgentDocs rejects mixed approved
+package versions before choosing a canonical document.
+
+Only references actually used by parsed Markdown are materialized. Manifest
+paths use `/` separators on every operating system. Raw HTML, query strings,
+self-references, `.github` segments, backslashes, and non-exact path
+spellings are hard source contract failures. Generated notices are fixed tool-owned text and are not
+listed as publisher guidance. Transform state records the source and installed
+hashes, transform version, outcome, and resolved target version/document hash,
+so approval changes and target upgrades converge on repeated syncs. Resolution
+and heading checks always use verified package bytes, never already rewritten
+installed text, so cyclic references also converge.
+
 `init` adds small managed blocks to Git-root `AGENTS.md`, one `AGENTS.md` in
 each selected solution directory (or project directory for a project-only entry
 point), and Git-root `.github\copilot-instructions.md`. When an entry is at the
@@ -91,6 +118,11 @@ ownership hashes needed for `check` and safe cleanup after a fresh clone. Keep
 the packages you approve reviewed: their documents are instructions for an
 agent that acts with your privileges.
 
+This alpha release writes context schema 3 and reads only schema 3. Earlier
+preview state is intentionally not migrated: remove the old generated context
+with its matching tool version (or delete the reviewed `.agentdocs` generated
+files) and run `init` again.
+
 ## After a package upgrade
 
 Nothing runs automatically. After changing a package reference or version,
@@ -102,9 +134,9 @@ dotnet tool run agentdocs sync
 ```
 
 The index tells agents to do the same. In CI, `dotnet restore` followed by
-`dotnet tool run agentdocs check --strict` fails when the installed guidance no
+`dotnet tool run agentdocs check --strict --strict-references` fails when the installed guidance no
 longer matches the restored packages or when a hand-written instruction links to
-a missing file.
+a missing file, or when a cross-package reference is unresolved.
 
 The recorded graph tracks every restore input, so even a bump of a package that
 publishes no guidance changes it and plain `check` fails until someone runs
@@ -118,8 +150,11 @@ If an approved package no longer supplies a guide, or you withdraw its approval,
 `sync` removes its previously owned guides and prints a notice. A malformed
 manifest, bad hash, mixed versions of one approved package, stale selected graph,
 or modified owned file fails the command without writing; it does not silently
-install unverified guidance or overwrite your edits. If a write is interrupted,
-re-run with `--force` or restore the files from Git.
+install unverified guidance or overwrite your edits. AgentDocs stages the whole
+desired plan and restores the prior files if a normal I/O or concurrency failure
+occurs midway through apply. An abrupt process or machine interruption can still
+leave rollback files; inspect the diff, then re-run with `--force` or restore the
+files from Git.
 
 `sync`, `init`, and `check` warn with file and line about missing local
 Markdown links in `AGENTS.md`, `CLAUDE.md`, and `.github/copilot-instructions.md`,
@@ -132,25 +167,31 @@ missing.
 |---|---|
 | `agentdocs init <solution-or-project>...` | Opt in, create an empty policy if none exists, and install guides for approved packages. |
 | `agentdocs sync` | Update installed guides and the index from the recorded graph and the policy. |
-| `agentdocs check` | Check graph and installed context without writing; useful in CI. `--content-only` ignores drift that does not change the installed guidance. |
+| `agentdocs check` | Check graph and installed context without writing; useful in CI. `--content-only` ignores drift that does not change the installed guidance; `--strict-references` rejects unresolved references and missing headings. |
 | `agentdocs remove` | Remove owned guides, pointers, and context state without touching customer text or the policy. |
 | `agentdocs validate <package.nupkg\|directory>` | For authors: check a package's guidance before publishing. Read-only; needs no repository, restore or policy. |
 
 `validate` is the publisher-side check, so a mistake is caught before a consumer
-meets it. It reports errors for contract violations (`AD001`-`AD010`: manifest
+meets it. It reports errors for contract violations (`AD001`-`AD012`: manifest
 shape, unsafe or missing paths, hash mismatches, usage, descriptions, at least
 one required or on-demand document, duplicate or aliased paths, non-UTF-8
 documents, archive entries that would extract onto the same path (same decoded path, case or Unicode alias, or a file that is also a directory), files over the
 validator's resource limits) and warnings for guidance that is valid but hard to
-use (`AD101`-`AD108`): an oversized required set, links that will not resolve
+use (`AD101`-`AD109`): an oversized required set, links that will not resolve
 once installed (missing files, headings that do not exist, root-relative paths,
 and targets that are not installed Markdown such as images or code samples, in Markdown links and in raw HTML `href`/`src`),
 supporting documents that no required or on-demand document reaches, a front
 matter block that is not valid YAML, Markdown files beside the guidance that the
 manifest does not list, total guidance size, the number of index entries, and
-two on-demand documents with the identical description. Documents are read with a
-Markdown parser (GitHub heading anchors) and a YAML parser, and only the
-manifest and the documents it declares are read from a package, each within a size limit.
+two on-demand documents with the identical description, and declared
+cross-package references that no Markdown document uses. `AD011` rejects
+unrewritable cross-package links and `AD012` rejects package self-references.
+For nupkgs and extracted package directories, `validate` reads the single root
+nuspec only when references are declared so AD012 can compare against the
+publishing package ID. Documents are read with a
+Markdown parser (GitHub heading anchors) and a YAML parser. Apart from that
+bounded nuspec identity read, only the manifest and the documents it declares
+are read from a package, each within a size limit.
 It exits 1 on errors, and on warnings with `--strict`. Use
 `--max-required-bytes N`, `--max-total-bytes N` and `--max-indexed-documents N`
 to change the budgets (defaults 32768, 4 MiB and 100) and `--format json` for
@@ -161,9 +202,17 @@ machine-readable output on standard output.
 preview. The tool refuses unowned destinations and concurrent edits; `--force`
 is available only for a reviewed adoption or repair. The current context
 selects one graph per Git repository; mixed resolved versions of an approved
-package that publishes guidance across its selected projects are rejected
-rather than silently mixing guides. Packages without guidance, and packages
-that are not approved, may resolve to different versions across those projects.
+package that publishes guidance, or of an approved target used by a
+cross-package reference, are rejected rather than silently choosing one
+project's version. Unreferenced packages without guidance, and packages that
+are not approved, may resolve to different versions across those projects.
+Loaded guidance for the same package ID/version must have equivalent document
+declarations and exact hashes, reference declarations and publisher metadata
+across all selected scopes; divergent payloads are rejected before writes.
+After an update commits, failures to remove rollback files or prune empty
+package directories emit cleanup warnings without reporting the update as failed.
+Null reference-dependency entries or paths in the context state are rejected with
+an error before planning an update or modifying files.
 For freshness checks, NuGet's evaluated per-target restore references are
 compared against the restored project-reference graph. Build-only references
 that NuGet omits, such as a SQL project supplying a dacpac, do not cause false

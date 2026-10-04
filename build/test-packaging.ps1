@@ -6,6 +6,8 @@ Set-StrictMode -Version Latest
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'package-version.ps1')
 $work = Join-Path ([System.IO.Path]::GetTempPath()) "agentdocs-packaging-$([guid]::NewGuid().ToString('N'))"
+$originalNuGetPackages = $env:NUGET_PACKAGES
+$originalDotNetCliHome = $env:DOTNET_CLI_HOME
 $publisher = Join-Path $work 'publisher'
 $packages = Join-Path $work 'packages'
 try {
@@ -86,7 +88,7 @@ try {
     }
     finally { $zip.Dispose() }
 
-    foreach ($invalid in @('../escape.md', 'NUL.md', 'guides/ending./doc.md',
+    foreach ($invalid in @('../escape.md', '.github/guide.md', 'NUL.md', 'guides/ending./doc.md',
             'guides\backslash.md', 'guides//empty.md')) {
         $output = & dotnet pack $project --no-restore "-p:PackageGuidancePath=$invalid" -o $Feed --nologo -v:q 2>&1
         if ($LASTEXITCODE -eq 0 -or ($output | Out-String) -notmatch 'PackageGuidancePath must be a portable relative Markdown path') {
@@ -130,7 +132,8 @@ try {
     # Multi-document publisher: PackageGuidanceItem items with mixed usage, checked by the shipped validator.
     $multi = Join-Path $work 'multi'
     New-Item -ItemType Directory -Path $multi | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $multi 'start.md'), "# Start`n`nSee [http](http.md#calling-x).`n")
+    [System.IO.File]::WriteAllText((Join-Path $multi 'start.md'),
+        "# Start`n`nSee [http](http.md#calling-x) and [publisher](publisher.md#publisher-guide).`n")
     [System.IO.File]::WriteAllText((Join-Path $multi 'http.md'), "# Http`n`n## Calling X`n")
     [System.IO.File]::WriteAllText((Join-Path $multi 'cookbook.md'), "# Cookbook`n")
     $validItems = @'
@@ -139,6 +142,8 @@ try {
     <PackageGuidanceItem Include="cookbook.md" PackagePath="guide/cookbook.md"
                          Description="Open when writing recipes." />
     <PackageGuidanceItem Include="http.md" PackagePath="guide/http.md" Usage="supporting" />
+    <PackageGuidanceReference Include="guide/publisher.md" PackageId="Independent.Publisher"
+                              DocumentPath="guides/overview.md" />
 '@
     function New-MultiProject([string] $Name, [string] $Items, [string] $Extra = '') {
         $dir = Join-Path $multi $Name
@@ -157,6 +162,7 @@ try {
   <ItemGroup>
 $Items
     <PackageReference Include="Trellis.AgentDocs.Packaging" Version="$version" PrivateAssets="all" />
+    <PackageReference Include="Independent.Publisher" Version="1.0.0" />
   </ItemGroup>
 </Project>
 "@)
@@ -172,11 +178,15 @@ $Items
         $reader = [System.IO.StreamReader]::new($zip.GetEntry('guidance/reference-manifest.json').Open())
         try { $metadata = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
         $docs = @($metadata.documents)
-        if ($docs.Count -ne 3 -or
+        if ($metadata.schemaVersion -ne 1 -or $docs.Count -ne 3 -or
             @($docs.path) -join ',' -ne 'guide/start.md,guide/cookbook.md,guide/http.md' -or
             @($docs.usage) -join ',' -ne 'required,onDemand,supporting' -or
             $docs[0].description -cne 'Read before using X; it''s & 100% needed.' -or
             $docs[2].PSObject.Properties['description'] -or
+            @($metadata.documentReferences).Count -ne 1 -or
+            $metadata.documentReferences[0].path -cne 'guide/publisher.md' -or
+            $metadata.documentReferences[0].packageId -cne 'Independent.Publisher' -or
+            $metadata.documentReferences[0].documentPath -cne 'guides/overview.md' -or
             $null -ne $metadata.PSObject.Properties['entryPoints']) {
             throw "Multi-document manifest is wrong: $($docs | ConvertTo-Json -Compress)"
         }
@@ -209,6 +219,13 @@ $Items
     & dotnet pack $toolProject -c Release -o $Feed --nologo -v:q
     if ($LASTEXITCODE -ne 0) { throw 'Tool pack failed.' }
     $toolVersion = Get-NuGetPackageVersion $toolProject
+    $env:NUGET_PACKAGES = Join-Path $work 'tool-packages'
+    $env:DOTNET_CLI_HOME = Join-Path $work 'dotnet-home'
+    $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
+    $env:DOTNET_NOLOGO = '1'
+    $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
+    $env:DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
+    $env:DOTNET_ADD_GLOBAL_TOOLS_TO_PATH = 'false'
     Push-Location $consumer
     try {
         & dotnet new tool-manifest --output .config | Out-Null
@@ -217,15 +234,36 @@ $Items
         $init = & dotnet tool run agentdocs init Consumer.csproj 2>&1
         if ($LASTEXITCODE -ne 0) { throw "Consumer init failed for the multi-document package: $($init | Out-String)" }
         [System.IO.File]::WriteAllText((Join-Path $consumer '.agentdocs\policy.json'),
-            '{ "schemaVersion": 1, "approvedPackages": ["Multi.Good"] }')
+            '{ "schemaVersion": 1, "approvedPackages": ["Independent.Publisher", "Multi.Good"] }')
         $sync = & dotnet tool run agentdocs sync 2>&1
         if ($LASTEXITCODE -ne 0) { throw "Consumer sync rejected the helper's output: $($sync | Out-String)" }
+        $check = & dotnet tool run agentdocs check --strict-references 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Consumer strict reference check failed: $($check | Out-String)" }
     }
     finally { Pop-Location }
     foreach ($installed in 'start.md', 'cookbook.md', 'http.md') {
         if (-not (Test-Path (Join-Path $consumer ".agentdocs\packages\multi.good\guide\$installed"))) {
             throw "Consumer did not install $installed from the multi-document package."
         }
+    }
+    if (-not (Test-Path (Join-Path $consumer '.agentdocs\packages\independent.publisher\guides\overview.md'))) {
+        throw 'Consumer did not install the approved cross-package reference target.'
+    }
+    $rewrittenStart = Get-Content -LiteralPath (
+        Join-Path $consumer '.agentdocs\packages\multi.good\guide\start.md') -Raw
+    if ($rewrittenStart -notmatch '\.\./\.\./independent\.publisher/guides/overview\.md#publisher-guide' -or
+        $rewrittenStart -match '\]\(publisher\.md#publisher-guide\)') {
+        throw "Consumer did not rewrite the cross-package document link: $rewrittenStart"
+    }
+    $state = Get-Content -LiteralPath (Join-Path $consumer '.agentdocs\agent-context.json') -Raw | ConvertFrom-Json
+    $sourceState = @($state.References | Where-Object Path -eq 'packages/multi.good/guide/start.md')
+    if ($state.SchemaVersion -ne 3 -or $sourceState.Count -ne 1 -or
+        $sourceState[0].TransformVersion -ne 'document-references-v1' -or
+        @($sourceState[0].ReferenceDependencies).Count -ne 1 -or
+        $sourceState[0].ReferenceDependencies[0].Outcome -ne 'resolved' -or
+        $sourceState[0].ReferenceDependencies[0].TargetVersion -ne '1.0.0' -or
+        $sourceState[0].ReferenceDependencies[0].TargetSha256.Length -ne 64) {
+        throw 'Consumer context does not record the resolved reference dependency.'
     }
     # Three-way conformance: the raw nupkg, the directory NuGet extracted from it, and what the consumer's reader
     # installed must agree on acceptance and on the bytes of every document.
@@ -258,8 +296,8 @@ $Items
             if ($packedBytes.Length -ne [System.IO.File]::ReadAllBytes((Join-Path $extracted "guide\$installed")).Length) {
                 throw "NuGet's extracted guide/$installed differs in size from the nupkg entry."
             }
-            if ($packed -ne $onDisk -or $packed -ne $delivered) {
-                throw "Bytes of guide/$installed differ between the nupkg, NuGet's extraction and the installed copy."
+            if ($packed -ne $onDisk -or ($installed -ne 'start.md' -and $packed -ne $delivered)) {
+                throw "Bytes of guide/$installed differ unexpectedly between the nupkg, NuGet's extraction and the installed copy."
             }
         }
     }
@@ -277,9 +315,17 @@ $Items
         'OnlySupporting' = @{ Items = '<PackageGuidanceItem Include="http.md" PackagePath="guide/http.md" Usage="supporting" />'; Match = 'at least one required or onDemand' }
         'BadUsage' = @{ Items = '<PackageGuidanceItem Include="http.md" PackagePath="guide/http.md" Usage="always" Description="x" />'; Match = 'Usage must be required, onDemand or supporting' }
         'BadPath' = @{ Items = '<PackageGuidanceItem Include="http.md" PackagePath="../http.md" Description="x" />'; Match = 'portable relative Markdown path' }
+        'HiddenDocumentPath' = @{ Items = '<PackageGuidanceItem Include="http.md" PackagePath="guide/.github/http.md" Description="x" />'; Match = 'portable relative Markdown path' }
         'Missing' = @{ Items = '<PackageGuidanceItem Include="nope.md" PackagePath="guide/nope.md" Description="x" />'; Match = 'missing guidance document' }
         'LongSupportingDescription' = @{ Items = ($validItems + '<PackageGuidanceItem Include="http.md" PackagePath="guide/other.md" Usage="supporting" Description="' + ('x' * 201) + '" />'); Match = 'at most 200 characters' }
         'BothForms' = @{ Items = $validItems; Extra = '<PackageGuidancePath>guide/x.md</PackageGuidancePath>'; Match = 'not both' }
+        'BadReferencePath' = @{ Items = ($validItems + '<PackageGuidanceReference Include="../escape.md" PackageId="Independent.Publisher" DocumentPath="guides/overview.md" />'); Match = 'portable relative Markdown path' }
+        'HiddenReferencePath' = @{ Items = ($validItems + '<PackageGuidanceReference Include=".github/other.md" PackageId="Independent.Publisher" DocumentPath="guides/overview.md" />'); Match = 'portable relative Markdown path' }
+        'BadReferencePackage' = @{ Items = ($validItems + '<PackageGuidanceReference Include="guide/other.md" PackageId="bad package id" DocumentPath="guides/overview.md" />'); Match = 'valid NuGet package ID' }
+        'BadReferenceDocument' = @{ Items = ($validItems + '<PackageGuidanceReference Include="guide/other.md" PackageId="Independent.Publisher" DocumentPath="../escape.md" />'); Match = 'DocumentPath must be a portable' }
+        'HiddenReferenceDocument' = @{ Items = ($validItems + '<PackageGuidanceReference Include="guide/other.md" PackageId="Independent.Publisher" DocumentPath="guides/.github/overview.md" />'); Match = 'DocumentPath must be a portable' }
+        'ReferenceCollision' = @{ Items = ($validItems + '<PackageGuidanceReference Include="guide/start.md" PackageId="Independent.Publisher" DocumentPath="guides/overview.md" />'); Match = 'collides with another' }
+        'SelfReference' = @{ Items = ($validItems + '<PackageGuidanceReference Include="guide/self.md" PackageId="Multi.BadSelfReference" DocumentPath="guide/start.md" />'); Match = 'must not target the publishing package itself' }
     }
     foreach ($case in $multiInvalid.Keys) {
         $extra = if ($multiInvalid[$case].ContainsKey('Extra')) { $multiInvalid[$case].Extra } else { '' }
@@ -292,6 +338,18 @@ $Items
     Write-Host 'PASS multi-document publisher, validator round trip, and invalid inputs.'
 }
 finally {
+    if ($null -eq $originalNuGetPackages) {
+        Remove-Item Env:NUGET_PACKAGES -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:NUGET_PACKAGES = $originalNuGetPackages
+    }
+    if ($null -eq $originalDotNetCliHome) {
+        Remove-Item Env:DOTNET_CLI_HOME -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:DOTNET_CLI_HOME = $originalDotNetCliHome
+    }
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
 }
 exit 0

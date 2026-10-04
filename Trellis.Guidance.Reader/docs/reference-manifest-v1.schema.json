@@ -28,6 +28,25 @@
         "then": { "required": ["description"] }
       }
     },
+    "documentReferences": {
+      "type": "array",
+      "description": "Virtual package-relative Markdown paths that ordinary Markdown links can use to reach a declared document in another restored package.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "packageId", "documentPath"],
+        "properties": {
+          "path": { "$ref": "#/$defs/markdownPackagePath" },
+          "packageId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "documentPath": { "$ref": "#/$defs/markdownPackagePath" }
+        }
+      }
+    },
     "publisherMetadata": {
       "type": "object",
       "patternProperties": {
@@ -40,7 +59,17 @@
     "packagePath": {
       "type": "string",
       "minLength": 1,
-      "description": "Package-relative path; additional portability, traversal, alias and link checks in the specification apply."
+      "allOf": [
+        { "not": { "pattern": "\\\\" } },
+        { "not": { "pattern": "(^|/)[.][gG][iI][tT][hH][uU][bB](/|$)" } }
+      ],
+      "description": "Package-relative path using forward slashes and no .github segment; additional portability, traversal, alias and link checks in the specification apply."
+    },
+    "markdownPackagePath": {
+      "allOf": [
+        { "$ref": "#/$defs/packagePath" },
+        { "pattern": "\\.[mM][dD]$" }
+      ]
     }
   }
 }

@@ -67,7 +67,7 @@ guidance; installing a NuGet package alone never modifies agent instructions.
 consumer installation paths.
 The destination must be a relative `.md` path using forward slashes and ASCII
 letters, digits, dots, hyphens, or underscores. Empty segments, trailing dots,
-Windows device names, backslashes, and path traversal are rejected. Packing
+`.github` segments, Windows device names, backslashes, and path traversal are rejected. Packing
 also fails if either property is missing or the source file does not exist.
 If neither property is set, the helper does nothing.
 
@@ -139,6 +139,51 @@ no duplicates, at least one required or on-demand document), hashes each file,
 and packs the documents and the manifest. Documents appear in the manifest in
 the order the items are declared.
 
+### Link to guidance from another package
+
+With the item form, declare a virtual Markdown path when one guide links to a
+document published by another package:
+
+```xml
+<ItemGroup>
+  <PackageGuidanceItem Include="docs/start.md" PackagePath="guide/start.md"
+                       Usage="required" Description="Read before using Example.Library." />
+  <PackageGuidanceReference Include="guide/yarp.md"
+                            PackageId="Trellis.Yarp"
+                            DocumentPath="guides/yarp.md" />
+</ItemGroup>
+```
+
+The source guide uses an ordinary relative Markdown link such as
+`[YARP guidance](yarp.md#forwarding-actors)`. `Include` is a **virtual path in
+the source package's guidance namespace**; no duplicate file is packed there.
+`PackageId` and `DocumentPath` identify the exact document declared by the
+target package. Reference paths share the local document namespace, so they
+cannot collide with a `PackageGuidanceItem` path or directory prefix. Every
+package path uses `/` separators and cannot contain a `.github` segment.
+
+The publisher helper validates and writes the declaration, while
+`agentdocs validate --strict` verifies that a Markdown link actually uses it.
+It cannot validate another package at pack time. In a consumer repository,
+AgentDocs rewrites the parsed link destination only when the target package is
+both restored and approved, after verifying both packages' declared document
+hashes. If the target is absent, unapproved, or publishes no guidance, AgentDocs
+installs a generated unavailable notice at the virtual path without reading
+target content. A missing exact target document also produces a reason-coded
+notice and warning. A missing heading preserves the rewritten link and fragment
+and emits a warning. Consumers can promote either warning to failure with
+`--strict-references`.
+
+Raw HTML references, query strings, package self-references, and link spellings
+that differ from the declared path by case or Unicode normalization are contract
+errors. Reference declarations that no Markdown document uses are publisher
+warnings and materialize nothing. The target is resolved across the complete
+selected graph; references never add a dependency or grant target approval.
+
+Cross-package references currently require the `PackageGuidanceItem` form.
+They do not add a NuGet dependency: if the target should always be restored,
+declare the appropriate package dependency separately.
+
 ## Check your guidance before publishing
 
 The helper checks that the manifest is well formed. Run the
@@ -167,9 +212,9 @@ the manifest format.
   "Documentation" is not.
 - **Keep required documents stable.** Consumers review what your package asks
   agents to read; adding or changing required documents is visible to them.
-- **Use relative links inside your package only.** Each package installs into
-  its own directory, so a link to another package's file breaks. Refer to other
-  packages by ID and let the consumer's index list them.
+- **Use relative links to local documents or declared package references.**
+  Declare `PackageGuidanceReference` for a version-correct link to another
+  package; never escape the package directory or link to a moving branch.
 - **Never hard-code where a consumer installs your guide.**
 - **Pin the guide's line endings.** Git checks files out with CRLF on Windows and
   LF elsewhere, so the same commit packs different bytes on each OS. Consumers
@@ -186,8 +231,9 @@ Run `dotnet build Trellis.AgentDocs.slnx -c Release` and
 Run `pwsh build/test-packaging.ps1` to pack the helper and a third-party-style
 publisher into a local feed. The probe checks the packed document, its SHA-256
 manifest, `usage` and `description` (including characters that need escaping),
-absence of consumer-side build targets or leaked helper dependencies, and
-rejection of invalid paths, usages, descriptions and missing files.
+absence of consumer-side build targets or leaked helper dependencies,
+cross-package reference resolution, and rejection of invalid paths, usages,
+descriptions, references and missing files.
 Run `pwsh build/test-end-to-end.ps1` to exercise discovery, pending-by-default
 approval, explicit sync after package upgrades, project and solution graphs,
 and isolation of invalid manifests. Both scripts use only local feeds;

@@ -34,10 +34,12 @@ public sealed class GuidanceValidatorTests
 
     [Theory]
     [InlineData("{not json")]
-    [InlineData("{\"schemaVersion\":2,\"documents\":[]}")]
+    [InlineData("{\"schemaVersion\":3,\"documents\":[]}")]
     [InlineData("{\"schemaVersion\":1}")]
     [InlineData("{\"schemaVersion\":1,\"documents\":[],\"entryPoints\":[]}")]
     [InlineData("{\"schemaVersion\":1,\"documents\":[],\"publisherMetadata\":{\"lockstep\":true}}")]
+    [InlineData("{\"schemaVersion\":1,\"documents\":[],\"documentReferences\":{}}")]
+    [InlineData("{\"schemaVersion\":1,\"documents\":[],\"documentReferences\":[{\"path\":\"a.md\",\"packageId\":\"A\",\"documentPath\":\"b.md\",\"extra\":true}]}")]
     [InlineData("{\"schemaVersion\":1,\"schemaVersion\":1,\"documents\":[]}")]
     [InlineData("[]")]
     public void Malformed_manifests_are_AD001(string manifest)
@@ -50,6 +52,18 @@ public sealed class GuidanceValidatorTests
     public void An_empty_manifest_is_valid()
     {
         new Package().Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Schema_version_one_is_the_current_alpha_contract()
+    {
+        var files = new Dictionary<string, byte[]>
+        {
+            ["guidance/reference-manifest.json"] =
+                Encoding.UTF8.GetBytes("{\"schemaVersion\":1,\"documents\":[]}")
+        };
+
+        GuidanceValidator.Validate(files).Diagnostics.Should().BeEmpty();
     }
 
     [Fact]
@@ -172,6 +186,126 @@ public sealed class GuidanceValidatorTests
         var package = new Package()
             .Doc("guide.md", "# S\n", "required", "Read first.")
             .Doc("guide.md/inner.md", "# I\n", "onDemand", "Open when nested.");
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD007");
+    }
+
+    [Fact]
+    public void A_declared_cross_package_document_reference_satisfies_a_relative_Markdown_link()
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n\nSee [YARP](../trellis-api-yarp.md#forwarding-actors).\n",
+                "required", "Read first.")
+            .Reference("trellis-api-yarp.md", "Trellis.Yarp", "guides/trellis-api-yarp.md");
+
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void An_unused_cross_package_document_reference_warns_AD109()
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n", "required", "Read first.")
+            .Reference("trellis-api-yarp.md", "Trellis.Yarp", "guides/trellis-api-yarp.md");
+
+        package.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD109")
+            .Which.Path.Should().Be("trellis-api-yarp.md");
+    }
+
+    [Fact]
+    public void A_cross_package_document_reference_in_raw_HTML_is_not_rewritable()
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n\n<a href=\"../trellis-api-yarp.md\">YARP</a>\n",
+                "required", "Read first.")
+            .Reference("trellis-api-yarp.md", "Trellis.Yarp", "guides/trellis-api-yarp.md");
+
+        package.Validate().Diagnostics.Should().Contain(d =>
+            d.Code == "AD011" && d.Severity == GuidanceSeverity.Error &&
+            d.Message.Contains("raw HTML", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_cross_package_document_reference_with_a_query_is_AD011()
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n\n[YARP](../trellis-api-yarp.md?view=all)\n",
+                "required", "Read first.")
+            .Reference("trellis-api-yarp.md", "Trellis.Yarp", "guides/trellis-api-yarp.md");
+
+        package.Validate().Diagnostics.Should().ContainSingle(d =>
+            d.Code == "AD011" && d.Severity == GuidanceSeverity.Error);
+    }
+
+    [Fact]
+    public void A_cross_package_document_reference_must_use_the_exact_declared_spelling()
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n\n[YARP](../Trellis-API-Yarp.md)\n",
+                "required", "Read first.")
+            .Reference("trellis-api-yarp.md", "Trellis.Yarp", "guides/trellis-api-yarp.md");
+
+        package.Validate().Diagnostics.Should().ContainSingle(d =>
+            d.Code == "AD011" && d.Severity == GuidanceSeverity.Error &&
+            d.Message.Contains("exact declared spelling", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Angle_bracket_cross_package_destinations_and_titles_are_supported()
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n\n[YARP](<../trellis-api-yarp.md#forwarding-actors> \"Forwarding\")\n",
+                "required", "Read first.")
+            .Reference("trellis-api-yarp.md", "Trellis.Yarp", "guides/trellis-api-yarp.md");
+
+        package.Validate().Diagnostics.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_cross_package_document_reference_to_the_source_package_is_AD012()
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n\n[Alias](alias.md)\n", "required", "Read first.")
+            .Reference("guide/alias.md", "Source.Package", Start);
+
+        package.Validate(new GuidanceValidationOptions { SourcePackageId = "Source.Package" })
+            .Diagnostics.Should().ContainSingle(d =>
+                d.Code == "AD012" && d.Severity == GuidanceSeverity.Error);
+    }
+
+    [Fact]
+    public void Cross_package_document_references_without_a_local_document_are_AD006()
+    {
+        new Package()
+            .Reference("trellis-api-yarp.md", "Trellis.Yarp", "guides/trellis-api-yarp.md")
+            .Validate().Diagnostics.Should().Contain(d => d.Code == "AD006");
+    }
+
+    [Theory]
+    [InlineData("../escape.md", "Trellis.Yarp", "guides/yarp.md", "AD002")]
+    [InlineData("yarp.md", "bad package id", "guides/yarp.md", "AD001")]
+    [InlineData("yarp.md", "Trellis.Yarp", "../escape.md", "AD002")]
+    [InlineData("yarp.txt", "Trellis.Yarp", "guides/yarp.md", "AD002")]
+    [InlineData("guide\\yarp.md", "Trellis.Yarp", "guides/yarp.md", "AD002")]
+    [InlineData(".github/yarp.md", "Trellis.Yarp", "guides/yarp.md", "AD002")]
+    [InlineData("yarp.md", "Trellis.Yarp", "guides\\yarp.md", "AD002")]
+    [InlineData("yarp.md", "Trellis.Yarp", "guides/.github/yarp.md", "AD002")]
+    public void Invalid_cross_package_document_references_are_rejected(
+        string path, string packageId, string documentPath, string code)
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n", "required", "Read first.")
+            .Reference(path, packageId, documentPath);
+
+        package.Validate().Diagnostics.Should().Contain(d => d.Code == code);
+    }
+
+    [Fact]
+    public void Cross_package_document_reference_paths_cannot_alias_documents()
+    {
+        var package = new Package()
+            .Doc(Start, "# Start\n", "required", "Read first.")
+            .Reference(Start, "Trellis.Yarp", "guides/yarp.md");
+
         package.Validate().Diagnostics.Should().Contain(d => d.Code == "AD007");
     }
 
@@ -375,15 +509,15 @@ public sealed class GuidanceValidatorTests
         package.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD008").Which.Path.Should().Be(Start);
     }
 
-    [Fact]
-    public void Backslash_separated_manifest_paths_are_found_and_hash_checked()
+    [Theory]
+    [InlineData("guide\\start.md")]
+    [InlineData(".github/start.md")]
+    [InlineData("guide/.github/start.md")]
+    public void Unsafe_manifest_document_paths_are_AD002(string path)
     {
-        var package = new Package().Doc("guide\\start.md", "# S\n", "required", "Read first.", pack: false);
-        package.Files["guide/start.md"] = Encoding.UTF8.GetBytes("# S\n");
-        package.Validate().Diagnostics.Should().BeEmpty();
-
-        package.Files["guide/start.md"] = Encoding.UTF8.GetBytes("# Tampered\n");
-        package.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD003");
+        var package = new Package().Doc(path, "# S\n", "required", "Read first.", pack: false);
+        package.Files[path.Replace('\\', '/')] = Encoding.UTF8.GetBytes("# S\n");
+        package.Validate().Diagnostics.Should().ContainSingle(d => d.Code == "AD002");
     }
 
     [Fact]
@@ -827,6 +961,7 @@ public sealed class GuidanceValidatorTests
     private sealed class Package
     {
         private readonly List<string> _documents = [];
+        private readonly List<string> _references = [];
 
         public Dictionary<string, byte[]> Files { get; } = new(StringComparer.Ordinal);
 
@@ -851,8 +986,22 @@ public sealed class GuidanceValidatorTests
             return this;
         }
 
-        public byte[] Manifest() => Encoding.UTF8.GetBytes(
-            "{\"schemaVersion\":1,\"documents\":[" + string.Join(',', _documents) + "]}");
+        public Package Reference(string path, string packageId, string documentPath)
+        {
+            _references.Add("{\"path\":" + JsonSerializer.Serialize(path) +
+                ",\"packageId\":" + JsonSerializer.Serialize(packageId) +
+                ",\"documentPath\":" + JsonSerializer.Serialize(documentPath) + "}");
+            return this;
+        }
+
+        public byte[] Manifest()
+        {
+            var references = _references.Count == 0
+                ? ""
+                : ",\"documentReferences\":[" + string.Join(',', _references) + "]";
+            return Encoding.UTF8.GetBytes(
+                "{\"schemaVersion\":1,\"documents\":[" + string.Join(',', _documents) + "]" + references + "}");
+        }
 
         public GuidanceValidation Validate(GuidanceValidationOptions? options = null)
         {
