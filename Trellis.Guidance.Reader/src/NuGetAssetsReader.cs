@@ -148,6 +148,10 @@ internal static class NuGetAssetsReader
             if (parse.Issues.Count > 0)
                 return Outcome(parse.UnsupportedSchema ? GuidanceStatus.UnsupportedSchema : GuidanceStatus.InvalidManifest,
                     parse.Issues[0].Message);
+            if (parse.DocumentReferences.Any(reference =>
+                    string.Equals(reference.PackageId, id, StringComparison.OrdinalIgnoreCase)))
+                return Outcome(GuidanceStatus.InvalidManifest,
+                    $"document reference cannot target its own package ID '{id}'.");
 
             var documents = new List<GuidanceDocument>();
             foreach (var document in parse.Documents)
@@ -167,7 +171,13 @@ internal static class NuGetAssetsReader
             }
 
             return Outcome(GuidanceStatus.Valid,
-                contribution: new GuidanceContribution(documents, parse.PublisherMetadata));
+                contribution: new GuidanceContribution(documents, parse.PublisherMetadata)
+                {
+                    DocumentReferences = parse.DocumentReferences
+                        .Select(reference => new GuidanceDocumentReference(
+                            reference.Path, reference.PackageId, reference.DocumentPath))
+                        .ToArray()
+                });
         }
         catch (JsonException e)
         {

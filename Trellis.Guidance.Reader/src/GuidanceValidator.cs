@@ -3,6 +3,8 @@ namespace Trellis.Guidance.Reader;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
+using System.Xml;
+using System.Xml.Linq;
 
 /// <summary>How serious a validation diagnostic is.</summary>
 public enum GuidanceSeverity
@@ -14,7 +16,7 @@ public enum GuidanceSeverity
 }
 
 /// <summary>One finding from <see cref="GuidanceValidator"/>.</summary>
-/// <param name="Code">Stable identifier: AD001-AD010 for errors, AD101 and up for warnings.</param>
+/// <param name="Code">Stable identifier: AD001-AD012 for errors, AD101 and up for warnings.</param>
 /// <param name="Severity">Error or warning.</param>
 /// <param name="Path">Package-relative path the finding concerns, when there is one.</param>
 /// <param name="Line">One-based line in <paramref name="Path"/>, when known.</param>
@@ -32,6 +34,9 @@ public sealed record GuidanceValidationOptions
 
     /// <summary>Number of required and on-demand documents (index entries) above which AD107 is reported. Default 100.</summary>
     public int MaxIndexedDocuments { get; init; } = 100;
+
+    /// <summary>The publishing package ID, when known, used to reject cross-package references back to itself.</summary>
+    public string? SourcePackageId { get; init; }
 }
 
 /// <summary>The outcome of validating one package's guidance.</summary>
@@ -119,6 +124,14 @@ public static class GuidanceValidator
         var parse = ManifestCheck.Parse(manifestBytes);
         foreach (var issue in parse.Issues)
             Error(issue.Code, issue.Path ?? ManifestCheck.ManifestPath, issue.Message);
+        var sourcePackageId = options.SourcePackageId;
+        if (sourcePackageId is null && parse.DocumentReferences.Count != 0)
+            sourcePackageId = ReadSourcePackageId(source, Error);
+        if (sourcePackageId is not null)
+            foreach (var reference in parse.DocumentReferences.Where(reference =>
+                         string.Equals(reference.PackageId, sourcePackageId, StringComparison.OrdinalIgnoreCase)))
+                Error("AD012", reference.Path,
+                    $"A package cannot reference its own package ID '{sourcePackageId}'; use an ordinary local document link.");
 
         var readable = new List<GuidanceText>();
         var requiredBytes = 0L;
@@ -170,10 +183,69 @@ public static class GuidanceValidator
             readable.Add(new GuidanceText(canonical, document.Usage, text, document.Description, bytes.Length));
         }
 
-        DocumentAnalyzer.Analyse(source.Names, readable, requiredBytes, options, Warn);
+        DocumentAnalyzer.Analyse(source.Names, readable, parse.DocumentReferences, requiredBytes, options, Error, Warn);
         return new GuidanceValidation(diagnostics, parse.Documents.Count, requiredBytes);
     }
 
     private static string Decode(byte[] bytes) =>
         StrictUtf8.GetString(bytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? bytes[3..] : bytes);
+
+    private static string? ReadSourcePackageId(PackageSource source,
+        Action<string, string?, string, int?> error)
+    {
+        var nuspecs = source.Names.Where(path =>
+                !path.Contains('/') && path.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase))
+            .Order(StringComparer.Ordinal).ToArray();
+        if (nuspecs.Length == 0)
+            return null;
+        if (nuspecs.Length != 1)
+        {
+            error("AD001", null,
+                "The package has multiple root nuspec files, so its publishing package ID is ambiguous.", null);
+            return null;
+        }
+
+        var path = nuspecs[0];
+        if (source.LinkedPaths is { } linked && PackagePath.Chain(path).Any(linked.Contains))
+        {
+            error("AD001", path,
+                "The package nuspec is a link/reparse point, so its publishing package ID was not read.", null);
+            return null;
+        }
+
+        if (source.Read(path) is not { } bytes)
+            return null;
+        try
+        {
+            var settings = new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null,
+                MaxCharactersInDocument = 1024 * 1024
+            };
+            using var stream = new MemoryStream(bytes, writable: false);
+            using var reader = XmlReader.Create(stream, settings);
+            var document = XDocument.Load(reader, LoadOptions.None);
+            var metadata = document.Root?.Elements()
+                .Where(element => element.Name.LocalName == "metadata").ToArray() ?? [];
+            var ids = metadata.Length == 1
+                ? metadata[0].Elements().Where(element => element.Name.LocalName == "id").ToArray()
+                : [];
+            var packageId = ids.Length == 1 ? ids[0].Value.Trim() : "";
+            if (!ManifestCheck.ValidPackageId(packageId))
+            {
+                error("AD001", path,
+                    "The package nuspec does not contain one valid package ID in its metadata.", null);
+                return null;
+            }
+
+            return packageId;
+        }
+        catch (XmlException)
+        {
+            error("AD001", path,
+                "The package nuspec is not safe, well-formed XML, so its publishing package ID was not read.", null);
+            return null;
+        }
+    }
 }

@@ -106,6 +106,8 @@
     <ParameterGroup>
       <ManifestFile ParameterType="System.String" Required="true" />
       <Documents ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+      <DocumentReferences ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="false" />
+      <SourcePackageId ParameterType="System.String" Required="true" />
     </ParameterGroup>
     <Task>
       <Using Namespace="System.Collections.Generic" />
@@ -122,6 +124,7 @@
             var prefixes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var paths = new List<string>();
             var entries = new List<string>();
+            var referenceEntries = new List<string>();
             var anyListed = false;
             foreach (var item in Documents)
             {
@@ -132,10 +135,9 @@
                     usage = "onDemand";
                 var name = item.ItemSpec;
 
-                if (!Regex.IsMatch(path, @"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*\.md$") ||
-                    Regex.IsMatch(path, @"(^|/)[^/]+[.](/|$)|(?i)(^|/)(con|prn|aux|nul|com[1-9]|lpt[1-9])([.]|/|$)"))
+                if (!ValidPath(path))
                 {
-                    Log.LogError("PackageGuidanceItem '" + name + "': PackagePath '" + path + "' must be a portable relative Markdown path with forward slashes and no device names.");
+                    Log.LogError("PackageGuidanceItem '" + name + "': PackagePath '" + path + "' must be a portable relative Markdown path with forward slashes, no .github segments and no device names.");
                     ok = false;
                     continue;
                 }
@@ -237,6 +239,84 @@
                 entries.Add(json.ToString());
             }
 
+            foreach (var item in DocumentReferences ?? new Microsoft.Build.Framework.ITaskItem[0])
+            {
+                var path = item.ItemSpec;
+                var packageId = item.GetMetadata("PackageId");
+                var documentPath = item.GetMetadata("DocumentPath");
+                if (!ValidPath(path))
+                {
+                    Log.LogError("PackageGuidanceReference '" + path +
+                        "': Include must be a portable relative Markdown path with forward slashes, no .github segments and no device names.");
+                    ok = false;
+                    continue;
+                }
+
+                if (!seen.Add(path.Normalize(NormalizationForm.FormC)))
+                {
+                    Log.LogError("PackageGuidanceReference '" + path +
+                        "': Include collides with another guidance document or reference path.");
+                    ok = false;
+                    continue;
+                }
+
+                var segments = path.Split('/');
+                string aliased = null;
+                for (var i = 1; i <= segments.Length && aliased == null; i++)
+                {
+                    var original = string.Join("/", segments, 0, i);
+                    var normalized = original.Normalize(NormalizationForm.FormC);
+                    string previous;
+                    if (prefixes.TryGetValue(normalized, out previous) && previous != original)
+                        aliased = previous + "' and '" + original;
+                    else
+                        prefixes[normalized] = original;
+                }
+
+                if (aliased != null)
+                {
+                    Log.LogError("PackageGuidanceReference '" + path +
+                        "' collides with a differently spelled path ('" + aliased +
+                        "'); portable aliases are rejected.");
+                    ok = false;
+                    continue;
+                }
+
+                paths.Add(path.Normalize(NormalizationForm.FormC));
+                if (!Regex.IsMatch(packageId, @"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))
+                {
+                    Log.LogError("PackageGuidanceReference '" + path +
+                        "': PackageId must be a valid NuGet package ID of at most 100 ASCII characters.");
+                    ok = false;
+                    continue;
+                }
+
+                if (string.Equals(packageId, SourcePackageId, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.LogError("PackageGuidanceReference '" + path +
+                        "': PackageId must not target the publishing package itself.");
+                    ok = false;
+                    continue;
+                }
+
+                if (!ValidPath(documentPath))
+                {
+                    Log.LogError("PackageGuidanceReference '" + path +
+                        "': DocumentPath must be a portable relative Markdown path with forward slashes, no .github segments and no device names.");
+                    ok = false;
+                    continue;
+                }
+
+                var json = new StringBuilder("{\"path\":");
+                AppendString(json, path);
+                json.Append(",\"packageId\":");
+                AppendString(json, packageId);
+                json.Append(",\"documentPath\":");
+                AppendString(json, documentPath);
+                json.Append('}');
+                referenceEntries.Add(json.ToString());
+            }
+
             foreach (var path in paths)
             {
                 foreach (var other in paths)
@@ -260,9 +340,17 @@
             var directory = Path.GetDirectoryName(Path.GetFullPath(ManifestFile));
             if (!string.IsNullOrEmpty(directory))
                 Directory.CreateDirectory(directory);
-            File.WriteAllText(ManifestFile, "{\"schemaVersion\":1,\"documents\":[" + string.Join(",", entries) + "]}",
-                new UTF8Encoding(false));
+            var manifest = "{\"schemaVersion\":1,\"documents\":[" + string.Join(",", entries) + "]";
+            if (referenceEntries.Count > 0)
+                manifest += ",\"documentReferences\":[" + string.Join(",", referenceEntries) + "]";
+            File.WriteAllText(ManifestFile, manifest + "}", new UTF8Encoding(false));
             return true;
+        }
+
+        private static bool ValidPath(string path)
+        {
+            return Regex.IsMatch(path ?? "", @"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*\.md$") &&
+                !Regex.IsMatch(path, @"(^|/)[^/]+[.](/|$)|(?i)(^|/)([.]github|con|prn|aux|nul|com[1-9]|lpt[1-9])([.]|/|$)");
         }
 
         private static void AppendString(StringBuilder json, string value)
@@ -294,12 +382,19 @@
       <_PackageGuidanceManifest>$(IntermediateOutputPath)reference-manifest.json</_PackageGuidanceManifest>
     </PropertyGroup>
     <WriteAgentDocsGuidanceManifestFromItems ManifestFile="$(_PackageGuidanceManifest)"
-                                             Documents="@(PackageGuidanceItem)" />
+                                             Documents="@(PackageGuidanceItem)"
+                                             DocumentReferences="@(PackageGuidanceReference)"
+                                             SourcePackageId="$(PackageId)" />
     <ItemGroup>
       <None Include="@(PackageGuidanceItem)" Pack="true" />
       <None Include="$(_PackageGuidanceManifest)" Pack="true"
             PackagePath="guidance/reference-manifest.json" />
     </ItemGroup>
+  </Target>
+
+  <Target Name="ValidatePackageGuidanceReferenceForm" BeforeTargets="_GetPackageFiles"
+          Condition="'$(IsPackable)' != 'false' AND '@(PackageGuidanceReference)' != '' AND '@(PackageGuidanceItem)' == ''">
+    <Error Text="PackageGuidanceReference requires PackageGuidanceItem; use the item form instead of the single-document properties." />
   </Target>
 
   <Target Name="GeneratePackageGuidanceManifest" BeforeTargets="_GetPackageFiles"
@@ -311,8 +406,8 @@
     <Error Condition="'$(PackageGuidanceDocument)' == '' OR '$(PackageGuidancePath)' == ''"
            Text="Set both PackageGuidanceDocument and PackageGuidancePath to publish guidance." />
     <Error Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(PackageGuidancePath)', '^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*\.md$')) != 'True' OR
-                      $([System.Text.RegularExpressions.Regex]::IsMatch('$(PackageGuidancePath)', '(^|/)[^/]+[.](/|$)|(?i)(^|/)(con|prn|aux|nul|com[1-9]|lpt[1-9])([.]|/|$)')) == 'True'"
-           Text="PackageGuidancePath must be a portable relative Markdown path with forward slashes and no device names." />
+                      $([System.Text.RegularExpressions.Regex]::IsMatch('$(PackageGuidancePath)', '(^|/)[^/]+[.](/|$)|(?i)(^|/)([.]github|con|prn|aux|nul|com[1-9]|lpt[1-9])([.]|/|$)')) == 'True'"
+           Text="PackageGuidancePath must be a portable relative Markdown path with forward slashes, no .github segments and no device names." />
     <Error Condition="'$(PackageGuidanceUsage)' != 'required' AND '$(PackageGuidanceUsage)' != 'onDemand'"
            Text="PackageGuidanceUsage must be required or onDemand." />
     <Error Condition="'$(PackageGuidanceDescription)' == ''"

@@ -2,6 +2,7 @@
 
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -20,15 +21,19 @@ public static class Program
 internal enum AgentDocsVerb { Init, Sync, Check, Remove }
 
 internal sealed record AgentDocsRequest(AgentDocsVerb Verb, bool DryRun, bool Force, bool Restore, bool Strict,
-    IReadOnlyList<string> SourceRoots, IReadOnlyList<string> EntryPoints, bool ContentOnly = false);
+    bool StrictReferences, IReadOnlyList<string> SourceRoots, IReadOnlyList<string> EntryPoints,
+    bool ContentOnly = false);
 
 /// <summary>Declares which options and entry points a verb accepts, so an invalid combination for a
 /// given verb is rejected by construction rather than by a hand-maintained combinatorial check.</summary>
 internal readonly record struct VerbOptions(bool SourceRoot, bool DryRun, bool Force, bool Restore, bool Strict,
-    bool EntryPoints, bool RequireEntryPoints, bool ContentOnly = false);
+    bool StrictReferences, bool EntryPoints, bool RequireEntryPoints, bool ContentOnly = false);
 
 internal sealed record Source(string Package, string PackageVersion, string PackagePath, string Sha256);
-internal sealed record OwnedFile(string Path, string CanonicalSha256, Source[] Sources);
+internal sealed record ReferenceDependency(string ReferencePath, string TargetPackage, string TargetDocumentPath,
+    string Outcome, string? TargetVersion, string? TargetSha256);
+internal sealed record OwnedFile(string Path, string CanonicalSha256, Source[] Sources,
+    string TransformVersion, ReferenceDependency[] ReferenceDependencies);
 internal sealed record InstructionEntry(string InstructionFile, string CanonicalSha256, bool ExistedBefore = false);
 internal sealed record GraphPackage(string Id, string Version, string? ContentHash);
 internal sealed record GraphProject(string Project, string Framework, string? Runtime, GraphPackage[] Packages);
@@ -53,12 +58,26 @@ internal sealed record Change(string Path, byte[]? Before, byte[]? After, string
     public byte[]? Snapshot { get; init; } = Before is null ? null : SHA256.HashData(Before);
 }
 
+internal sealed class StagedMutation(Change change)
+{
+    public Change Change { get; } = change;
+    public string? StagedPath { get; set; }
+    public string? BackupPath { get; set; }
+    public bool OriginalMoved { get; set; }
+    public bool ReplacementMoved { get; set; }
+}
+
 /// <summary>Executes graph discovery and repository-scoped lifecycle operations.</summary>
 public static partial class AgentDocsCommand
 {
     private const string Start = "<!-- agentdocs:start -->";
     private const string End = "<!-- agentdocs:end -->";
     private const string VisualStudioInstructions = ".github/copilot-instructions.md";
+    private const int ContextSchemaVersion = 1;
+    private const string CanonicalTextTransform = "canonical-text-v1";
+    private const string DocumentReferenceTransform = "document-references-v1";
+    private const string ReferencePlaceholderTransform = "reference-placeholder-v1";
+    private const string GeneratedIndexTransform = "generated-index-v1";
     private static readonly UTF8Encoding Strict = new(false, true);
     private static readonly UTF8Encoding Bom = new(true, true);
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
@@ -91,7 +110,7 @@ public static partial class AgentDocsCommand
 
         if (args.Length < 1 || !TryParseVerb(args[0], out var verb))
         {
-            output.WriteLine("Usage: agentdocs init|sync|check|remove [--source-root DIR] [--dry-run] [--force] [--restore] [--strict] [--content-only] [PROJECT|SOLUTION]");
+            output.WriteLine("Usage: agentdocs init|sync|check|remove [--source-root DIR] [--dry-run] [--force] [--restore] [--strict] [--strict-references] [--content-only] [PROJECT|SOLUTION]");
             output.WriteLine(ValidateUsage);
             output.WriteLine("Avoid external edits to affected files during mutation; an edit after the final snapshot check may be lost.");
             return 2;
@@ -117,13 +136,17 @@ public static partial class AgentDocsCommand
     private static VerbOptions AllowedOptions(AgentDocsVerb verb) => verb switch
     {
         AgentDocsVerb.Init => new VerbOptions(SourceRoot: true, DryRun: true, Force: true, Restore: true, Strict: true,
+            StrictReferences: true,
             EntryPoints: true, RequireEntryPoints: true),
         AgentDocsVerb.Sync => new VerbOptions(SourceRoot: false, DryRun: true, Force: true, Restore: true, Strict: true,
+            StrictReferences: true,
             EntryPoints: false, RequireEntryPoints: false),
         AgentDocsVerb.Remove => new VerbOptions(SourceRoot: false, DryRun: true, Force: true, Restore: false, Strict: false,
+            StrictReferences: false,
             EntryPoints: false, RequireEntryPoints: false),
         AgentDocsVerb.Check => new VerbOptions(SourceRoot: false, DryRun: false,
-            Force: false, Restore: false, Strict: true, EntryPoints: false, RequireEntryPoints: false, ContentOnly: true),
+            Force: false, Restore: false, Strict: true, StrictReferences: true,
+            EntryPoints: false, RequireEntryPoints: false, ContentOnly: true),
         _ => throw new ArgumentOutOfRangeException(nameof(verb))
     };
 
@@ -134,6 +157,7 @@ public static partial class AgentDocsCommand
         var force = false;
         var restore = false;
         var strict = false;
+        var strictReferences = false;
         var contentOnly = false;
         var sourceRoots = new List<string>();
         var entryPoints = new List<string>();
@@ -149,6 +173,7 @@ public static partial class AgentDocsCommand
                 case "--force" when allowed.Force: force = true; break;
                 case "--restore" when allowed.Restore: restore = true; break;
                 case "--strict" when allowed.Strict: strict = true; break;
+                case "--strict-references" when allowed.StrictReferences: strictReferences = true; break;
                 case "--content-only" when allowed.ContentOnly: contentOnly = true; break;
                 default:
                     if (args[i].StartsWith('-'))
@@ -165,7 +190,8 @@ public static partial class AgentDocsCommand
         if (allowed.RequireEntryPoints && entryPoints.Count == 0)
             throw new ArgumentException($"{args[0]} requires an explicit project or solution.");
 
-        return new AgentDocsRequest(verb, dryRun, force, restore, strict, sourceRoots, entryPoints, contentOnly);
+        return new AgentDocsRequest(
+            verb, dryRun, force, restore, strict, strictReferences, sourceRoots, entryPoints, contentOnly);
     }
 
     private static int Execute(AgentDocsRequest request, TextWriter output, Func<IEnumerable<string>, Func<string, bool>, GuidanceDiscovery> discover)
@@ -211,7 +237,7 @@ public static partial class AgentDocsCommand
             ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             : LoadApprovedPackages(policyPath, output);
         (ContextState State, Dictionary<string, string> Content)? discovery = request.Verb == AgentDocsVerb.Remove ? null : BuildState(root,
-            graphEntries, explicitRoots, version, previous, discover, approved, output);
+            graphEntries, explicitRoots, version, previous, discover, approved, request.StrictReferences, output);
         var changes = Plan(root, previous, discovery?.State, discovery?.Content, manifestPath, request.Force);
         if (request.Verb == AgentDocsVerb.Init && !File.Exists(policyPath))
             changes.Insert(0, new Change(policyPath, null, PolicyTemplate(), "Create policy"));
@@ -254,42 +280,32 @@ public static partial class AgentDocsCommand
 
         if (request.DryRun || changes.Count == 0)
             return 0;
-        ProbeAtomic(root, changes.Select(change => change.Path));
-        foreach (var change in changes)
-        {
-            EnsureDirectoriesSafe(root, Path.GetDirectoryName(change.Path)!);
-            var current = File.Exists(change.Path) ? File.ReadAllBytes(change.Path) : null;
-            if (!Equal(current is null ? null : SHA256.HashData(current), change.Snapshot))
-                throw new InvalidOperationException($"Concurrent change detected: {change.Path}");
-            if (change.After is null)
-            {
-                var staged = Path.Combine(Path.GetDirectoryName(change.Path)!, "." + Guid.NewGuid().ToString("N") + ".remove");
-                File.Move(change.Path, staged);
-                File.Delete(staged);
-                continue;
-            }
-
-            Directory.CreateDirectory(Path.GetDirectoryName(change.Path)!);
-            var temp = Path.Combine(Path.GetDirectoryName(change.Path)!, "." + Guid.NewGuid().ToString("N") + ".stage");
-            try
-            {
-                File.WriteAllBytes(temp, change.After);
-                File.Move(temp, change.Path, overwrite: current is not null);
-            }
-            finally
-            {
-                if (File.Exists(temp))
-                    File.Delete(temp);
-            }
-        }
+        var cleanupWarning = ApplyChanges(root, changes);
+        if (cleanupWarning is not null)
+            output.WriteLine(cleanupWarning);
 
         return 0;
+    }
+
+    private static bool EquivalentGuidance(GuidanceContribution? first, GuidanceContribution? second)
+    {
+        if (first is null || second is null)
+            return first is null && second is null;
+        return first.Documents.Select(document =>
+                (document.Identity.PackagePath, document.Sha256, document.Usage, document.Description))
+            .SequenceEqual(second.Documents.Select(document =>
+                (document.Identity.PackagePath, document.Sha256, document.Usage, document.Description))) &&
+            first.DocumentReferences.SequenceEqual(second.DocumentReferences) &&
+            first.PublisherMetadata.Count == second.PublisherMetadata.Count &&
+            first.PublisherMetadata.All(pair =>
+                second.PublisherMetadata.TryGetValue(pair.Key, out var value) &&
+                JsonElement.DeepEquals(pair.Value, value));
     }
 
     private static (ContextState State, Dictionary<string, string> Content) BuildState(string root, string[] entries,
         string[] explicitRoots, string version, ContextState? previous,
         Func<IEnumerable<string>, Func<string, bool>, GuidanceDiscovery> discover, HashSet<string> approved,
-        TextWriter output)
+        bool strictReferences, TextWriter output)
     {
         var projects = entries.SelectMany(entry => Projects(entry, root)).Distinct(Portable)
             .OrderBy(p => p, StringComparer.Ordinal).ToArray();
@@ -319,6 +335,7 @@ public static partial class AgentDocsCommand
         var packages = guidance.Packages.Select(p => p.Contribution is not null && !approved.Contains(p.PackageId)
             ? p with { Status = GuidanceStatus.NotLoaded, Contribution = null, ManifestDeclared = true }
             : p).ToArray();
+        var packageFamilies = packages.ToLookup(package => package.PackageId, Portable);
         var incompatibilities = new List<string>();
         if (guidance.Diagnostics.Count != 0 || packages.Any(p =>
                 p.Status is not (GuidanceStatus.Valid or GuidanceStatus.NoManifest or GuidanceStatus.NotLoaded)))
@@ -332,18 +349,40 @@ public static partial class AgentDocsCommand
                 incompatibilities.Add($"Package assets are missing: {package.PackageId}/{package.Version}");
         }
 
-        foreach (var family in packages.GroupBy(p => p.PackageId, StringComparer.OrdinalIgnoreCase))
-            if (family.Any(p => p.Contribution is not null) &&
-                family.Select(p => p.Version).Distinct(StringComparer.OrdinalIgnoreCase).Skip(1).Any())
-                incompatibilities.Add($"Mixed versions of {family.Key}: " +
-                    string.Join(", ", family.Select(p => p.Version).Distinct(StringComparer.OrdinalIgnoreCase)
-                        .OrderBy(v => v, StringComparer.Ordinal)) + "; select a graph with one version per package.");
+        string MixedVersionMessage(string packageId, IEnumerable<GuidancePackage> family)
+        {
+            var locations = family.Select(package =>
+                    $"{package.Version} ({Rel(root, package.Scope.ProjectPath)})")
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(value => value, StringComparer.Ordinal).ToArray();
+            return $"Mixed versions of {packageId}: " + string.Join(", ", locations) +
+                "; select a graph with one version per package.";
+        }
+
+        foreach (var family in packageFamilies)
+        {
+            var versions = family.Select(p => p.Version).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            if (versions.Length < 2 || !family.Any(p => p.Contribution is not null))
+                continue;
+            incompatibilities.Add(MixedVersionMessage(family.Key, family));
+        }
         if (incompatibilities.Count != 0)
             throw new InvalidOperationException(string.Join(Environment.NewLine, incompatibilities));
 
+        foreach (var family in packageFamilies)
+            foreach (var resolvedVersion in family.Where(package => package.Status != GuidanceStatus.NotLoaded)
+                         .GroupBy(package => package.Version, Portable))
+            {
+                var first = resolvedVersion.First();
+                if (resolvedVersion.Skip(1).Any(package => !EquivalentGuidance(first.Contribution, package.Contribution)))
+                    throw new InvalidOperationException(
+                        $"Conflicting contributions for {first.PackageId}/{first.Version}. " +
+                        "Conflicting guidance metadata or document/reference declarations across selected scopes.");
+            }
+
         var previouslyDocumented = previous?.References.SelectMany(reference => reference.Sources)
             .Select(source => source.Package).ToHashSet(Portable) ?? new HashSet<string>(Portable);
-        foreach (var family in packages.GroupBy(p => p.PackageId, Portable))
+        foreach (var family in packageFamilies)
         {
             if (!previouslyDocumented.Contains(family.Key))
                 continue;
@@ -371,38 +410,218 @@ public static partial class AgentDocsCommand
         var instructionFiles = InstructionFiles(root, entries).ToArray();
         var mapped = new Dictionary<string, (string Text, List<Source> Sources)>(Portable);
         var listings = new Dictionary<string, GuideListing>(Portable);
-        foreach (var package in packages.Where(p => p.Contribution is not null))
-        for (var documentIndex = 0; documentIndex < package.Contribution!.Documents.Count; documentIndex++)
+        var dependencies = new Dictionary<string, List<ReferenceDependency>>(Portable);
+        var transformVersions = new Dictionary<string, string>(Portable);
+        foreach (var package in packages.Where(p => p.Contribution is not null)
+                     .OrderBy(p => p.PackageId, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(p => p.PackageId, StringComparer.Ordinal)
+                     .ThenBy(p => p.Version, StringComparer.Ordinal)
+                     .ThenBy(p => p.Scope.ProjectPath, StringComparer.Ordinal))
+            for (var documentIndex = 0; documentIndex < package.Contribution!.Documents.Count; documentIndex++)
+            {
+                var document = package.Contribution.Documents[documentIndex];
+                if (!document.Identity.PackagePath.EndsWith(".md", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"Non-Markdown guidance: {document.Identity.PackagePath}");
+                var relative = InstalledPackagePath(package.PackageId, document.Identity.PackagePath);
+                var portablePath = relative.Normalize(NormalizationForm.FormC);
+                var bytes = File.ReadAllBytes(document.LocalPath);
+                if (Hash(bytes) != document.Sha256)
+                    throw new InvalidOperationException($"Package hash mismatch: {package.PackageId}/{document.Identity.PackagePath}");
+                var text = Canonical(bytes);
+                var source = new Source(package.PackageId, package.Version, document.Identity.PackagePath, document.Sha256);
+                var existingPath = mapped.Keys.FirstOrDefault(p => Portable.Equals(p.Normalize(NormalizationForm.FormC), portablePath));
+                if (existingPath is not null)
+                {
+                    var existing = mapped[existingPath];
+                    if (existing.Text != text || !string.Equals(relative, existingPath, StringComparison.Ordinal))
+                        throw new InvalidOperationException($"Conflicting contributions to {relative}: {existing.Sources[0].Package}, {package.PackageId}");
+                    existing.Sources.Add(source);
+                    if (listings[existingPath] is { } listed &&
+                        (listed.Description != (document.Description ?? "") || listed.Usage != document.Usage))
+                        throw new InvalidOperationException($"Conflicting guidance metadata for {relative}.");
+                }
+                else
+                {
+                    mapped.Add(relative, (text, [source]));
+                    dependencies.Add(relative, []);
+                    transformVersions.Add(relative, CanonicalTextTransform);
+                    listings.Add(relative, new GuideListing(relative, package.PackageId, package.Version,
+                        document.Description ?? "", document.Usage, documentIndex));
+                }
+            }
+
+        var rewrittenDocuments = new Dictionary<string, string>(Portable);
+        var referenceWarnings = new List<string>();
+        foreach (var package in packages.Where(p => p.Contribution?.DocumentReferences.Count > 0)
+                     .OrderBy(p => p.PackageId, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(p => p.PackageId, StringComparer.Ordinal)
+                     .ThenBy(p => p.Version, StringComparer.Ordinal)
+                     .ThenBy(p => p.Scope.ProjectPath, StringComparer.Ordinal))
         {
-            var document = package.Contribution.Documents[documentIndex];
-            if (!document.Identity.PackagePath.EndsWith(".md", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException($"Non-Markdown guidance: {document.Identity.PackagePath}");
-            var relative = "packages/" + SafeComponent(package.PackageId) + "/" +
-                document.Identity.PackagePath.Replace('\\', '/');
-            ValidateRelative(relative);
-            var portablePath = relative.Normalize(NormalizationForm.FormC);
-            var bytes = File.ReadAllBytes(document.LocalPath);
-            if (Hash(bytes) != document.Sha256)
-                throw new InvalidOperationException($"Package hash mismatch: {package.PackageId}/{document.Identity.PackagePath}");
-            var text = Canonical(bytes);
-            var source = new Source(package.PackageId, package.Version, document.Identity.PackagePath, document.Sha256);
-            var existingPath = mapped.Keys.FirstOrDefault(p => Portable.Equals(p.Normalize(NormalizationForm.FormC), portablePath));
+            foreach (var reference in package.Contribution!.DocumentReferences)
+            {
+                ValidateRelative(reference.Path, allowInstructionPath: false);
+                ValidateRelative(reference.DocumentPath, allowInstructionPath: false);
+            }
+
+            if (package.Contribution.DocumentReferences.Any(reference =>
+                    Portable.Equals(reference.PackageId, package.PackageId)))
+                throw new InvalidOperationException(
+                    $"Package '{package.PackageId}/{package.Version}' cannot reference its own package ID.");
+
+            var referencePaths = package.Contribution.DocumentReferences
+                .Select(reference => reference.Path).ToHashSet(StringComparer.Ordinal);
+            var analyses = new Dictionary<string, DocumentReferenceAnalysis>(StringComparer.Ordinal);
+            var usedReferences = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var document in package.Contribution.Documents)
+            {
+                var relative = InstalledPackagePath(package.PackageId, document.Identity.PackagePath);
+                var analysis = DocumentAnalyzer.AnalyseDocumentReferences(
+                    document.Identity.PackagePath, mapped[relative].Text, referencePaths);
+                if (analysis.Problems.Count != 0)
+                    throw new InvalidOperationException(
+                        $"Package '{package.PackageId}/{package.Version}' document " +
+                        $"'{document.Identity.PackagePath}' line {analysis.Problems[0].Line}: " +
+                        analysis.Problems[0].Message);
+                analyses.Add(document.Identity.PackagePath, analysis);
+                foreach (var use in analysis.Uses)
+                    usedReferences.Add(use.ReferencePath);
+            }
+
+            var resolvedReferences = new Dictionary<string, DocumentReferenceTarget>(StringComparer.Ordinal);
+            var outcomes = new Dictionary<string, ReferenceDependency>(StringComparer.Ordinal);
+            void RecordUnavailableReference(GuidanceDocumentReference reference, string targetPackageId,
+                string outcome, string? targetVersion = null)
+            {
+                var dependency = new ReferenceDependency(
+                    reference.Path, targetPackageId, reference.DocumentPath, outcome, targetVersion, null);
+                outcomes.Add(reference.Path, dependency);
+                AddReferencePlaceholder(package, reference, dependency);
+                referenceWarnings.Add(
+                    $"{package.PackageId}/{reference.Path}: {targetPackageId}/{reference.DocumentPath} is {outcome}.");
+            }
+
+            foreach (var reference in package.Contribution.DocumentReferences
+                         .Where(reference => usedReferences.Contains(reference.Path)))
+            {
+                var candidates = packageFamilies[reference.PackageId]
+                    .OrderBy(candidate => candidate.PackageId, StringComparer.Ordinal)
+                    .ThenBy(candidate => candidate.Version, StringComparer.Ordinal)
+                    .ThenBy(candidate => candidate.Scope.ProjectPath, StringComparer.Ordinal)
+                    .ToArray();
+                var candidateVersions = candidates.Select(candidate => candidate.Version)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                if (approved.Contains(reference.PackageId) && candidateVersions.Length > 1)
+                    throw new InvalidOperationException(MixedVersionMessage(
+                        candidates[0].PackageId, candidates));
+                var outcome = candidates.Length == 0
+                    ? "not-restored"
+                    : !approved.Contains(reference.PackageId) ||
+                      candidates.All(candidate => candidate.Status == GuidanceStatus.NotLoaded)
+                        ? "not-approved"
+                        : candidates.All(candidate => candidate.Contribution is null)
+                            ? "no-guidance"
+                            : null;
+                if (outcome is not null)
+                {
+                    var targetPackageId = candidates.Length == 0
+                        ? reference.PackageId
+                        : candidates[0].PackageId;
+                    RecordUnavailableReference(reference, targetPackageId, outcome);
+                    continue;
+                }
+
+                var targetPackage = candidates.First(candidate => candidate.Contribution is not null);
+                var targetDocument = targetPackage.Contribution!.Documents.SingleOrDefault(document =>
+                    string.Equals(document.Identity.PackagePath, reference.DocumentPath, StringComparison.Ordinal));
+                if (targetDocument is null)
+                {
+                    RecordUnavailableReference(reference, targetPackage.PackageId,
+                        "document-missing", targetPackage.Version);
+                    continue;
+                }
+
+                var targetRelative = InstalledPackagePath(targetPackage.PackageId, targetDocument.Identity.PackagePath);
+                if (!mapped.TryGetValue(targetRelative, out var target))
+                    throw new InvalidOperationException(
+                        $"Resolved cross-package document is not installed: {reference.PackageId}/{reference.DocumentPath}.");
+                if (!resolvedReferences.TryAdd(reference.Path,
+                        new DocumentReferenceTarget(targetRelative, target.Text)))
+                    throw new InvalidOperationException(
+                        $"Duplicate cross-package document reference path '{reference.Path}' in {package.PackageId}.");
+                outcomes.Add(reference.Path, new ReferenceDependency(
+                    reference.Path, targetPackage.PackageId, targetDocument.Identity.PackagePath,
+                    "resolved", targetPackage.Version, targetDocument.Sha256));
+            }
+
+            foreach (var document in package.Contribution.Documents)
+            {
+                var relative = InstalledPackagePath(package.PackageId, document.Identity.PackagePath);
+                var original = mapped[relative].Text;
+                var analysis = analyses[document.Identity.PackagePath];
+                var documentDependencies = analysis.Uses.Select(use => use.ReferencePath)
+                    .Distinct(StringComparer.Ordinal)
+                    .Select(path => outcomes[path])
+                    .ToArray();
+                if (documentDependencies.Length != 0)
+                {
+                    dependencies[relative].AddRange(documentDependencies);
+                    transformVersions[relative] = DocumentReferenceTransform;
+                }
+
+                var rewritten = DocumentAnalyzer.RewriteDocumentReferences(
+                    relative, original, analysis, resolvedReferences,
+                    (use, message) => referenceWarnings.Add(
+                        $"{package.PackageId}/{document.Identity.PackagePath}:{use.Line}: {message}"));
+                if (rewrittenDocuments.TryGetValue(relative, out var priorRewrite) && priorRewrite != rewritten)
+                    throw new InvalidOperationException(
+                        $"Cross-package document references for {package.PackageId}/{document.Identity.PackagePath} " +
+                        "resolve differently across the selected project graph.");
+                rewrittenDocuments[relative] = rewritten;
+            }
+        }
+
+        var orderedReferenceWarnings = referenceWarnings.Distinct(StringComparer.Ordinal)
+            .OrderBy(warning => warning, StringComparer.Ordinal).ToArray();
+        foreach (var warning in orderedReferenceWarnings)
+            output.WriteLine("AgentDocs reference warning: " + warning);
+        if (strictReferences && orderedReferenceWarnings.Length != 0)
+            throw new InvalidOperationException(
+                $"{orderedReferenceWarnings.Length} cross-package reference warning(s); --strict-references refuses to update.");
+
+        foreach (var rewritten in rewrittenDocuments)
+        {
+            var original = mapped[rewritten.Key];
+            mapped[rewritten.Key] = (rewritten.Value, original.Sources);
+        }
+
+        void AddReferencePlaceholder(GuidancePackage sourcePackage, GuidanceDocumentReference reference,
+            ReferenceDependency dependency)
+        {
+            var relative = InstalledPackagePath(sourcePackage.PackageId, reference.Path);
+            var text = "# Cross-package guidance unavailable\n\n" +
+                $"Target: {CodeSpan(dependency.TargetPackage + "/" + dependency.TargetDocumentPath)}\n\n" +
+                $"Reason: `{dependency.Outcome}`\n\n" +
+                "Source guidance remains available without this page. No target guidance is installed here.\n";
+            var source = new Source(
+                sourcePackage.PackageId, sourcePackage.Version, reference.Path, HashText(text));
+            var existingPath = mapped.Keys.FirstOrDefault(path =>
+                Portable.Equals(path.Normalize(NormalizationForm.FormC),
+                    relative.Normalize(NormalizationForm.FormC)));
             if (existingPath is not null)
             {
                 var existing = mapped[existingPath];
                 if (existing.Text != text || !string.Equals(relative, existingPath, StringComparison.Ordinal))
-                    throw new InvalidOperationException($"Conflicting contributions to {relative}: {existing.Sources[0].Package}, {package.PackageId}");
+                    throw new InvalidOperationException(
+                        $"Conflicting local document and cross-package reference at {relative}.");
                 existing.Sources.Add(source);
-                if (listings[existingPath] is { } listed &&
-                    (listed.Description != (document.Description ?? "") || listed.Usage != document.Usage))
-                    throw new InvalidOperationException($"Conflicting guidance metadata for {relative}.");
+                dependencies[existingPath].Add(dependency);
+                return;
             }
-            else
-            {
-                mapped.Add(relative, (text, [source]));
-                listings.Add(relative, new GuideListing(relative, package.PackageId, package.Version,
-                    document.Description ?? "", document.Usage, documentIndex));
-            }
+
+            mapped.Add(relative, (text, [source]));
+            dependencies.Add(relative, [dependency]);
+            transformVersions.Add(relative, ReferencePlaceholderTransform);
         }
 
         var orderedListings = listings.Values.OrderBy(p => p.Package, StringComparer.OrdinalIgnoreCase)
@@ -411,7 +630,11 @@ public static partial class AgentDocsCommand
         var references = mapped.OrderBy(pair => pair.Key, StringComparer.Ordinal)
             .Select(pair => new OwnedFile(pair.Key, HashText(pair.Value.Text),
                 pair.Value.Sources.Distinct().OrderBy(s => s.Package, StringComparer.Ordinal)
-                    .ThenBy(s => s.PackagePath, StringComparer.Ordinal).ToArray())).ToArray();
+                    .ThenBy(s => s.PackagePath, StringComparer.Ordinal).ToArray(),
+                transformVersions[pair.Key],
+                dependencies[pair.Key].Distinct().OrderBy(dependency => dependency.ReferencePath, StringComparer.Ordinal)
+                    .ThenBy(dependency => dependency.TargetPackage, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(dependency => dependency.TargetDocumentPath, StringComparer.Ordinal).ToArray())).ToArray();
         var content = mapped.ToDictionary(pair => pair.Key, pair => pair.Value.Text, Portable);
 
         var enabled = orderedListings.Where(l => l.Usage != GuidanceUsage.Supporting)
@@ -439,13 +662,19 @@ public static partial class AgentDocsCommand
         PrintSummary(output, groups, orderedListings, content, indexText, pending);
 
         var graph = BuildGraph(root, entries, guidance);
-        var state = new ContextState(2, "utf8-lf-no-bom-v1", version, roots, graph,
+        var state = new ContextState(ContextSchemaVersion, "utf8-lf-no-bom-v1", version, roots, graph,
             instructionFiles.Select(p => new InstructionEntry(Rel(root, p), HashText(Entry(root, p)),
                 previous?.InstructionEntries.SingleOrDefault(e => Portable.Equals(e.InstructionFile, Rel(root, p)))?.ExistedBefore
                 ?? File.Exists(p))).ToArray(),
             [], references, explicitRoots.OrderBy(p => p, StringComparer.Ordinal).ToArray());
         content["README.md"] = indexText;
-        return (state with { ToolOwnedFiles = [new OwnedFile("README.md", HashText(indexText), [])] }, content);
+        return (state with
+        {
+            ToolOwnedFiles =
+            [
+                new OwnedFile("README.md", HashText(indexText), [], GeneratedIndexTransform, [])
+            ]
+        }, content);
     }
 
     private static void PrintSummary(TextWriter output, IReadOnlyList<IndexGroup> groups,
@@ -929,7 +1158,7 @@ public static partial class AgentDocsCommand
         "8. After changing package references, versions, or restore inputs, run `dotnet restore` and `dotnet tool run agentdocs sync` before further package-specific work."
     ];
 
-    /// <summary>Renders publisher-supplied text as an inline code span so it is inert Markdown.</summary>
+    /// <summary>Renders untrusted text as an inline code span so it is inert Markdown.</summary>
     private static string CodeSpan(string value)
     {
         value = value.Replace("\r", " ").Replace("\n", " ").Replace('\u0085', ' ').Replace('\u2028', ' ').Replace('\u2029', ' ');
@@ -1109,7 +1338,10 @@ public static partial class AgentDocsCommand
                     "with that version, or delete .agentdocs and the restore imports it added, then run init again.");
         var state = JsonSerializer.Deserialize<ContextState>(text, Json)
             ?? throw new InvalidOperationException("Empty context manifest.");
-        if (state.SchemaVersion != 2 || state.TextHashFormat != "utf8-lf-no-bom-v1" ||
+        if (state.SchemaVersion != ContextSchemaVersion)
+            throw new InvalidOperationException(
+                $"Unsupported context schemaVersion {state.SchemaVersion}; expected {ContextSchemaVersion}.");
+        if (state.TextHashFormat != "utf8-lf-no-bom-v1" ||
             state.Graph is null || state.InstructionEntries is null || state.References is null ||
             state.ToolOwnedFiles is null || state.SourceRoots is null ||
             state.ExplicitSourceRoots is null)
@@ -1122,6 +1354,23 @@ public static partial class AgentDocsCommand
             ValidateRelative(item.Path);
             if (item.CanonicalSha256.Length != 64 || !item.CanonicalSha256.All(Uri.IsHexDigit))
                 throw new InvalidOperationException("Invalid owned-file hash.");
+            if (string.IsNullOrWhiteSpace(item.TransformVersion) || item.ReferenceDependencies is null)
+                throw new InvalidOperationException("Invalid owned-file transform state.");
+            foreach (var dependency in item.ReferenceDependencies)
+            {
+                if (dependency is null)
+                    throw new InvalidOperationException("Invalid cross-package reference dependency.");
+                ValidateRelative(dependency.ReferencePath, allowInstructionPath: false);
+                ValidateRelative(dependency.TargetDocumentPath, allowInstructionPath: false);
+                if (dependency.Outcome is not ("resolved" or "not-restored" or "not-approved" or
+                    "no-guidance" or "document-missing"))
+                    throw new InvalidOperationException("Invalid cross-package reference outcome.");
+                if (dependency.Outcome == "resolved" &&
+                    (string.IsNullOrWhiteSpace(dependency.TargetVersion) ||
+                     dependency.TargetSha256 is null || dependency.TargetSha256.Length != 64 ||
+                     !dependency.TargetSha256.All(Uri.IsHexDigit)))
+                    throw new InvalidOperationException("Invalid resolved cross-package reference dependency.");
+            }
         }
 
         foreach (var reference in state.References)
@@ -1283,6 +1532,209 @@ public static partial class AgentDocsCommand
             throw new InvalidOperationException($"No existing destination parent for {destination}.");
         }).Distinct(Physical).OrderBy(directory => directory, StringComparer.Ordinal).ToArray();
 
+    private static string? ApplyChanges(string root, IReadOnlyList<Change> changes)
+    {
+        ProbeAtomic(root, changes.Select(change => change.Path));
+        var mutations = changes.Select(change => new StagedMutation(change)).ToArray();
+        var createdDirectories = new HashSet<string>(Physical);
+        Exception? failure = null;
+        var recoveryErrors = new List<Exception>();
+        try
+        {
+            foreach (var mutation in mutations)
+            {
+                var change = mutation.Change;
+                var directory = Path.GetDirectoryName(change.Path)!;
+                EnsureDirectoriesSafe(root, directory);
+                var current = File.Exists(change.Path) ? File.ReadAllBytes(change.Path) : null;
+                if (!Equal(current is null ? null : SHA256.HashData(current), change.Snapshot))
+                    throw new InvalidOperationException($"Concurrent change detected: {change.Path}");
+                if (change.After is null)
+                    continue;
+
+                CreateDirectoryTracked(root, directory, createdDirectories);
+                mutation.StagedPath = Path.Combine(directory, "." + Guid.NewGuid().ToString("N") + ".stage");
+                File.WriteAllBytes(mutation.StagedPath, change.After);
+            }
+
+            foreach (var mutation in mutations)
+            {
+                var change = mutation.Change;
+                var current = File.Exists(change.Path) ? File.ReadAllBytes(change.Path) : null;
+                if (!Equal(current is null ? null : SHA256.HashData(current), change.Snapshot))
+                    throw new InvalidOperationException($"Concurrent change detected: {change.Path}");
+
+                if (current is not null)
+                {
+                    mutation.BackupPath = Path.Combine(
+                        Path.GetDirectoryName(change.Path)!, "." + Guid.NewGuid().ToString("N") + ".rollback");
+                    File.Move(change.Path, mutation.BackupPath);
+                    mutation.OriginalMoved = true;
+                }
+
+                if (change.After is null)
+                    continue;
+                File.Move(mutation.StagedPath!, change.Path);
+                mutation.ReplacementMoved = true;
+                mutation.StagedPath = null;
+            }
+        }
+        catch (Exception error)
+        {
+            failure = error;
+            foreach (var mutation in mutations.Reverse())
+            {
+                try
+                {
+                    if (mutation.ReplacementMoved && File.Exists(mutation.Change.Path))
+                        File.Delete(mutation.Change.Path);
+                    if (mutation.OriginalMoved && mutation.BackupPath is not null &&
+                        File.Exists(mutation.BackupPath))
+                        File.Move(mutation.BackupPath, mutation.Change.Path);
+                }
+                catch (Exception recoveryError)
+                {
+                    recoveryErrors.Add(recoveryError);
+                }
+            }
+        }
+        finally
+        {
+            foreach (var mutation in mutations)
+            {
+                try
+                {
+                    if (mutation.StagedPath is not null && File.Exists(mutation.StagedPath))
+                        File.Delete(mutation.StagedPath);
+                }
+                catch (Exception cleanupError)
+                {
+                    recoveryErrors.Add(cleanupError);
+                }
+            }
+
+            if (failure is not null)
+                RemoveCreatedDirectories(root, createdDirectories, recoveryErrors);
+        }
+
+        if (failure is not null)
+        {
+            if (recoveryErrors.Count != 0)
+                throw new InvalidOperationException(
+                    "The update failed and AgentDocs could not completely restore the prior state.",
+                    new AggregateException([failure, .. recoveryErrors]));
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+
+        return CompleteSuccessfulApply(root,
+            mutations.Where(mutation => mutation.BackupPath is not null)
+                .Select(mutation => mutation.BackupPath!),
+            changes.Where(change => change.After is null).Select(change => change.Path),
+            File.Delete);
+    }
+
+    private static void CreateDirectoryTracked(string root, string directory, HashSet<string> createdDirectories)
+    {
+        Inside(root, directory);
+        var missing = new List<string>();
+        for (var current = directory;
+             !Physical.Equals(current, root) && !Directory.Exists(current);
+             current = Path.GetDirectoryName(current)!)
+            missing.Add(current);
+
+        try
+        {
+            Directory.CreateDirectory(directory);
+        }
+        finally
+        {
+            foreach (var path in missing.Where(Directory.Exists))
+                createdDirectories.Add(path);
+        }
+    }
+
+    private static void RemoveCreatedDirectories(string root, IEnumerable<string> createdDirectories,
+        List<Exception> recoveryErrors)
+    {
+        foreach (var directory in createdDirectories.OrderByDescending(path => path.Length))
+            try
+            {
+                EnsureDirectoriesSafe(root, directory);
+                if (Directory.Exists(directory) && !Directory.EnumerateFileSystemEntries(directory).Any())
+                    Directory.Delete(directory);
+            }
+            catch (Exception cleanupError)
+            {
+                recoveryErrors.Add(cleanupError);
+            }
+    }
+
+    private static string? CompleteSuccessfulApply(string root, IEnumerable<string> backupPaths,
+        IEnumerable<string> removedFiles, Action<string> deleteBackup, Action<string>? deleteDirectory = null)
+    {
+        var cleanupErrors = 0;
+        foreach (var backupPath in backupPaths)
+            try
+            {
+                if (File.Exists(backupPath))
+                    deleteBackup(backupPath);
+            }
+            catch (Exception)
+            {
+                cleanupErrors++;
+            }
+
+        var directoryErrors = PruneEmptyPackageDirectories(root, removedFiles, deleteDirectory ?? Directory.Delete);
+        if (cleanupErrors == 0 && directoryErrors.Count == 0)
+            return null;
+
+        var warnings = new List<string>();
+        if (cleanupErrors != 0)
+        {
+            var noun = cleanupErrors == 1 ? "file" : "files";
+            warnings.Add($"could not remove {cleanupErrors} rollback {noun}. " +
+                "Remove leftover .rollback files before committing.");
+        }
+        if (directoryErrors.Count != 0)
+        {
+            var noun = directoryErrors.Count == 1 ? "directory" : "directories";
+            warnings.Add($"could not prune {directoryErrors.Count} empty package {noun}: " +
+                string.Join("; ", directoryErrors));
+        }
+        return "AgentDocs warning: update completed, but " + string.Join(" ", warnings);
+    }
+
+    private static List<string> PruneEmptyPackageDirectories(string root, IEnumerable<string> removedFiles,
+        Action<string> deleteDirectory)
+    {
+        var errors = new List<string>();
+        var failedDirectories = new HashSet<string>(Physical);
+        var packagesRoot = Path.Combine(root, ".agentdocs", "packages");
+        foreach (var file in removedFiles)
+            for (var directory = Path.GetDirectoryName(file);
+                 directory is not null && Within(packagesRoot, directory) &&
+                 !Physical.Equals(packagesRoot, directory);
+                 directory = Path.GetDirectoryName(directory))
+            {
+                if (failedDirectories.Contains(directory))
+                    break;
+                try
+                {
+                    CheckDestination(root, root, directory);
+                    if (!Directory.Exists(directory) || Directory.EnumerateFileSystemEntries(directory).Any())
+                        break;
+                    deleteDirectory(directory);
+                }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException)
+                {
+                    failedDirectories.Add(directory);
+                    errors.Add($"{Rel(root, directory)}: {error.Message}");
+                    break;
+                }
+            }
+        return errors;
+    }
+
     private static void ProbeAtomic(string root, IEnumerable<string> destinations)
     {
         foreach (var directory in AtomicProbeDirectories(destinations))
@@ -1407,9 +1859,16 @@ public static partial class AgentDocsCommand
             throw new InvalidOperationException(".github is excluded from agent-context operations.");
     }
 
-    private static void ValidateRelative(string value)
+    private static string InstalledPackagePath(string packageId, string packagePath)
     {
-        if (value == VisualStudioInstructions)
+        var relative = "packages/" + SafeComponent(packageId) + "/" + packagePath.Replace('\\', '/');
+        ValidateRelative(relative, allowInstructionPath: false);
+        return relative;
+    }
+
+    private static void ValidateRelative(string? value, bool allowInstructionPath = true)
+    {
+        if (allowInstructionPath && value == VisualStudioInstructions)
             return;
         if (string.IsNullOrEmpty(value) || Path.IsPathRooted(value) || value.Contains('\\') ||
             value.Split('/').Any(p => p is "" or "." or ".." || p.Contains(':') ||

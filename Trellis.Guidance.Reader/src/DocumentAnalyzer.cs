@@ -1,8 +1,10 @@
 namespace Trellis.Guidance.Reader;
 
+using System.Text;
 using Markdig;
 using Markdig.Extensions.AutoIdentifiers;
 using Markdig.Extensions.Yaml;
+using Markdig.Helpers;
 using Markdig.Renderers.Html;
 using Markdig.Syntax;
 using Markdig.Syntax.Inlines;
@@ -10,6 +12,13 @@ using YamlDotNet.Core;
 using YamlDotNet.RepresentationModel;
 
 internal sealed record GuidanceText(string Path, GuidanceUsage Usage, string Text, string? Description, int Length);
+internal sealed record DocumentReferenceTarget(string InstalledPath, string Text);
+internal sealed record DocumentLink(string Target, int Line, SourceSpan? UrlSpan);
+internal sealed record DocumentReferenceUse(
+    string ReferencePath, string Fragment, string RawFragment, int Line, SourceSpan UrlSpan, bool AngleDelimited);
+internal sealed record DocumentReferenceProblem(int Line, string Message);
+internal sealed record DocumentReferenceAnalysis(
+    IReadOnlyList<DocumentReferenceUse> Uses, IReadOnlyList<DocumentReferenceProblem> Problems);
 
 /// <summary>Authoring-quality checks over verified guidance documents.</summary>
 internal static class DocumentAnalyzer
@@ -21,7 +30,9 @@ internal static class DocumentAnalyzer
         .Build();
 
     public static void Analyse(IReadOnlySet<string> names, List<GuidanceText> documents,
-        long requiredBytes, GuidanceValidationOptions options, Action<string, string?, string, int?> warn)
+        IReadOnlyList<ManifestDocumentReference> documentReferences, long requiredBytes,
+        GuidanceValidationOptions options, Action<string, string?, string, int?> error,
+        Action<string, string?, string, int?> warn)
     {
         if (requiredBytes > options.MaxRequiredBytes)
             warn("AD101", null,
@@ -45,14 +56,25 @@ internal static class DocumentAnalyzer
         var parsed = documents.ToDictionary(d => d.Path, d => Markdown.Parse(d.Text, Pipeline), StringComparer.Ordinal);
         var slugs = parsed.ToDictionary(pair => pair.Key, pair => Anchors(pair.Value), StringComparer.Ordinal);
         var edges = documents.ToDictionary(d => d.Path, _ => new HashSet<string>(StringComparer.Ordinal), StringComparer.Ordinal);
+        var references = documentReferences.ToDictionary(reference => reference.Path, StringComparer.Ordinal);
+        var referencePaths = references.Keys.ToHashSet(StringComparer.Ordinal);
+        var usedReferences = new HashSet<string>(StringComparer.Ordinal);
         var htmlParser = new AngleSharp.Html.Parser.HtmlParser();
 
         foreach (var document in documents)
         {
             var path = document.Path;
             FrontMatter(path, document.Text, parsed[path], warn);
-            foreach (var (target, line) in Links(parsed[path], htmlParser))
+            var referenceAnalysis = AnalyseDocumentReferences(
+                path, document.Text, parsed[path], referencePaths);
+            foreach (var problem in referenceAnalysis.Problems)
+                error("AD011", path, problem.Message, problem.Line);
+            foreach (var use in referenceAnalysis.Uses)
+                usedReferences.Add(use.ReferencePath);
+            foreach (var link in Links(parsed[path], htmlParser))
             {
+                var target = link.Target;
+                var line = link.Line;
                 var hash = target.IndexOf('#');
                 var file = hash < 0 ? target : target[..hash];
                 var fragment = hash < 0 ? "" : target[(hash + 1)..];
@@ -86,6 +108,13 @@ internal static class DocumentAnalyzer
                     }
 
                     resolved = combined;
+                    if (references.Keys.Any(reference =>
+                            string.Equals(
+                                PackagePath.NormalizeIdentity(reference),
+                                PackagePath.NormalizeIdentity(resolved),
+                                StringComparison.OrdinalIgnoreCase)))
+                        continue;
+
                     if (!names.Contains(resolved))
                     {
                         warn("AD102", path, $"Link '{target}' points to '{resolved}', which is not in the package.", line);
@@ -120,6 +149,10 @@ internal static class DocumentAnalyzer
         foreach (var document in documents.Where(d => d.Usage == GuidanceUsage.Supporting && !reachable.Contains(d.Path)))
             warn("AD103", document.Path,
                 "No required or on-demand document links to this supporting document, directly or through other documents, and the index does not list supporting documents, so agents cannot discover it.", null);
+        foreach (var reference in documentReferences.Where(reference => !usedReferences.Contains(reference.Path)))
+            warn("AD109", reference.Path,
+                $"No guidance document links to this cross-package reference ({reference.PackageId}/{reference.DocumentPath}). Remove it or add the intended Markdown link.",
+                null);
 
         var listed = new HashSet<string>(documents.Select(d => d.Path), StringComparer.Ordinal);
         var directories = documents.Select(d => PackagePath.Directory(d.Path)).Where(d => d.Length > 0).ToHashSet(StringComparer.Ordinal);
@@ -154,20 +187,177 @@ internal static class DocumentAnalyzer
         }
     }
 
-    private static IEnumerable<(string Target, int Line)> Links(
+    internal static DocumentReferenceAnalysis AnalyseDocumentReferences(string documentPath, string text,
+        IReadOnlySet<string> referencePaths) =>
+        AnalyseDocumentReferences(documentPath, text, Markdown.Parse(text, Pipeline), referencePaths);
+
+    private static DocumentReferenceAnalysis AnalyseDocumentReferences(string documentPath, string text,
+        MarkdownDocument document, IReadOnlySet<string> referencePaths)
+    {
+        var uses = new List<DocumentReferenceUse>();
+        var problems = new List<DocumentReferenceProblem>();
+        var htmlParser = new AngleSharp.Html.Parser.HtmlParser();
+        foreach (var link in Links(document, htmlParser))
+        {
+            var hash = link.Target.IndexOf('#');
+            var beforeFragment = hash < 0 ? link.Target : link.Target[..hash];
+            var fragment = hash < 0 ? "" : link.Target[(hash + 1)..];
+            var query = beforeFragment.IndexOf('?');
+            var file = query < 0 ? beforeFragment : beforeFragment[..query];
+            if (file.Length == 0 || file.StartsWith('/') || file.StartsWith('\\') ||
+                PackagePath.Resolve(documentPath, file) is not { } resolved)
+                continue;
+            if (!referencePaths.Contains(resolved))
+            {
+                var alias = referencePaths.FirstOrDefault(reference =>
+                    string.Equals(
+                        PackagePath.NormalizeIdentity(reference),
+                        PackagePath.NormalizeIdentity(resolved),
+                        StringComparison.OrdinalIgnoreCase));
+                if (alias is not null)
+                    problems.Add(new DocumentReferenceProblem(link.Line,
+                        $"Cross-package document link '{link.Target}' resolves to '{resolved}', but the declared path is '{alias}'. Use the exact declared spelling."));
+                continue;
+            }
+
+            if (link.UrlSpan is null)
+            {
+                problems.Add(new DocumentReferenceProblem(link.Line,
+                    $"Cross-package document link '{link.Target}' uses raw HTML or another unrewritable form. Use a Markdown link."));
+                continue;
+            }
+
+            if (query >= 0)
+            {
+                problems.Add(new DocumentReferenceProblem(link.Line,
+                    $"Cross-package document link '{link.Target}' contains a query string, which is not supported."));
+                continue;
+            }
+
+            var span = link.UrlSpan.Value;
+            if (span.Start < 0 || span.End < span.Start || span.End >= text.Length)
+                throw new InvalidOperationException(
+                    $"Cross-package document link at line {link.Line} has no usable source span.");
+            var angleDelimited = span.Start >= 0 && span.End < text.Length &&
+                text[span.Start] == '<' && text[span.End] == '>';
+            var rawUrl = text.Substring(span.Start, span.End - span.Start + 1);
+            if (angleDelimited)
+                rawUrl = rawUrl[1..^1];
+            var rawFragment = hash < 0 ? "" : RawFragment(rawUrl);
+            uses.Add(new DocumentReferenceUse(resolved, fragment, rawFragment, link.Line, span, angleDelimited));
+        }
+
+        return new DocumentReferenceAnalysis(uses, problems);
+    }
+
+    internal static string RewriteDocumentReferences(string installedPath, string text,
+        DocumentReferenceAnalysis analysis, IReadOnlyDictionary<string, DocumentReferenceTarget> references,
+        Action<DocumentReferenceUse, string> warn)
+    {
+        if (analysis.Problems.Count != 0)
+            throw new InvalidOperationException(analysis.Problems[0].Message);
+        if (references.Count == 0)
+            return text;
+        var replacements = new Dictionary<(int Start, int End), string>();
+        var targetAnchors = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        foreach (var use in analysis.Uses)
+        {
+            if (!references.TryGetValue(use.ReferencePath, out var reference))
+                continue;
+
+            var span = use.UrlSpan;
+            if (span.Start < 0 || span.End < span.Start)
+                throw new InvalidOperationException($"Cross-package document link at line {use.Line} has no usable source span.");
+
+            if (use.Fragment.Length > 0)
+            {
+                if (!targetAnchors.TryGetValue(reference.InstalledPath, out var anchors))
+                {
+                    anchors = Anchors(Markdown.Parse(reference.Text, Pipeline));
+                    targetAnchors.Add(reference.InstalledPath, anchors);
+                }
+
+                if (!anchors.Contains(PackagePath.Unescape(use.Fragment).ToLowerInvariant()))
+                    warn(use,
+                        $"heading '{use.Fragment}' does not exist in '{reference.InstalledPath}'; the fragment was preserved.");
+            }
+
+            var replacement = RelativeInstalledLink(installedPath, reference.InstalledPath) + use.RawFragment;
+            if (use.AngleDelimited)
+                replacement = '<' + replacement + '>';
+            var key = (span.Start, span.End);
+            if (replacements.TryGetValue(key, out var previous) && previous != replacement)
+                throw new InvalidOperationException(
+                    $"Cross-package document link at line {use.Line} resolves inconsistently.");
+            replacements[key] = replacement;
+        }
+
+        if (replacements.Count == 0)
+            return text;
+        var rewritten = new StringBuilder(text);
+        foreach (var replacement in replacements.OrderByDescending(pair => pair.Key.Start))
+        {
+            var length = replacement.Key.End - replacement.Key.Start + 1;
+            rewritten.Remove(replacement.Key.Start, length);
+            rewritten.Insert(replacement.Key.Start, replacement.Value);
+        }
+
+        return rewritten.ToString();
+    }
+
+    private static string RawFragment(string rawUrl)
+    {
+        for (var index = 0; index < rawUrl.Length; index++)
+        {
+            if (rawUrl[index] == '#')
+                return rawUrl[index..];
+            if (rawUrl[index] == '\\' && index + 1 < rawUrl.Length &&
+                HtmlHelper.Unescape(rawUrl.Substring(index, 2), true) is { Length: 1 } escaped)
+            {
+                if (escaped == "#")
+                    return rawUrl[index..];
+                index++;
+            }
+            else if (rawUrl[index] == '&' && rawUrl.IndexOf(';', index + 1) is var end && end >= 0)
+            {
+                var entity = rawUrl[index..(end + 1)];
+                var decoded = HtmlHelper.Unescape(entity, true);
+                if (decoded == "#")
+                    return rawUrl[index..];
+                if (decoded != entity)
+                    index = end;
+            }
+        }
+        throw new InvalidOperationException("Cross-package document link fragment has no matching source span.");
+    }
+
+    private static string RelativeInstalledLink(string source, string target)
+    {
+        var from = PackagePath.Directory(source).Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var to = target.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var common = 0;
+        while (common < from.Length && common < to.Length &&
+               string.Equals(from[common], to[common], StringComparison.Ordinal))
+            common++;
+        var parts = Enumerable.Repeat("..", from.Length - common)
+            .Concat(to.Skip(common).Select(Uri.EscapeDataString));
+        return string.Join('/', parts);
+    }
+
+    private static IEnumerable<DocumentLink> Links(
         MarkdownDocument document, AngleSharp.Html.Parser.HtmlParser htmlParser)
     {
         foreach (var link in document.Descendants<LinkInline>())
         {
             var target = Filter(link.Url);
             if (target is not null)
-                yield return (target, link.Line + 1);
+                yield return new DocumentLink(target, link.Line + 1, link.UrlSpan);
         }
 
         foreach (var html in document.Descendants<HtmlInline>())
             foreach (var target in HtmlTargets(html.Tag, htmlParser))
                 if (Filter(target) is { } found)
-                    yield return (found, html.Line + 1);
+                    yield return new DocumentLink(found, html.Line + 1, null);
         foreach (var block in document.Descendants<HtmlBlock>())
         {
             var lines = Enumerable.Range(0, block.Lines.Count).Select(i => block.Lines.Lines[i].Slice.ToString()).ToArray();
@@ -175,7 +365,7 @@ internal static class DocumentAnalyzer
                 if (Filter(target) is { } found)
                 {
                     var index = Array.FindIndex(lines, l => l.Contains(target, StringComparison.Ordinal));
-                    yield return (found, block.Line + 1 + Math.Max(index, 0));
+                    yield return new DocumentLink(found, block.Line + 1 + Math.Max(index, 0), null);
                 }
         }
 

@@ -6,11 +6,15 @@ using System.Text.Json;
 /// <summary>A declared document that passed the manifest's own rules.</summary>
 internal sealed record ManifestDocument(string Path, string Sha256, GuidanceUsage Usage, string? Description);
 
+/// <summary>A virtual package-relative link target that resolves to another package's declared document.</summary>
+internal sealed record ManifestDocumentReference(string Path, string PackageId, string DocumentPath);
+
 /// <summary>One manifest rule violation. <paramref name="Code"/> is the validator's ADnnn identifier.</summary>
 internal sealed record ManifestIssue(string Code, string? Path, string Message);
 
 /// <summary>The outcome of checking a manifest's own content, before any package file is touched.</summary>
 internal sealed record ManifestParse(IReadOnlyList<ManifestDocument> Documents,
+    IReadOnlyList<ManifestDocumentReference> DocumentReferences,
     IReadOnlyDictionary<string, JsonElement> PublisherMetadata, IReadOnlyList<ManifestIssue> Issues, bool UnsupportedSchema);
 
 /// <summary>
@@ -27,8 +31,9 @@ internal static class ManifestCheck
     {
         var issues = new List<ManifestIssue>();
         var documents = new List<ManifestDocument>();
+        var documentReferences = new List<ManifestDocumentReference>();
         var metadata = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
-        ManifestParse Done(bool unsupported = false) => new(documents, metadata, issues, unsupported);
+        ManifestParse Done(bool unsupported = false) => new(documents, documentReferences, metadata, issues, unsupported);
         void Issue(string code, string? path, string message) => issues.Add(new ManifestIssue(code, path, message));
 
         try
@@ -54,7 +59,8 @@ internal static class ManifestCheck
                 return Done(unsupported: true);
             }
 
-            foreach (var property in manifest.EnumerateObject().Where(p => p.Name is not ("schemaVersion" or "documents" or "publisherMetadata")))
+            foreach (var property in manifest.EnumerateObject().Where(p =>
+                         p.Name is not ("schemaVersion" or "documents" or "documentReferences" or "publisherMetadata")))
                 Issue("AD001", null, $"unknown field '{property.Name}'.");
             if (!JsonElementRules.TryArray(manifest, "documents", out var rawDocuments))
             {
@@ -82,7 +88,33 @@ internal static class ManifestCheck
 
             var prefixes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var declared = new HashSet<string>(StringComparer.Ordinal);
-            var normalizedDocuments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var normalizedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            bool Aliased(string path)
+            {
+                var parts = PackagePath.Separators(path).Split('/');
+                for (var i = 1; i <= parts.Length; i++)
+                {
+                    var original = string.Join('/', parts.Take(i));
+                    var normalized = PackagePath.NormalizeIdentity(original);
+                    if (prefixes.TryGetValue(normalized, out var previous) && previous != original)
+                    {
+                        Issue("AD007", path, $"portable directory or document alias: '{previous}' and '{original}'.");
+                        return true;
+                    }
+
+                    prefixes[normalized] = original;
+                }
+
+                if (!declared.Add(path) ||
+                    !normalizedPaths.Add(PackagePath.NormalizeIdentity(PackagePath.Separators(path))))
+                {
+                    Issue("AD007", path, $"portable document or reference alias: '{path}'.");
+                    return true;
+                }
+
+                return false;
+            }
+
             foreach (var raw in rawDocuments.EnumerateArray())
             {
                 if (!JsonElementRules.Object(raw) || JsonElementRules.DuplicateProperties(raw))
@@ -98,9 +130,10 @@ internal static class ManifestCheck
                     ok = false;
                 }
 
-                if (!JsonElementRules.TryString(raw, "path", out var path) || !PackagePath.SafeRelative(path))
+                if (!JsonElementRules.TryString(raw, "path", out var path) || !PortableManifestPath(path))
                 {
-                    Issue("AD002", path, "invalid document path: it must be a portable relative path without rooted, '..', device or trailing-dot segments.");
+                    Issue("AD002", path,
+                        "invalid document path: it must be a portable relative path using forward slashes, without rooted, '..', '.github', device or trailing-dot segments.");
                     continue;
                 }
 
@@ -136,39 +169,77 @@ internal static class ManifestCheck
                     ok = false;
                 }
 
-                var parts = PackagePath.Separators(path).Split('/');
-                var alias = false;
-                for (var i = 1; i <= parts.Length; i++)
-                {
-                    var original = string.Join('/', parts.Take(i));
-                    var normalized = PackagePath.NormalizeIdentity(original);
-                    if (prefixes.TryGetValue(normalized, out var previous) && previous != original)
-                    {
-                        Issue("AD007", path, $"portable directory or document alias: '{previous}' and '{original}'.");
-                        alias = true;
-                        break;
-                    }
-
-                    prefixes[normalized] = original;
-                }
-
-                if (!alias && (!declared.Add(path) || !normalizedDocuments.Add(PackagePath.NormalizeIdentity(PackagePath.Separators(path)))))
-                {
-                    Issue("AD007", path, $"portable document alias: '{path}'.");
-                    alias = true;
-                }
-
+                var alias = Aliased(path);
                 if (ok && !alias)
                     documents.Add(new ManifestDocument(path, hash, usage, description));
             }
 
-            foreach (var document in documents.Where(doc => prefixes.Keys.Any(prefix =>
-                         prefix.StartsWith(PackagePath.NormalizeIdentity(PackagePath.Separators(doc.Path)) + "/", StringComparison.OrdinalIgnoreCase))))
-                Issue("AD007", document.Path, "a document is also used as a directory prefix.");
+            if (manifest.TryGetProperty("documentReferences", out var rawReferences))
+            {
+                if (rawReferences.ValueKind != JsonValueKind.Array)
+                {
+                    Issue("AD001", null, "documentReferences must be an array.");
+                }
+                else
+                {
+                    foreach (var raw in rawReferences.EnumerateArray())
+                    {
+                        if (!JsonElementRules.Object(raw) || JsonElementRules.DuplicateProperties(raw))
+                        {
+                            Issue("AD001", null,
+                                "each document reference must be an object with unique properties.");
+                            continue;
+                        }
+
+                        var ok = true;
+                        foreach (var property in raw.EnumerateObject().Where(p =>
+                                     p.Name is not ("path" or "packageId" or "documentPath")))
+                        {
+                            Issue("AD001", null, $"unknown document reference field '{property.Name}'.");
+                            ok = false;
+                        }
+
+                        if (!JsonElementRules.TryString(raw, "path", out var path) ||
+                            !MarkdownPath(path))
+                        {
+                            Issue("AD002", path,
+                                "invalid document reference path: it must be a portable relative Markdown path using forward slashes, without rooted, '..', '.github', device or trailing-dot segments.");
+                            continue;
+                        }
+
+                        if (!JsonElementRules.TryString(raw, "packageId", out var packageId) ||
+                            !ValidPackageId(packageId))
+                        {
+                            Issue("AD001", path,
+                                "document reference packageId must be a valid NuGet package ID of at most 100 ASCII characters.");
+                            ok = false;
+                        }
+
+                        if (!JsonElementRules.TryString(raw, "documentPath", out var documentPath) ||
+                            !MarkdownPath(documentPath))
+                        {
+                            Issue("AD002", path,
+                                "document reference documentPath must be a portable relative Markdown path using forward slashes and without '.github' segments.");
+                            ok = false;
+                        }
+
+                        var alias = Aliased(path);
+                        if (ok && !alias)
+                            documentReferences.Add(new ManifestDocumentReference(path, packageId, documentPath));
+                    }
+                }
+            }
+
+            foreach (var path in declared.Where(path => prefixes.Keys.Any(prefix =>
+                         prefix.StartsWith(PackagePath.NormalizeIdentity(PackagePath.Separators(path)) + "/",
+                             StringComparison.OrdinalIgnoreCase))))
+                Issue("AD007", path, "a document or reference is also used as a directory prefix.");
 
             // Only meaningful when every entry parsed: a rejected entry could have been the required one.
             if (issues.Count == 0 && documents.Count > 0 && documents.All(doc => doc.Usage == GuidanceUsage.Supporting))
                 Issue("AD006", null, "non-empty documents require at least one required or onDemand document.");
+            if (issues.Count == 0 && documents.Count == 0 && documentReferences.Count > 0)
+                Issue("AD006", null, "documentReferences require at least one guidance document.");
 
             return Done();
         }
@@ -217,4 +288,14 @@ internal static class ManifestCheck
         key.Length > 2 && key.Contains('.') &&
         key.Split('.').All(p => p.Length > 0 && p.All(c => char.IsAsciiLetterOrDigit(c) || c == '-'));
 
+    private static bool MarkdownPath(string path) =>
+        PortableManifestPath(path) && path.EndsWith(".md", StringComparison.OrdinalIgnoreCase);
+
+    private static bool PortableManifestPath(string path) =>
+        !path.Contains('\\') && PackagePath.SafeRelative(path) &&
+        !path.Split('/').Any(segment => segment.Equals(".github", StringComparison.OrdinalIgnoreCase));
+
+    internal static bool ValidPackageId(string packageId) =>
+        packageId.Length is > 0 and <= 100 && char.IsAsciiLetterOrDigit(packageId[0]) &&
+        packageId.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '-' or '_');
 }

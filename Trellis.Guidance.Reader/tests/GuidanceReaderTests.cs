@@ -90,6 +90,42 @@ public sealed class GuidanceReaderTests
         result.Packages.Single().Contribution!.Documents[1].Description.Should().BeNull();
     }
 
+    [Fact]
+    public void Discover_Cross_package_document_references_retain_only_portable_target_identity()
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        var manifest = "{\"schemaVersion\":1,\"documents\":[" + DocumentJson(graph) +
+            "],\"documentReferences\":[{\"path\":\"guide/yarp.md\",\"packageId\":\"Trellis.Yarp\"," +
+            "\"documentPath\":\"docs/yarp.md\"}]}";
+        File.WriteAllText(
+            Path.Combine(graph.Root, "cache", "other", "1.0.0", "guidance", "reference-manifest.json"),
+            manifest);
+
+        var result = GuidanceReader.Discover([graph.Assets]);
+
+        result.IsSuccessful.Should().BeTrue();
+        result.Packages.Single().Contribution!.DocumentReferences.Should().ContainSingle().Which
+            .Should().Be(new GuidanceDocumentReference("guide/yarp.md", "Trellis.Yarp", "docs/yarp.md"));
+    }
+
+    [Fact]
+    public void Discover_Cross_package_document_reference_to_the_source_package_is_invalid()
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", "valid");
+        File.WriteAllText(
+            Path.Combine(graph.Root, "cache", "other", "1.0.0", "guidance", "reference-manifest.json"),
+            "{\"schemaVersion\":1,\"documents\":[" + DocumentJson(graph) +
+            "],\"documentReferences\":[{\"path\":\"guide/alias.md\",\"packageId\":\"OTHER\"," +
+            "\"documentPath\":\"guide/intro.md\"}]}");
+
+        var package = GuidanceReader.Discover([graph.Assets]).Packages.Single();
+
+        package.Status.Should().Be(GuidanceStatus.InvalidManifest);
+        package.Diagnostic.Should().Contain("own package ID");
+    }
+
     [Theory]
     [InlineData("\"usage\":\"required\"")]
     [InlineData("\"usage\":\"onDemand\"")]
@@ -261,9 +297,7 @@ public sealed class GuidanceReaderTests
     [Theory]
     [InlineData("Docs/one.md", "docs/two.md")]
     [InlineData("caf\u00e9/one.md", "cafe\u0301/two.md")]
-    [InlineData("docs\\one.md", "Docs/two.md")]
     [InlineData("intro.md", "INTRO.md")]
-    [InlineData("guide/intro.md", "guide\\intro.md")]
     [InlineData("guide", "guide/intro.md")]
     public void Discover_Portable_aliases_fail_before_loading_missing_payloads(string first, string second)
     {
@@ -279,6 +313,33 @@ public sealed class GuidanceReaderTests
         outcome.Status.Should().Be(GuidanceStatus.InvalidManifest);
         (outcome.Diagnostic!.Contains("alias", StringComparison.Ordinal) ||
             outcome.Diagnostic.Contains("directory prefix", StringComparison.Ordinal)).Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData("guide\\intro.md")]
+    [InlineData(".github/intro.md")]
+    [InlineData("guide/.github/intro.md")]
+    public void Discover_Unsafe_manifest_paths_are_invalid_before_loading_payloads(string path)
+    {
+        using var graph = new Graph();
+        var manifest = JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            documents = new[]
+            {
+                new
+                {
+                    path, sha256 = new string('a', 64), usage = "onDemand",
+                    description = "x"
+                }
+            }
+        });
+        graph.Package("Other", "1.0.0", manifest: manifest);
+
+        var outcome = GuidanceReader.Discover([graph.Assets]).Packages.Single();
+
+        outcome.Status.Should().Be(GuidanceStatus.InvalidManifest);
+        outcome.Diagnostic.Should().Contain("invalid document path");
     }
 
     [Fact]
@@ -322,6 +383,7 @@ public sealed class GuidanceReaderTests
 
     [Theory]
     [InlineData("2", GuidanceStatus.UnsupportedSchema)]
+    [InlineData("3", GuidanceStatus.UnsupportedSchema)]
     [InlineData("2147483648", GuidanceStatus.UnsupportedSchema)]
     [InlineData("9223372036854775808", GuidanceStatus.InvalidManifest)]
     [InlineData("1.5", GuidanceStatus.InvalidManifest)]
@@ -377,7 +439,7 @@ public sealed class GuidanceReaderTests
                 break;
             case "relative-package-folder":
                 node["packageFolders"] = new System.Text.Json.Nodes.JsonObject
-                    { ["relative/cache"] = new System.Text.Json.Nodes.JsonObject() };
+                { ["relative/cache"] = new System.Text.Json.Nodes.JsonObject() };
                 break;
             case "target-not-an-object":
                 node["targets"]!["net10.0/win-x64"] = 5;
@@ -557,7 +619,8 @@ public sealed class GuidanceReaderTests
         (string Name, bool Acceptable, (string Path, string Usage, object? Description)[] Docs)[] cases =
         [
             ("plain", true, [("guide/start.md", "required", "Read first.")]),
-            ("backslash spelling", true, [("guide\\start.md", "required", "Read first.")]),
+            ("backslash spelling", false, [("guide\\start.md", "required", "Read first.")]),
+            ("hidden segment", false, [("guide/.github/start.md", "required", "Read first.")]),
             ("two siblings", true, [("docs/one.md", "required", "Read first."), ("docs/two.md", "supporting", null)]),
             ("directory case alias", false, [("Docs/one.md", "required", "Read first."), ("docs/two.md", "onDemand", "Open when two.")]),
             ("directory nfc alias", false, [(cafeDecomposed + "/one.md", "required", "Read first."), (cafeComposed + "/two.md", "onDemand", "Open when two.")]),

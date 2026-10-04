@@ -40,9 +40,20 @@ public sealed record GuidanceIdentity(string PackageId, string Version, string P
 public sealed record GuidanceDocument(GuidanceIdentity Identity, string LocalPath, string Sha256, GuidanceUsage Usage,
     string? Description = null);
 
+/// <summary>
+/// A virtual path used by ordinary relative Markdown links and the document in another restored package that it
+/// resolves to. A repository-level consumer resolves it only from an approved package in its selected graph and
+/// must reject mixed target versions rather than choosing one scope's version.
+/// </summary>
+public sealed record GuidanceDocumentReference(string Path, string PackageId, string DocumentPath);
+
 /// <summary>One validated manifest.</summary>
 public sealed record GuidanceContribution(IReadOnlyList<GuidanceDocument> Documents,
-    IReadOnlyDictionary<string, JsonElement> PublisherMetadata);
+    IReadOnlyDictionary<string, JsonElement> PublisherMetadata)
+{
+    /// <summary>Cross-package document links declared by this manifest.</summary>
+    public IReadOnlyList<GuidanceDocumentReference> DocumentReferences { get; init; } = [];
+}
 
 /// <summary>A package's discovery outcome, retaining machine-local package provenance separately from logical identity.</summary>
 public sealed record GuidancePackage(GuidanceScope Scope, string PackageId, string Version, string? PackageRoot,

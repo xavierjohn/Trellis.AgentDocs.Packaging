@@ -45,6 +45,29 @@ public sealed class ValidateCommandTests : IDisposable
     }
 
     [Fact]
+    public void A_nupkg_cannot_reference_its_own_package_id()
+    {
+        WritePackage(
+            startDescription: "Read before using X.",
+            startText: "# Start\n\n[Alias](alias.md)\n",
+            selfReference: true);
+        var nupkg = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".nupkg");
+        try
+        {
+            ZipFile.CreateFromDirectory(_root, nupkg);
+
+            var (code, output) = Validate(nupkg);
+
+            code.Should().Be(1);
+            output.Should().Contain("error AD012").And.Contain("own package ID");
+        }
+        finally
+        {
+            File.Delete(nupkg);
+        }
+    }
+
+    [Fact]
     public void Errors_fail_the_command_and_name_the_rule_and_document()
     {
         WritePackage(startDescription: null);
@@ -158,19 +181,36 @@ public sealed class ValidateCommandTests : IDisposable
         return (code, writer.ToString());
     }
 
-    private void WritePackage(string? startDescription, string startText = "# Start\n\n[http](http.md)\n")
+    private void WritePackage(string? startDescription, string startText = "# Start\n\n[http](http.md)\n",
+        bool selfReference = false)
     {
         var start = Encoding.UTF8.GetBytes(startText);
         var http = Encoding.UTF8.GetBytes("# Http\n");
         Directory.CreateDirectory(Path.Combine(_root, "guide"));
         Directory.CreateDirectory(Path.Combine(_root, "guidance"));
+        File.WriteAllText(Path.Combine(_root, "Source.Package.nuspec"), """
+            <?xml version="1.0"?>
+            <package>
+              <metadata>
+                <id>Source.Package</id>
+                <version>1.0.0</version>
+                <authors>Tests</authors>
+                <description>Tests</description>
+              </metadata>
+            </package>
+            """);
         File.WriteAllBytes(Path.Combine(_root, "guide", "start.md"), start);
         File.WriteAllBytes(Path.Combine(_root, "guide", "http.md"), http);
         string Hash(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
         var description = startDescription is null ? "" : ",\"description\":" + JsonSerializer.Serialize(startDescription);
+        var references = selfReference
+            ? ",\"documentReferences\":[{\"path\":\"guide/alias.md\",\"packageId\":\"Source.Package\"," +
+              "\"documentPath\":\"guide/start.md\"}]"
+            : "";
         File.WriteAllText(Path.Combine(_root, "guidance", "reference-manifest.json"),
             "{\"schemaVersion\":1,\"documents\":[" +
             "{\"path\":\"guide/start.md\",\"sha256\":\"" + Hash(start) + "\",\"usage\":\"required\"" + description + "}," +
-            "{\"path\":\"guide/http.md\",\"sha256\":\"" + Hash(http) + "\",\"usage\":\"supporting\"}]}");
+            "{\"path\":\"guide/http.md\",\"sha256\":\"" + Hash(http) + "\",\"usage\":\"supporting\"}]" +
+            references + "}");
     }
 }
