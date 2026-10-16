@@ -151,13 +151,23 @@ dotnet tool run agentdocs sync
 `init`, `sync`, and `check` fail without writing when a selected project's
 restore output is older than its project file or repository-local restore
 inputs, including `Directory.Packages.props`, `Directory.Build.props`,
-`Directory.Build.targets`, `NuGet.Config`, and tracked imports. Inputs from
-NuGet's evaluated project references, including transitive references and their
-per-framework imports, are included in both freshness checks and the recorded
-graph. Build-only references omitted by NuGet are still excluded. This also
-applies to `check --content-only`: stale restore output cannot establish that
-installed guidance is current. The timestamp check is conservative, so merely
-touching an input can require another restore.
+`Directory.Build.targets`, `NuGet.Config`, and tracked imports. Repository-local
+inputs from NuGet's evaluated project references, including transitive
+references and their per-framework imports, are included in both freshness
+checks and the recorded graph. Build-only references omitted by NuGet are still
+excluded. This also applies to `check --content-only`: stale restore output
+cannot establish that installed guidance is current. The timestamp check is
+conservative, so merely touching an input can require another restore.
+
+Project references outside the Git root, such as sibling checkouts, remain
+supported. AgentDocs warns once per external project per command and skips that
+project and its reference subtree: their freshness is not checked and their
+inputs are not included in the recorded restore hash. Selected entry points
+must still be inside the Git root.
+
+MSBuild evaluations are reused by project path and target framework throughout
+one command, including overlapping solution and project entry points. The cache
+is created after any requested restores and discarded when the command ends.
 
 NuGet can leave an unchanged `project.assets.json` untouched. `--force` refreshes
 the successful `project.nuget.cache` checkpoint even when the resolved graph

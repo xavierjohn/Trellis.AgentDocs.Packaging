@@ -228,6 +228,7 @@ public static partial class AgentDocsCommand
             }
         }
 
+        using var evaluationCache = new ProjectEvaluations(Evaluate);
         var explicitRoots = request.Verb == AgentDocsVerb.Init
             ? request.SourceRoots.Select(p => Rel(root, Path.GetFullPath(p, cwd))).ToArray()
             : previous?.ExplicitSourceRoots ?? [];
@@ -237,7 +238,7 @@ public static partial class AgentDocsCommand
             ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             : LoadApprovedPackages(policyPath, output);
         (ContextState State, Dictionary<string, string> Content)? discovery = request.Verb == AgentDocsVerb.Remove ? null : BuildState(root,
-            graphEntries, explicitRoots, version, previous, discover, approved, request.StrictReferences, output);
+            graphEntries, explicitRoots, version, previous, discover, approved, request.StrictReferences, output, evaluationCache);
         var changes = Plan(root, previous, discovery?.State, discovery?.Content, manifestPath, request.Force);
         if (request.Verb == AgentDocsVerb.Init && !File.Exists(policyPath))
             changes.Insert(0, new Change(policyPath, null, PolicyTemplate(), "Create policy"));
@@ -305,7 +306,7 @@ public static partial class AgentDocsCommand
     private static (ContextState State, Dictionary<string, string> Content) BuildState(string root, string[] entries,
         string[] explicitRoots, string version, ContextState? previous,
         Func<IEnumerable<string>, Func<string, bool>, GuidanceDiscovery> discover, HashSet<string> approved,
-        bool strictReferences, TextWriter output)
+        bool strictReferences, TextWriter output, ProjectEvaluations evaluationCache)
     {
         var projects = entries.SelectMany(entry => Projects(entry, root)).Distinct(Portable)
             .OrderBy(p => p, StringComparer.Ordinal).ToArray();
@@ -327,7 +328,7 @@ public static partial class AgentDocsCommand
             }
         }
 
-        var assets = projects.Select(p => AssetPath(p)).ToArray();
+        var assets = projects.Select(p => AssetPath(p, evaluationCache)).ToArray();
         foreach (var asset in assets)
             CheckDestination(root, root, asset);
         var guidance = discover(assets, approved.Contains);
@@ -403,7 +404,7 @@ public static partial class AgentDocsCommand
 
         var roots = projects.Select(p => Rel(root, Path.GetDirectoryName(p)!)).Concat(explicitRoots)
             .Distinct(Portable).OrderBy(p => p, StringComparer.Ordinal).ToArray();
-        var generatedDirectories = GeneratedDirectories(projects);
+        var generatedDirectories = GeneratedDirectories(projects, evaluationCache);
         foreach (var source in roots)
             if (generatedDirectories.Any(directory => Within(directory, Full(root, source))))
                 throw new InvalidOperationException($"Source root is inside an evaluated generated directory: {source}");
@@ -661,7 +662,7 @@ public static partial class AgentDocsCommand
         var indexText = Index(groups, unguided, orderedListings, pending);
         PrintSummary(output, groups, orderedListings, content, indexText, pending);
 
-        var graph = BuildGraph(root, entries, guidance);
+        var graph = BuildGraph(root, entries, guidance, evaluationCache, output);
         var state = new ContextState(ContextSchemaVersion, "utf8-lf-no-bom-v1", version, roots, graph,
             instructionFiles.Select(p => new InstructionEntry(Rel(root, p), HashText(Entry(root, p)),
                 previous?.InstructionEntries.SingleOrDefault(e => Portable.Equals(e.InstructionFile, Rel(root, p)))?.ExistedBefore
@@ -700,9 +701,19 @@ public static partial class AgentDocsCommand
         output.WriteLine($"AgentDocs: index is {Encoding.UTF8.GetByteCount(indexText)} bytes.");
     }
 
-    private static GraphState BuildGraph(string root, string[] entries, GuidanceDiscovery discovery)
+    private static GraphState BuildGraph(string root, string[] entries, GuidanceDiscovery discovery,
+        ProjectEvaluations evaluationCache, TextWriter output)
     {
-        var graphEntries = entries.Select(p => new GraphInput(Rel(root, p), RestoreSpec(p)))
+        var warnedProjects = new HashSet<string>(Physical);
+        void WarnOutsideReference(string project)
+        {
+            if (warnedProjects.Add(project))
+                output.WriteLine($"agentdocs warning: Referenced project '{project}' is outside the Git root; " +
+                    "freshness is not checked for this project or its reference subtree.");
+        }
+
+        var graphEntries = entries.Select(p => new GraphInput(Rel(root, p),
+                RestoreSpec(p, evaluationCache, WarnOutsideReference)))
             .OrderBy(p => p.Path, StringComparer.Ordinal).ToArray();
         var projects = discovery.Packages.GroupBy(p => new { p.Scope.ProjectPath, p.Scope.TargetFramework, p.Scope.RuntimeIdentifier })
             .Select(g => new GraphProject(Rel(root, g.Key.ProjectPath), g.Key.TargetFramework, g.Key.RuntimeIdentifier,
@@ -712,33 +723,33 @@ public static partial class AgentDocsCommand
         return new GraphState(graphEntries, projects);
     }
 
-    private static string AssetPath(string project, JsonElement? evaluatedProperties = null)
+    private static string AssetPath(string project, ProjectEvaluations evaluationCache, JsonElement? evaluatedProperties = null)
     {
         if (evaluatedProperties is null)
         {
-            using var evaluated = Evaluate(project);
-            return AssetPath(project, evaluated.RootElement.GetProperty("Properties"));
+            var evaluated = evaluationCache.Get(project);
+            return AssetPath(project, evaluationCache, evaluated.GetProperty("Properties"));
         }
 
         var value = evaluatedProperties.Value.GetProperty("ProjectAssetsFile").GetString();
         if (string.IsNullOrWhiteSpace(value) &&
             evaluatedProperties.Value.GetProperty("TargetFrameworks").GetString() is { Length: > 0 } frameworks)
         {
-            using var inner = Evaluate(project, frameworks.Split(';', StringSplitOptions.RemoveEmptyEntries)[0]);
-            value = inner.RootElement.GetProperty("Properties").GetProperty("ProjectAssetsFile").GetString();
+            var inner = evaluationCache.Get(project, frameworks.Split(';', StringSplitOptions.RemoveEmptyEntries)[0]);
+            value = inner.GetProperty("Properties").GetProperty("ProjectAssetsFile").GetString();
         }
         if (string.IsNullOrWhiteSpace(value))
             throw new InvalidOperationException($"Cannot evaluate ProjectAssetsFile for {project}.");
         return Path.GetFullPath(value, Path.GetDirectoryName(project)!);
     }
 
-    private static string RestoreSpec(string entry)
+    private static string RestoreSpec(string entry, ProjectEvaluations evaluationCache, Action<string> warnOutsideReference)
     {
         if (entry.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
         {
-            using var evaluated = Evaluate(entry);
-            var properties = evaluated.RootElement.GetProperty("Properties");
-            var assets = AssetPath(entry, properties);
+            var evaluated = evaluationCache.Get(entry);
+            var properties = evaluated.GetProperty("Properties");
+            var assets = AssetPath(entry, evaluationCache, properties);
             using var json = JsonDocument.Parse(File.ReadAllText(assets));
             if (json.RootElement.TryGetProperty("project", out var project) &&
                 project.TryGetProperty("restore", out var restore) &&
@@ -776,12 +787,12 @@ public static partial class AgentDocsCommand
                 var referencedProjects = new HashSet<string>(Physical);
                 foreach (var assetFramework in assetFrameworks.EnumerateObject())
                 {
-                    using var target = Evaluate(entry, assetFramework.Name);
+                    var target = evaluationCache.Get(entry, assetFramework.Name);
                     ValidateRequestedPackages(entry, assetFramework.Name, assetFramework.Value,
-                        target.RootElement.GetProperty("Items"));
+                        target.GetProperty("Items"));
                     referencedProjects.UnionWith(ValidateProjectReferences(entry, assetFramework.Name, restore,
-                        target.RootElement.GetProperty("Items")));
-                    evaluations.Add(target.RootElement.GetProperty("Properties").Clone());
+                        target.GetProperty("Items")));
+                    evaluations.Add(target.GetProperty("Properties"));
                 }
 
                 var clone = new SortedDictionary<string, object?>(StringComparer.Ordinal);
@@ -804,7 +815,7 @@ public static partial class AgentDocsCommand
                 var projectRoot = GitRoot(Path.GetDirectoryName(entry)!);
                 var sources = new HashSet<string>(Physical);
                 AddRestoreSources(projectRoot, entry, evaluations, sources);
-                AddReferencedRestoreSources(projectRoot, entry, referencedProjects, sources);
+                AddReferencedRestoreSources(projectRoot, entry, referencedProjects, sources, evaluationCache, warnOutsideReference);
                 ValidateRestoreFreshness(projectRoot, entry, assets, properties, sources);
                 var sourceDigest = string.Join("\n", sources.OrderBy(p => Rel(projectRoot, p), StringComparer.Ordinal)
                     .Select(p => (Path: p, Text: RestoreSourceText(projectRoot, p)))
@@ -817,7 +828,7 @@ public static partial class AgentDocsCommand
         }
 
         return HashText(string.Join("|", Projects(entry, GitRoot(Path.GetDirectoryName(entry)!))
-            .OrderBy(p => p).Select(RestoreSpec)));
+            .OrderBy(p => p).Select(project => RestoreSpec(project, evaluationCache, warnOutsideReference))));
     }
 
     private static string? RestoreSourceText(string root, string file) => Canonical(File.ReadAllBytes(file));
@@ -854,7 +865,7 @@ public static partial class AgentDocsCommand
     }
 
     private static void AddReferencedRestoreSources(string root, string entry, IEnumerable<string> references,
-        HashSet<string> sources)
+        HashSet<string> sources, ProjectEvaluations evaluationCache, Action<string> warnOutsideReference)
     {
         var visited = new HashSet<string>(Physical) { entry };
         var pending = new Queue<string>(references.OrderBy(path => path, StringComparer.Ordinal));
@@ -863,18 +874,23 @@ public static partial class AgentDocsCommand
             var project = CanonicalExistingPath(root, reference);
             if (!visited.Add(project))
                 continue;
+            if (!Within(root, project))
+            {
+                warnOutsideReference(project);
+                continue;
+            }
             CheckFileDestination(root, root, project);
-            using var evaluated = Evaluate(project);
-            var properties = evaluated.RootElement.GetProperty("Properties");
+            var evaluated = evaluationCache.Get(project);
+            var properties = evaluated.GetProperty("Properties");
             var evaluations = new List<JsonElement> { properties };
             var frameworks = new[] { "TargetFramework", "TargetFrameworks" }
                 .SelectMany(name => properties.GetProperty(name).GetString()!.Split(';', StringSplitOptions.RemoveEmptyEntries))
                 .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(name => name, StringComparer.Ordinal);
             foreach (var framework in frameworks)
             {
-                using var target = Evaluate(project, framework);
-                evaluations.Add(target.RootElement.GetProperty("Properties").Clone());
-                foreach (var child in EvaluatedProjectReferences(project, framework, target.RootElement.GetProperty("Items"))
+                var target = evaluationCache.Get(project, framework);
+                evaluations.Add(target.GetProperty("Properties"));
+                foreach (var child in EvaluatedProjectReferences(project, framework, target.GetProperty("Items"))
                     .OrderBy(path => path, StringComparer.Ordinal))
                     pending.Enqueue(child);
             }
@@ -925,6 +941,38 @@ public static partial class AgentDocsCommand
     /// recorded on a developer machine.
     /// </summary>
     internal static string CanonicalJson(JsonElement element) => JsonSerializer.Serialize(element);
+
+    private sealed class ProjectEvaluations(Func<string, string?, JsonDocument> evaluate) : IDisposable
+    {
+        private readonly Dictionary<(string Project, string? Framework), JsonDocument> _documents = new(
+            EqualityComparer<(string Project, string? Framework)>.Create(
+                (first, second) => Physical.Equals(first.Project, second.Project) &&
+                    StringComparer.Ordinal.Equals(first.Framework, second.Framework),
+                key => HashCode.Combine(Physical.GetHashCode(key.Project),
+                    key.Framework is null ? 0 : StringComparer.Ordinal.GetHashCode(key.Framework))));
+        private bool _disposed;
+
+        public JsonElement Get(string project, string? framework = null)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var key = (Project: Path.GetFullPath(project), Framework: framework);
+            if (!_documents.TryGetValue(key, out var document))
+            {
+                document = evaluate(key.Project, key.Framework);
+                _documents.Add(key, document);
+            }
+
+            return document.RootElement;
+        }
+
+        public void Dispose()
+        {
+            foreach (var document in _documents.Values)
+                document.Dispose();
+            _documents.Clear();
+            _disposed = true;
+        }
+    }
 
     private static JsonDocument Evaluate(string project, string? framework = null)
     {
@@ -1503,21 +1551,21 @@ public static partial class AgentDocsCommand
         throw new InvalidOperationException("Expected a .csproj, .slnx, or .sln entry point.");
     }
 
-    private static HashSet<string> GeneratedDirectories(string[] projects)
+    private static HashSet<string> GeneratedDirectories(string[] projects, ProjectEvaluations evaluationCache)
     {
         var generated = new HashSet<string>(Physical);
         foreach (var project in projects)
         {
-            using var evaluated = Evaluate(project);
-            var properties = evaluated.RootElement.GetProperty("Properties");
+            var evaluated = evaluationCache.Get(project);
+            var properties = evaluated.GetProperty("Properties");
             var frameworks = properties.GetProperty("TargetFrameworks").GetString()!
                 .Split(';', StringSplitOptions.RemoveEmptyEntries);
             if (frameworks.Length == 0)
                 frameworks = [properties.GetProperty("TargetFramework").GetString()!];
             foreach (var framework in frameworks)
             {
-                using var target = Evaluate(project, framework);
-                var targetProperties = target.RootElement.GetProperty("Properties");
+                var target = evaluationCache.Get(project, framework);
+                var targetProperties = target.GetProperty("Properties");
                 foreach (var name in new[] { "BaseIntermediateOutputPath", "IntermediateOutputPath",
                     "MSBuildProjectExtensionsPath",
                     "BaseOutputPath", "OutputPath", "TargetDir", "PublishDir",

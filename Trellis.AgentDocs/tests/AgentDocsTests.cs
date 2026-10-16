@@ -1618,6 +1618,72 @@ public sealed class AgentDocsTests
     }
 
     [Theory]
+    [InlineData("App.csproj")]
+    [InlineData("Dependency/Dependency.csproj")]
+    public void Lifecycle_commands_warn_once_and_skip_external_reference_subtrees(string referrer)
+    {
+        using var fixture = new Fixture();
+        AddReferencedProjects(fixture);
+        var sibling = System.IO.Path.GetFullPath(fixture.Path("..", "external-" + Guid.NewGuid().ToString("N")));
+        Directory.CreateDirectory(System.IO.Path.Combine(sibling, "Leaf"));
+        try
+        {
+            var externalProject = System.IO.Path.Combine(sibling, "Sibling.csproj");
+            var externalLeaf = System.IO.Path.Combine(sibling, "Leaf", "Leaf.csproj");
+            File.WriteAllText(System.IO.Path.Combine(sibling, "Directory.Build.props"), "<Project />");
+            File.WriteAllText(System.IO.Path.Combine(sibling, "NuGet.Config"),
+                "<configuration><packageSources><clear /></packageSources></configuration>");
+            File.WriteAllText(externalProject, """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+                  <ItemGroup><ProjectReference Include="Leaf/Leaf.csproj" /></ItemGroup>
+                </Project>
+                """);
+            File.WriteAllText(externalLeaf,
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+            var project = fixture.Path(referrer.Replace('/', System.IO.Path.DirectorySeparatorChar));
+            var reference = System.Security.SecurityElement.Escape(
+                System.IO.Path.GetRelativePath(System.IO.Path.GetDirectoryName(project)!, externalProject));
+            fixture.Write(referrer, File.ReadAllText(project).Replace("</Project>",
+                $"<ItemGroup><ProjectReference Include=\"{reference}\" /></ItemGroup></Project>"));
+            fixture.Write("Apps.slnx", """
+                <Solution>
+                  <Project Path="App.csproj" />
+                  <Project Path="Dependency/Dependency.csproj" />
+                </Solution>
+                """);
+            fixture.Run("init", "--restore", "Apps.slnx", "App.csproj").Should().Be(0, fixture.LastOutput);
+            var snapshot = Directory.EnumerateFiles(fixture.Path(".agentdocs"), "*", SearchOption.AllDirectories)
+                .Concat([fixture.Path("AGENTS.md"), fixture.Path(".github", "copilot-instructions.md"),
+                    fixture.Path("obj", "project.assets.json"), fixture.Path("obj", "project.nuget.cache")])
+                .ToDictionary(file => file, File.ReadAllBytes);
+
+            foreach (var file in new[] { externalProject, externalLeaf, System.IO.Path.Combine(sibling, "Directory.Build.props") })
+            {
+                File.AppendAllText(file, "\n");
+                File.SetLastWriteTimeUtc(file, DateTime.UtcNow.AddMinutes(1));
+            }
+            string[][] commands = [["init", "Apps.slnx", "App.csproj"], ["sync"], ["check"], ["check", "--content-only"]];
+            foreach (var command in commands)
+            {
+                fixture.Run(command).Should().Be(0, fixture.LastOutput);
+                fixture.LastOutput.Split('\n').Where(line => line.StartsWith("agentdocs warning: Referenced project",
+                    StringComparison.Ordinal)).Should().ContainSingle().Which.Should()
+                    .Contain(externalProject).And.Contain("outside the Git root").And.Contain("freshness is not checked");
+                fixture.LastOutput.Should().NotContain(externalLeaf);
+            }
+
+            foreach (var file in snapshot)
+                File.ReadAllBytes(file.Key).Should().Equal(file.Value);
+            Directory.Exists(System.IO.Path.Combine(sibling, ".agentdocs")).Should().BeFalse();
+        }
+        finally
+        {
+            Directory.Delete(sibling, recursive: true);
+        }
+    }
+
+    [Theory]
     [InlineData(false, "App.csproj")]
     [InlineData(true, "Other.csproj")]
     public void A_failed_or_foreign_restore_cache_cannot_mark_assets_fresh(bool success, string project)
