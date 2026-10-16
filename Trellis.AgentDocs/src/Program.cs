@@ -772,26 +772,16 @@ public static partial class AgentDocsCommand
                 }
                 if (!requestedRuntimes.SetEquals(restoredRuntimes))
                     throw new InvalidOperationException($"Stale assets for {entry}: runtime identifiers changed; run dotnet restore.");
-                var targetImports = new List<string>();
-                var generatedPaths = new HashSet<string>(Physical)
-                {
-                    Path.Combine(Path.GetDirectoryName(entry)!, "obj")
-                };
+                var evaluations = new List<JsonElement> { properties };
+                var referencedProjects = new HashSet<string>(Physical);
                 foreach (var assetFramework in assetFrameworks.EnumerateObject())
                 {
                     using var target = Evaluate(entry, assetFramework.Name);
                     ValidateRequestedPackages(entry, assetFramework.Name, assetFramework.Value,
                         target.RootElement.GetProperty("Items"));
-                    ValidateProjectReferences(entry, assetFramework.Name, restore,
-                        target.RootElement.GetProperty("Items"));
-                    var targetProperties = target.RootElement.GetProperty("Properties");
-                    foreach (var property in new[] { "BaseIntermediateOutputPath", "IntermediateOutputPath",
-                        "MSBuildProjectExtensionsPath" })
-                        if (targetProperties.TryGetProperty(property, out var outputPath) &&
-                            outputPath.GetString() is { Length: > 0 } value)
-                            generatedPaths.Add(Path.GetFullPath(value, Path.GetDirectoryName(entry)!));
-                    if (targetProperties.TryGetProperty("MSBuildAllProjects", out var targetProjects))
-                        targetImports.AddRange(targetProjects.GetString()!.Split(';', StringSplitOptions.RemoveEmptyEntries));
+                    referencedProjects.UnionWith(ValidateProjectReferences(entry, assetFramework.Name, restore,
+                        target.RootElement.GetProperty("Items")));
+                    evaluations.Add(target.RootElement.GetProperty("Properties").Clone());
                 }
 
                 var clone = new SortedDictionary<string, object?>(StringComparer.Ordinal);
@@ -812,24 +802,9 @@ public static partial class AgentDocsCommand
                                 : []
                         }).ToArray();
                 var projectRoot = GitRoot(Path.GetDirectoryName(entry)!);
-                var sources = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { entry };
-                for (var directory = Path.GetDirectoryName(entry); directory is not null && Within(projectRoot, directory);
-                    directory = Path.GetDirectoryName(directory))
-                    foreach (var name in new[] { "Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props", "NuGet.Config" })
-                    {
-                        var path = Path.Combine(directory, name);
-                        if (File.Exists(path))
-                            sources.Add(path);
-                    }
-
-                if (properties.TryGetProperty("MSBuildAllProjects", out var imports))
-                    targetImports.AddRange(imports.GetString()!.Split(';', StringSplitOptions.RemoveEmptyEntries));
-                foreach (var path in targetImports)
-                    if (Path.IsPathFullyQualified(path) && Within(projectRoot, path) &&
-                        !Rel(projectRoot, path).Split('/').Any(p => p.Equals(".github", StringComparison.OrdinalIgnoreCase)) &&
-                        !generatedPaths.Any(directory => Within(directory, path)) &&
-                        File.Exists(path))
-                        sources.Add(path);
+                var sources = new HashSet<string>(Physical);
+                AddRestoreSources(projectRoot, entry, evaluations, sources);
+                AddReferencedRestoreSources(projectRoot, entry, referencedProjects, sources);
                 ValidateRestoreFreshness(projectRoot, entry, assets, properties, sources);
                 var sourceDigest = string.Join("\n", sources.OrderBy(p => Rel(projectRoot, p), StringComparer.Ordinal)
                     .Select(p => (Path: p, Text: RestoreSourceText(projectRoot, p)))
@@ -846,6 +821,67 @@ public static partial class AgentDocsCommand
     }
 
     private static string? RestoreSourceText(string root, string file) => Canonical(File.ReadAllBytes(file));
+
+    private static void AddRestoreSources(string root, string project, IEnumerable<JsonElement> evaluations,
+        HashSet<string> sources)
+    {
+        sources.Add(project);
+        for (var directory = Path.GetDirectoryName(project); directory is not null && Within(root, directory);
+            directory = Path.GetDirectoryName(directory))
+            foreach (var name in new[] { "Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props", "NuGet.Config" })
+            {
+                var path = Path.Combine(directory, name);
+                if (File.Exists(path))
+                    sources.Add(path);
+            }
+
+        var imports = new HashSet<string>(Physical);
+        var generatedPaths = new HashSet<string>(Physical) { Path.Combine(Path.GetDirectoryName(project)!, "obj") };
+        foreach (var properties in evaluations)
+        {
+            foreach (var property in new[] { "BaseIntermediateOutputPath", "IntermediateOutputPath", "MSBuildProjectExtensionsPath" })
+                if (properties.TryGetProperty(property, out var outputPath) && outputPath.GetString() is { Length: > 0 } value)
+                    generatedPaths.Add(Path.GetFullPath(value, Path.GetDirectoryName(project)!));
+            if (properties.TryGetProperty("MSBuildAllProjects", out var projects))
+                imports.UnionWith(projects.GetString()!.Split(';', StringSplitOptions.RemoveEmptyEntries));
+        }
+
+        foreach (var path in imports)
+            if (Path.IsPathFullyQualified(path) && Within(root, path) &&
+                !Rel(root, path).Split('/').Any(p => p.Equals(".github", StringComparison.OrdinalIgnoreCase)) &&
+                !generatedPaths.Any(directory => Within(directory, path)) && File.Exists(path))
+                sources.Add(path);
+    }
+
+    private static void AddReferencedRestoreSources(string root, string entry, IEnumerable<string> references,
+        HashSet<string> sources)
+    {
+        var visited = new HashSet<string>(Physical) { entry };
+        var pending = new Queue<string>(references.OrderBy(path => path, StringComparer.Ordinal));
+        while (pending.TryDequeue(out var reference))
+        {
+            var project = CanonicalExistingPath(root, reference);
+            if (!visited.Add(project))
+                continue;
+            CheckFileDestination(root, root, project);
+            using var evaluated = Evaluate(project);
+            var properties = evaluated.RootElement.GetProperty("Properties");
+            var evaluations = new List<JsonElement> { properties };
+            var frameworks = new[] { "TargetFramework", "TargetFrameworks" }
+                .SelectMany(name => properties.GetProperty(name).GetString()!.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(name => name, StringComparer.Ordinal);
+            foreach (var framework in frameworks)
+            {
+                using var target = Evaluate(project, framework);
+                evaluations.Add(target.RootElement.GetProperty("Properties").Clone());
+                foreach (var child in EvaluatedProjectReferences(project, framework, target.RootElement.GetProperty("Items"))
+                    .OrderBy(path => path, StringComparer.Ordinal))
+                    pending.Enqueue(child);
+            }
+
+            AddRestoreSources(root, project, evaluations, sources);
+        }
+    }
 
     private static void ValidateRestoreFreshness(string root, string entry, string assets,
         JsonElement properties, IEnumerable<string> sources)
@@ -993,7 +1029,29 @@ public static partial class AgentDocsCommand
                     $"Stale assets for {entry} ({framework}): PackageReference {id} was removed; run dotnet restore.");
     }
 
-    private static void ValidateProjectReferences(string entry, string framework, JsonElement restore, JsonElement items)
+    private static HashSet<string> ValidateProjectReferences(string entry, string framework, JsonElement restore, JsonElement items)
+    {
+        var evaluated = EvaluatedProjectReferences(entry, framework, items);
+        var restored = new HashSet<string>(Physical);
+        if (restore.TryGetProperty("frameworks", out var frameworks) &&
+            frameworks.ValueKind == JsonValueKind.Object &&
+            frameworks.TryGetProperty(framework, out var restoredFramework) &&
+            restoredFramework.ValueKind == JsonValueKind.Object &&
+            restoredFramework.TryGetProperty("projectReferences", out var references))
+        {
+            if (references.ValueKind != JsonValueKind.Object)
+                throw new InvalidOperationException($"Stale or incomplete assets for {entry} ({framework}); run dotnet restore.");
+            foreach (var reference in references.EnumerateObject())
+                restored.Add(Path.GetFullPath(reference.Name, Path.GetDirectoryName(entry)!));
+        }
+
+        if (!evaluated.SetEquals(restored))
+            throw new InvalidOperationException(
+                $"Stale assets for {entry} ({framework}): ProjectReference changed; run dotnet restore.");
+        return evaluated;
+    }
+
+    private static HashSet<string> EvaluatedProjectReferences(string entry, string framework, JsonElement items)
     {
         var unavailable = $"Cannot evaluate NuGet restore graph for {entry} ({framework}); the .NET SDK may be unsupported.";
         if (!items.TryGetProperty("_RestoreGraphEntry", out var graph) || graph.ValueKind != JsonValueKind.Array)
@@ -1012,22 +1070,7 @@ public static partial class AgentDocsCommand
                 throw new InvalidOperationException(unavailable);
             evaluated.Add(Path.GetFullPath(path.GetString()!, Path.GetDirectoryName(entry)!));
         }
-        var restored = new HashSet<string>(Physical);
-        if (restore.TryGetProperty("frameworks", out var frameworks) &&
-            frameworks.ValueKind == JsonValueKind.Object &&
-            frameworks.TryGetProperty(framework, out var restoredFramework) &&
-            restoredFramework.ValueKind == JsonValueKind.Object &&
-            restoredFramework.TryGetProperty("projectReferences", out var references))
-        {
-            if (references.ValueKind != JsonValueKind.Object)
-                throw new InvalidOperationException($"Stale or incomplete assets for {entry} ({framework}); run dotnet restore.");
-            foreach (var reference in references.EnumerateObject())
-                restored.Add(Path.GetFullPath(reference.Name, Path.GetDirectoryName(entry)!));
-        }
-
-        if (!evaluated.SetEquals(restored))
-            throw new InvalidOperationException(
-                $"Stale assets for {entry} ({framework}): ProjectReference changed; run dotnet restore.");
+        return evaluated;
     }
 
     private static List<Change> Plan(string root, ContextState? old, ContextState? next,

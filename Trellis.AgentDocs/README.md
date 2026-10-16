@@ -151,7 +151,10 @@ dotnet tool run agentdocs sync
 `init`, `sync`, and `check` fail without writing when a selected project's
 restore output is older than its project file or repository-local restore
 inputs, including `Directory.Packages.props`, `Directory.Build.props`,
-`Directory.Build.targets`, `NuGet.Config`, and tracked imports. This also
+`Directory.Build.targets`, `NuGet.Config`, and tracked imports. Inputs from
+NuGet's evaluated project references, including transitive references and their
+per-framework imports, are included in both freshness checks and the recorded
+graph. Build-only references omitted by NuGet are still excluded. This also
 applies to `check --content-only`: stale restore output cannot establish that
 installed guidance is current. The timestamp check is conservative, so merely
 touching an input can require another restore.
@@ -162,6 +165,10 @@ does not change. For several selected entry points, restore each explicitly,
 or use `dotnet tool run agentdocs sync --restore` to restore all recorded entry
 points before syncing. `init --restore` and `sync --restore` pass `--force` to
 NuGet; `check` never restores.
+
+In CI, check out the repository first, restore every recorded entry point, then
+run `check`. Restoring a solution does not refresh a separately selected project
+that is missing from that solution; `sync --restore` covers both.
 
 The index tells agents to do the same. In CI, `dotnet restore --force` followed by
 `dotnet tool run agentdocs check --strict --strict-references` fails when the installed guidance no

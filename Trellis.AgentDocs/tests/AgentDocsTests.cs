@@ -1529,6 +1529,95 @@ public sealed class AgentDocsTests
     }
 
     [Theory]
+    [InlineData("Dependency/Dependency.csproj")]
+    [InlineData("Dependency/Directory.Build.props")]
+    [InlineData("Dependency/Directory.Build.targets")]
+    [InlineData("Dependency/Directory.Packages.props")]
+    [InlineData("Dependency/NuGet.Config")]
+    [InlineData("Dependency/Restore.props")]
+    [InlineData("Dependency/Leaf/Leaf.csproj")]
+    [InlineData("Dependency/Leaf/Restore.props")]
+    public void Lifecycle_commands_reject_changed_referenced_project_inputs_without_writing(string input)
+    {
+        using var fixture = new Fixture();
+        AddReferencedProjects(fixture);
+        fixture.Run("init", "--restore", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var snapshot = Directory.EnumerateFiles(fixture.Path(".agentdocs"), "*", SearchOption.AllDirectories)
+            .Concat([fixture.Path("AGENTS.md"), fixture.Path(".github", "copilot-instructions.md")])
+            .ToDictionary(file => file, File.ReadAllBytes);
+        var assets = fixture.Path("obj", "project.assets.json");
+        var assetsBefore = File.ReadAllBytes(assets);
+        var restoredAt = new[] { assets, fixture.Path("obj", "project.nuget.cache") }
+            .Select(File.GetLastWriteTimeUtc).Max();
+        var path = fixture.Path(input.Replace('/', System.IO.Path.DirectorySeparatorChar));
+        var text = File.ReadAllText(path);
+        fixture.Write(input, input.EndsWith(".csproj", StringComparison.Ordinal)
+            ? text.Replace("</Project>",
+                "<ItemGroup><PackageReference Include=\"Example.Library\" /></ItemGroup></Project>")
+            : text + "\n");
+        File.SetLastWriteTimeUtc(path, restoredAt.AddSeconds(1));
+
+        string[][] commands = [["init", "App.csproj"], ["sync"], ["check"], ["check", "--content-only"]];
+        foreach (var command in commands)
+        {
+            fixture.Run(command).Should().Be(1, fixture.LastOutput);
+            fixture.LastOutput.Should().Contain("Stale restore output").And.Contain(input)
+                .And.Contain("dotnet restore --force");
+        }
+
+        foreach (var file in snapshot)
+            File.ReadAllBytes(file.Key).Should().Equal(file.Value);
+        File.ReadAllBytes(assets).Should().Equal(assetsBefore);
+    }
+
+    [Fact]
+    public void Restored_referenced_project_import_changes_update_the_recorded_graph()
+    {
+        using var fixture = new Fixture();
+        AddReferencedProjects(fixture);
+        fixture.Run("init", "--restore", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var manifest = fixture.Path(".agentdocs", "agent-context.json");
+        var before = File.ReadAllBytes(manifest);
+        fixture.Write("Dependency/Restore.props",
+            File.ReadAllText(fixture.Path("Dependency", "Restore.props")).Replace("One", "Two"));
+        fixture.MarkRestored();
+
+        fixture.Run("check").Should().Be(1, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("Context differs from the restored graph")
+            .And.NotContain("Stale restore output");
+        fixture.Run("check", "--content-only").Should().Be(0, fixture.LastOutput);
+        File.ReadAllBytes(manifest).Should().Equal(before);
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        File.ReadAllBytes(manifest).Should().NotEqual(before);
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+    }
+
+    [Fact]
+    public void Check_rejects_changed_referenced_project_per_framework_imports()
+    {
+        using var fixture = new Fixture();
+        AddReferencedProjects(fixture);
+        fixture.Write("Dependency/Directory.Build.props", """
+            <Project>
+              <Import Project="Restore.props" />
+              <Import Project="Framework.props" Condition="'$(TargetFramework)' == 'net10.0'" />
+            </Project>
+            """);
+        fixture.Write("Dependency/Framework.props", """
+            <Project>
+              <PropertyGroup><MSBuildAllProjects>$(MSBuildAllProjects);$(MSBuildThisFileFullPath)</MSBuildAllProjects></PropertyGroup>
+            </Project>
+            """);
+        fixture.Run("init", "--restore", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.Write("Dependency/Framework.props", File.ReadAllText(fixture.Path("Dependency", "Framework.props")) + "\n");
+        File.SetLastWriteTimeUtc(fixture.Path("Dependency", "Framework.props"),
+            File.GetLastWriteTimeUtc(fixture.Path("obj", "project.nuget.cache")).AddSeconds(1));
+
+        fixture.Run("check", "--content-only").Should().Be(1, fixture.LastOutput);
+        fixture.LastOutput.Should().Contain("Stale restore output").And.Contain("Dependency/Framework.props");
+    }
+
+    [Theory]
     [InlineData(false, "App.csproj")]
     [InlineData(true, "Other.csproj")]
     public void A_failed_or_foreign_restore_cache_cannot_mark_assets_fresh(bool success, string project)
@@ -2446,6 +2535,44 @@ public sealed class AgentDocsTests
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
         File.ReadAllText(fixture.Path(".agentdocs", "README.md"))
             .Should().Contain("``See [x](http://e.example) `tick` <b>bold</b>``");
+    }
+
+    private static void AddReferencedProjects(Fixture fixture)
+    {
+        fixture.Write("App.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><ProjectReference Include="Dependency/Dependency.csproj" /></ItemGroup>
+            </Project>
+            """);
+        fixture.Write("Dependency/Dependency.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><ProjectReference Include="Leaf/Leaf.csproj" /></ItemGroup>
+            </Project>
+            """);
+        fixture.Write("Dependency/Leaf/Leaf.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+        foreach (var directory in new[] { "Dependency", "Dependency/Leaf" })
+        {
+            fixture.Write(directory + "/Directory.Build.props", "<Project><Import Project=\"Restore.props\" /></Project>");
+            fixture.Write(directory + "/Restore.props", """
+                <Project>
+                  <PropertyGroup>
+                    <MSBuildAllProjects>$(MSBuildAllProjects);$(MSBuildThisFileFullPath)</MSBuildAllProjects>
+                    <RestoreChoice>One</RestoreChoice>
+                  </PropertyGroup>
+                </Project>
+                """);
+            fixture.Write(directory + "/Directory.Build.targets", "<Project />");
+            fixture.Write(directory + "/Directory.Packages.props", $"""
+                <Project>
+                  <PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup>
+                  <ItemGroup><PackageVersion Include="Example.Library" Version="{ToolVersion()}" /></ItemGroup>
+                </Project>
+                """);
+            fixture.Write(directory + "/NuGet.Config", "<configuration><packageSources><clear /></packageSources></configuration>");
+        }
     }
 
     private static void AddSecondProject(Fixture fixture)
