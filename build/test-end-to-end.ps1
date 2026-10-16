@@ -87,6 +87,24 @@ function Set-Policy {
         '{"schemaVersion":1,"approvedPackages":[' + $list + ']}')
 }
 
+function Assert-StaleRestore {
+    param([string] $ExpectedInput)
+    $files = @(Get-ChildItem -LiteralPath (Join-Path $repo '.agentdocs') -File -Recurse |
+        Sort-Object FullName | Select-Object -ExpandProperty FullName)
+    $before = $files | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }
+    foreach ($command in @(@('sync'), @('check'), @('check', '--content-only'))) {
+        $output = & dotnet tool run agentdocs @command 2>&1
+        if ($LASTEXITCODE -eq 0 -or ($output | Out-String) -notmatch 'Stale restore output' -or
+            -not ($output | Out-String).Contains($ExpectedInput.Replace('\', '/'))) {
+            throw "AgentDocs $($command -join ' ') did not reject stale input ${ExpectedInput}:`n$($output | Out-String)"
+        }
+    }
+    $after = $files | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }
+    if (($before -join ',') -ne ($after -join ',')) {
+        throw 'Rejecting stale restore output modified the installed context.'
+    }
+}
+
 $oldHome = $env:DOTNET_CLI_HOME
 $oldPackages = $env:NUGET_PACKAGES
 $succeeded = $false
@@ -142,9 +160,48 @@ try {
             throw 'Approved guide was not installed.'
         }
         Invoke-Dotnet 'Initial check' @('tool', 'run', 'agentdocs', 'check') | Out-Null
+
+        # Even an input change that leaves the resolved graph unchanged requires a fresh restore checkpoint.
+        [System.IO.File]::AppendAllText((Join-Path $app 'App.csproj'), "`n")
+        Assert-StaleRestore $appProject
         Invoke-Dotnet 'Explicit sync with restore' @('tool', 'run', 'agentdocs', 'sync', '--restore') | Out-Null
+        Invoke-Dotnet 'Check after no-op restore' @('tool', 'run', 'agentdocs', 'check') | Out-Null
         Invoke-Dotnet 'Initial solution' @('new', 'sln', '-n', 'Consumer', '--format', 'slnx') | Out-Null
         Invoke-Dotnet 'Add solution project' @('sln', 'Consumer.slnx', 'add', $appProject) | Out-Null
+
+        # A separately selected seed and its dependency are not restored by the main solution.
+        $seed = Join-Path $repo 'tools\seed'
+        $dependency = Join-Path $seed 'AntiCorruptionLayer'
+        $seedProject = Join-Path 'tools' 'seed' 'Seed.csproj'
+        $dependencyProject = Join-Path $dependency 'AntiCorruptionLayer.csproj'
+        New-Item -ItemType Directory -Path $dependency -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $seed 'Directory.Packages.props'), @'
+<Project>
+  <PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup>
+  <ItemGroup><PackageVersion Include="Independent.Publisher" Version="1.0.0" /></ItemGroup>
+</Project>
+'@)
+        [System.IO.File]::WriteAllText((Join-Path $repo $seedProject), @'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <ItemGroup><ProjectReference Include="AntiCorruptionLayer/AntiCorruptionLayer.csproj" /></ItemGroup>
+</Project>
+'@)
+        $dependencyText = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>'
+        [System.IO.File]::WriteAllText($dependencyProject, $dependencyText)
+        Invoke-Dotnet 'Restore out-of-solution seed' @('restore', $seedProject, '--force', '--nologo', '-v:q') | Out-Null
+        Invoke-Dotnet 'Remove initial graph' @('tool', 'run', 'agentdocs', 'remove') | Out-Null
+        Invoke-Dotnet 'Select solution and out-of-solution seed' @('tool', 'run', 'agentdocs', 'init',
+            'Consumer.slnx', $seedProject) | Out-Null
+        Invoke-Dotnet 'Check solution and seed' @('tool', 'run', 'agentdocs', 'check') | Out-Null
+        [System.IO.File]::WriteAllText($dependencyProject, $dependencyText.Replace('</Project>',
+            '<ItemGroup><PackageReference Include="Independent.Publisher" /></ItemGroup></Project>'))
+        Invoke-Dotnet 'Restore main solution only' @('restore', 'Consumer.slnx', '--force', '--nologo', '-v:q') | Out-Null
+        Assert-StaleRestore (Join-Path 'tools' 'seed' 'AntiCorruptionLayer' 'AntiCorruptionLayer.csproj')
+        Invoke-Dotnet 'Restore all recorded entry points' @('tool', 'run', 'agentdocs', 'sync', '--restore') | Out-Null
+        Invoke-Dotnet 'Check restored solution and seed' @('tool', 'run', 'agentdocs', 'check') | Out-Null
+        Invoke-Dotnet 'Remove solution and seed graph' @('tool', 'run', 'agentdocs', 'remove') | Out-Null
+        Invoke-Dotnet 'Reselect application graph' @('tool', 'run', 'agentdocs', 'init', $appProject) | Out-Null
 
         # A restore alone never changes guidance; the developer runs sync after a package change.
         Publish-Version '2.0.0' $true
@@ -166,7 +223,7 @@ try {
         Select-Package '2.0.0'
         Invoke-Dotnet 'Add second solution project' @('sln', 'Consumer.slnx',
             'add', $otherProject) | Out-Null
-        Invoke-Dotnet 'Restore two-project solution' @('restore', 'Consumer.slnx', '--nologo', '-v:q') | Out-Null
+        Invoke-Dotnet 'Restore two-project solution' @('restore', 'Consumer.slnx', '--force', '--nologo', '-v:q') | Out-Null
         Invoke-Dotnet 'Remove project graph' @('tool', 'run', 'agentdocs', 'remove') | Out-Null
         if (-not (Test-Path -LiteralPath (Join-Path $repo '.agentdocs\policy.json'))) { throw 'Remove deleted the consumer policy.' }
         Invoke-Dotnet 'Select two-project graph' @('tool', 'run', 'agentdocs', 'init', 'Consumer.slnx') | Out-Null
@@ -278,7 +335,7 @@ try {
         }
     }
     finally { Pop-Location }
-    Write-Host 'PASS pending-by-default install, approval, explicit sync after upgrades, two-project and nested solutions, missing-guide notice, invalid-guide isolation, and cleanup.'
+    Write-Host 'PASS pending-by-default install, approval, stale-restore rejection and recovery, referenced projects outside the solution, explicit sync after upgrades, two-project and nested solutions, missing-guide notice, invalid-guide isolation, and cleanup.'
     $succeeded = $true
 }
 finally {
