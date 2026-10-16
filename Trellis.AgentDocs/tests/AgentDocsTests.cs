@@ -514,6 +514,28 @@ public sealed class AgentDocsTests
         fixture.Run("remove").Should().Be(0);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Context_manifest_is_written_as_UTF8_without_a_BOM_on_init_and_sync(bool sync)
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var path = fixture.Path(".agentdocs", "agent-context.json");
+        if (sync)
+        {
+            File.WriteAllText(path, File.ReadAllText(path), new UTF8Encoding(true));
+            fixture.OverviewDescription = "Updated overview.";
+            fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        }
+
+        var bytes = File.ReadAllBytes(path);
+        bytes.AsSpan().StartsWith(Encoding.UTF8.GetPreamble()).Should().BeFalse();
+        using var manifest = JsonDocument.Parse(bytes);
+        manifest.RootElement.GetProperty("TextHashFormat").GetString().Should().Be("utf8-lf-no-bom-v1");
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+    }
+
     [Fact]
     public void Generated_files_are_line_feed_only_and_check_tolerates_a_windows_checkout()
     {
@@ -639,6 +661,7 @@ public sealed class AgentDocsTests
         foreach (var directory in new[] { "artifacts", "scratch", "sourcegen" })
             fixture.Write(directory + "/AGENTS.md", "# Generated\n");
         fixture.Write("src/Features/AGENTS.md", "# Source\n");
+        fixture.MarkRestored();
 
         fixture.Run("init", "App.csproj").Should().Be(0);
         fixture.Run("sync").Should().Be(0);
@@ -1209,6 +1232,7 @@ public sealed class AgentDocsTests
               </ItemGroup>
             </Project>
             """);
+        fixture.MarkRestored();
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
         fixture.Run("check").Should().Be(0, fixture.LastOutput);
     }
@@ -1228,6 +1252,7 @@ public sealed class AgentDocsTests
               </ItemGroup>
             </Project>
             """);
+        fixture.MarkRestored();
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
         fixture.Run("check").Should().Be(0, fixture.LastOutput);
     }
@@ -1417,6 +1442,7 @@ public sealed class AgentDocsTests
         }));
         fixture.Run("init", "App.csproj").Should().NotBe(0);
         fixture.Write("App.csproj", MultiTargetProject(version));
+        fixture.MarkRestored();
         fixture.Run("init", "App.csproj").Should().Be(0);
         fixture.Write("App.csproj", MultiTargetProject("9.9.9"));
         fixture.Run("check").Should().NotBe(0);
@@ -1427,6 +1453,7 @@ public sealed class AgentDocsTests
     {
         using var fixture = new Fixture();
         fixture.Write("Directory.Build.props", "<Project><PropertyGroup><MyRestoreChoice>One</MyRestoreChoice></PropertyGroup></Project>");
+        fixture.MarkRestored();
         fixture.Run("init", "App.csproj").Should().Be(0);
         fixture.Write("Directory.Build.props", "<Project><PropertyGroup><MyRestoreChoice>Two</MyRestoreChoice></PropertyGroup></Project>");
         fixture.Run("check").Should().NotBe(0);
@@ -1437,15 +1464,103 @@ public sealed class AgentDocsTests
     {
         using var fixture = new Fixture();
         fixture.Write("Directory.Build.props", "<Project><PropertyGroup><MyRestoreChoice>One</MyRestoreChoice></PropertyGroup></Project>");
+        fixture.MarkRestored();
         fixture.Run("init", "App.csproj").Should().Be(0);
         var before = File.ReadAllBytes(fixture.Path(".agentdocs", "agent-context.json"));
         fixture.Write("Directory.Build.props", "<Project><PropertyGroup><MyRestoreChoice>Two</MyRestoreChoice></PropertyGroup></Project>");
+        fixture.MarkRestored();
 
-        // The restore inputs changed, but nothing that is installed would, so only the strict check objects.
+        // The restored inputs changed, but nothing that is installed would, so only the strict check objects.
         fixture.Run("check").Should().NotBe(0);
         fixture.Run("check", "--content-only").Should().Be(0, fixture.LastOutput);
         fixture.LastOutput.Should().Contain("Installed guidance is current").And.NotContain("Update manifest");
         File.ReadAllBytes(fixture.Path(".agentdocs", "agent-context.json")).Should().Equal(before, "check never writes");
+    }
+
+    [Fact]
+    public void Init_rejects_stale_restore_output_before_creating_context()
+    {
+        using var fixture = new Fixture();
+        File.SetLastWriteTimeUtc(fixture.Path("App.csproj"),
+            File.GetLastWriteTimeUtc(fixture.Path("obj", "project.assets.json")).AddSeconds(1));
+
+        fixture.Run("init", "App.csproj").Should().Be(1);
+
+        fixture.LastOutput.Should().Contain("Stale restore output").And.Contain("dotnet restore --force");
+        File.Exists(fixture.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
+        File.Exists(fixture.Path(".agentdocs", "README.md")).Should().BeFalse();
+        File.Exists(fixture.Path("AGENTS.md")).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("App.csproj")]
+    [InlineData("Directory.Packages.props")]
+    [InlineData("Directory.Build.props")]
+    [InlineData("Directory.Build.targets")]
+    [InlineData("NuGet.Config")]
+    public void Lifecycle_commands_reject_restore_output_older_than_project_inputs_without_writing(string input)
+    {
+        using var fixture = new Fixture();
+        if (!File.Exists(fixture.Path(input)))
+            fixture.Write(input, input == "NuGet.Config" ? "<configuration />" : "<Project />");
+        fixture.MarkRestored();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var snapshot = Directory.EnumerateFiles(fixture.Path(".agentdocs"), "*", SearchOption.AllDirectories)
+            .Concat([fixture.Path("AGENTS.md"), fixture.Path(".github", "copilot-instructions.md")])
+            .ToDictionary(file => file, File.ReadAllBytes);
+        var assets = fixture.Path("obj", "project.assets.json");
+        var assetsBefore = File.ReadAllBytes(assets);
+        var restoredAt = File.GetLastWriteTimeUtc(assets);
+        File.SetLastWriteTimeUtc(fixture.Path(input), restoredAt.AddSeconds(1));
+
+        string[][] commands = [["init", "App.csproj"], ["sync"], ["sync", "--dry-run"],
+            ["check"], ["check", "--content-only"]];
+        foreach (var command in commands)
+        {
+            fixture.Run(command).Should().Be(1);
+            fixture.LastOutput.Should().Contain("Stale restore output").And.Contain(input)
+                .And.Contain("dotnet restore --force");
+        }
+
+        foreach (var file in snapshot)
+            File.ReadAllBytes(file.Key).Should().Equal(file.Value);
+        File.ReadAllBytes(assets).Should().Equal(assetsBefore);
+        File.GetLastWriteTimeUtc(assets).Should().Be(restoredAt);
+    }
+
+    [Theory]
+    [InlineData(false, "App.csproj")]
+    [InlineData(true, "Other.csproj")]
+    public void A_failed_or_foreign_restore_cache_cannot_mark_assets_fresh(bool success, string project)
+    {
+        using var fixture = new Fixture();
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.Write("obj/project.nuget.cache", JsonSerializer.Serialize(new
+        {
+            success,
+            projectFilePath = fixture.Path(project)
+        }));
+
+        fixture.Run("check").Should().Be(1);
+
+        fixture.LastOutput.Should().Contain("Invalid or unsuccessful restore cache")
+            .And.Contain("dotnet restore --force");
+    }
+
+    [Fact]
+    public void Fresh_assets_are_accepted_when_the_successful_restore_cache_is_older()
+    {
+        using var fixture = new Fixture();
+        fixture.Write("obj/project.nuget.cache", JsonSerializer.Serialize(new
+        {
+            success = true,
+            projectFilePath = fixture.Path("App.csproj")
+        }));
+        File.SetLastWriteTimeUtc(fixture.Path("obj", "project.nuget.cache"),
+            File.GetLastWriteTimeUtc(fixture.Path("App.csproj")).AddMinutes(-1));
+
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
     }
 
     [Fact]
@@ -1603,6 +1718,32 @@ public sealed class AgentDocsTests
         File.Exists(fixture.Path("obj", "project.assets.json")).Should().BeFalse();
         fixture.Run("init", "--restore", "App.csproj").Should().Be(0);
         File.Exists(fixture.Path("obj", "project.assets.json")).Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData("BaseIntermediateOutputPath")]
+    [InlineData("MSBuildProjectExtensionsPath")]
+    public void Explicit_restore_refreshes_stale_inputs_even_when_assets_do_not_change(string property)
+    {
+        using var fixture = new Fixture();
+        fixture.Write("Directory.Build.props",
+            $"<Project><PropertyGroup><{property}>generated/</{property}></PropertyGroup></Project>");
+        fixture.SetAssets("generated/project.assets.json");
+        fixture.Run("init", "--restore", "App.csproj").Should().Be(0, fixture.LastOutput);
+        var assets = fixture.Path("generated", "project.assets.json");
+        var before = File.ReadAllBytes(assets);
+        var writtenAt = File.GetLastWriteTimeUtc(assets);
+        fixture.Write("App.csproj", File.ReadAllText(fixture.Path("App.csproj")) + "\n");
+        fixture.Run("sync").Should().Be(1);
+        fixture.LastOutput.Should().Contain("Stale restore output");
+
+        fixture.Run("sync", "--restore").Should().Be(0, fixture.LastOutput);
+
+        File.ReadAllBytes(assets).Should().Equal(before);
+        File.GetLastWriteTimeUtc(assets).Should().Be(writtenAt, "NuGet leaves unchanged assets alone");
+        File.GetLastWriteTimeUtc(fixture.Path("generated", "project.nuget.cache"))
+            .Should().BeOnOrAfter(File.GetLastWriteTimeUtc(fixture.Path("App.csproj")));
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
     }
 
     [Fact]
@@ -2877,6 +3018,8 @@ public sealed class AgentDocsTests
         public string Path(params string[] pieces) => System.IO.Path.Combine([_root, .. pieces]);
         public void EnterRoot() => Environment.CurrentDirectory = _root;
         public void SetAssets(string relative) => _assets = relative;
+        public void MarkRestored() => File.SetLastWriteTimeUtc(
+            Path(_assets.Replace('/', System.IO.Path.DirectorySeparatorChar)), DateTime.UtcNow);
 
         public void Scope(string relative)
         {

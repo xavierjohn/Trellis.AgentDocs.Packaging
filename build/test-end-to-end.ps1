@@ -142,7 +142,27 @@ try {
             throw 'Approved guide was not installed.'
         }
         Invoke-Dotnet 'Initial check' @('tool', 'run', 'agentdocs', 'check') | Out-Null
+
+        # Even an input change that leaves the resolved graph unchanged requires a fresh restore checkpoint.
+        $context = Join-Path $repo '.agentdocs\agent-context.json'
+        $beforeStale = @($installed, $context) |
+            ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }
+        [System.IO.File]::AppendAllText((Join-Path $app 'App.csproj'), "`n")
+        $staleSync = & dotnet tool run agentdocs sync 2>&1
+        if ($LASTEXITCODE -eq 0 -or ($staleSync | Out-String) -notmatch 'Stale restore output') {
+            throw "Sync did not reject stale restore output:`n$($staleSync | Out-String)"
+        }
+        $staleCheck = & dotnet tool run agentdocs check --content-only 2>&1
+        if ($LASTEXITCODE -eq 0 -or ($staleCheck | Out-String) -notmatch 'Stale restore output') {
+            throw "Content-only check did not reject stale restore output:`n$($staleCheck | Out-String)"
+        }
+        $afterStale = @($installed, $context) |
+            ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }
+        if (($beforeStale -join ',') -ne ($afterStale -join ',')) {
+            throw 'Rejecting stale restore output modified the installed context.'
+        }
         Invoke-Dotnet 'Explicit sync with restore' @('tool', 'run', 'agentdocs', 'sync', '--restore') | Out-Null
+        Invoke-Dotnet 'Check after no-op restore' @('tool', 'run', 'agentdocs', 'check') | Out-Null
         Invoke-Dotnet 'Initial solution' @('new', 'sln', '-n', 'Consumer', '--format', 'slnx') | Out-Null
         Invoke-Dotnet 'Add solution project' @('sln', 'Consumer.slnx', 'add', $appProject) | Out-Null
 
@@ -166,7 +186,7 @@ try {
         Select-Package '2.0.0'
         Invoke-Dotnet 'Add second solution project' @('sln', 'Consumer.slnx',
             'add', $otherProject) | Out-Null
-        Invoke-Dotnet 'Restore two-project solution' @('restore', 'Consumer.slnx', '--nologo', '-v:q') | Out-Null
+        Invoke-Dotnet 'Restore two-project solution' @('restore', 'Consumer.slnx', '--force', '--nologo', '-v:q') | Out-Null
         Invoke-Dotnet 'Remove project graph' @('tool', 'run', 'agentdocs', 'remove') | Out-Null
         if (-not (Test-Path -LiteralPath (Join-Path $repo '.agentdocs\policy.json'))) { throw 'Remove deleted the consumer policy.' }
         Invoke-Dotnet 'Select two-project graph' @('tool', 'run', 'agentdocs', 'init', 'Consumer.slnx') | Out-Null
@@ -278,7 +298,7 @@ try {
         }
     }
     finally { Pop-Location }
-    Write-Host 'PASS pending-by-default install, approval, explicit sync after upgrades, two-project and nested solutions, missing-guide notice, invalid-guide isolation, and cleanup.'
+    Write-Host 'PASS pending-by-default install, approval, stale-restore rejection and recovery, explicit sync after upgrades, two-project and nested solutions, missing-guide notice, invalid-guide isolation, and cleanup.'
     $succeeded = $true
 }
 finally {

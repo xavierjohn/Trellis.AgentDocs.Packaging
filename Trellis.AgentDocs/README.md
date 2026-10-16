@@ -118,6 +118,19 @@ ownership hashes needed for `check` and safe cleanup after a fresh clone. Keep
 the packages you approve reviewed: their documents are instructions for an
 agent that acts with your privileges.
 
+Newly written `agent-context.json` files use UTF-8 without a BOM, so standard
+JSON readers can consume them directly. Generated text uses LF line endings;
+the `utf8-lf-no-bom-v1` ownership hashes ignore BOM and line-ending conversions
+on checkout. To keep `.agentdocs` files as LF and avoid Git's LF-to-CRLF warnings,
+add this rule to your repository-root `.gitattributes`:
+
+```gitattributes
+.agentdocs/** text eol=lf
+```
+
+AgentDocs does not modify your `.gitattributes` or normalize existing
+customer-authored instruction files.
+
 This alpha release writes context schema 1 and reads only schema 1. Version 1
 defines the first actual context contract in place, independently of the package
 manifest schema. Backward compatibility with earlier development formats is not
@@ -131,11 +144,26 @@ Nothing runs automatically. After changing a package reference or version,
 restore and then sync:
 
 ```powershell
-dotnet restore
+dotnet restore --force
 dotnet tool run agentdocs sync
 ```
 
-The index tells agents to do the same. In CI, `dotnet restore` followed by
+`init`, `sync`, and `check` fail without writing when a selected project's
+restore output is older than its project file or repository-local restore
+inputs, including `Directory.Packages.props`, `Directory.Build.props`,
+`Directory.Build.targets`, `NuGet.Config`, and tracked imports. This also
+applies to `check --content-only`: stale restore output cannot establish that
+installed guidance is current. The timestamp check is conservative, so merely
+touching an input can require another restore.
+
+NuGet can leave an unchanged `project.assets.json` untouched. `--force` refreshes
+the successful `project.nuget.cache` checkpoint even when the resolved graph
+does not change. For several selected entry points, restore each explicitly,
+or use `dotnet tool run agentdocs sync --restore` to restore all recorded entry
+points before syncing. `init --restore` and `sync --restore` pass `--force` to
+NuGet; `check` never restores.
+
+The index tells agents to do the same. In CI, `dotnet restore --force` followed by
 `dotnet tool run agentdocs check --strict --strict-references` fails when the installed guidance no
 longer matches the restored packages or when a hand-written instruction links to
 a missing file, or when a cross-package reference is unresolved.
@@ -199,9 +227,10 @@ It exits 1 on errors, and on warnings with `--strict`. Use
 to change the budgets (defaults 32768, 4 MiB and 100) and `--format json` for
 machine-readable output on standard output.
 
-`init` accepts `--restore` if the selected project has not yet been restored,
-`--source-root DIR` for additional source directories, and `--dry-run` to
-preview. The tool refuses unowned destinations and concurrent edits; `--force`
+`init` and `sync` accept `--restore` to refresh the selected entry points.
+`init` also accepts `--source-root DIR` for additional source directories.
+Both accept `--dry-run` to preview, but not together with `--restore`.
+The tool refuses unowned destinations and concurrent edits; `--force`
 is available only for a reviewed adoption or repair. The current context
 selects one graph per Git repository; mixed resolved versions of an approved
 package that publishes guidance, or of an approved target used by a
