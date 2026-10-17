@@ -1,7 +1,7 @@
 # Trellis.AgentDocs
 
 `Trellis.AgentDocs` is an opt-in local .NET tool for developers using NuGet
-packages that publish [AgentDocs guidance](../Trellis.Guidance.Reader/docs/experimental-guidance-v1.md).
+packages that publish [AgentDocs guidance](../Trellis.Guidance.Reader/docs/guidance-v1.md).
 It reads the **restored package versions**, verifies each declared Markdown
 document against its SHA-256 hash, and installs the guides of packages **you
 approve** where coding agents can find them. It does not require the publisher
@@ -19,8 +19,8 @@ dotnet tool run agentdocs init <solution-or-project> [<more-projects-or-solution
 ```
 
 If the repository already has `.config\dotnet-tools.json`, reuse it instead of
-creating a second manifest. Replace the placeholder with the published version;
-until it is available on NuGet.org, add the local feed containing its nupkg to
+creating a second manifest. Replace the placeholder with the published version.
+To try an unpublished build, add the local feed containing its nupkg to
 `dotnet tool install` with `--add-source`. The local tool is independently
 versioned; it does **not** need to match the version of any library package.
 `init` accepts several projects or solutions, so projects outside your main
@@ -131,12 +131,15 @@ add this rule to your repository-root `.gitattributes`:
 AgentDocs does not modify your `.gitattributes` or normalize existing
 customer-authored instruction files.
 
-This alpha release writes context schema 1 and reads only schema 1. Version 1
-defines the first actual context contract in place, independently of the package
-manifest schema. Backward compatibility with earlier development formats is not
-required. Earlier state is intentionally not migrated: remove the old generated
-context with its matching tool version (or delete the reviewed `.agentdocs`
-generated files) and run `init` again.
+This release writes context schema 1 and reads only schema 1, and it reads
+policy schema 1 only. Both versions are independent of the package manifest
+schema. An incompatible change to either file format will use a new schema
+version and be called out in the release notes. State written by the 0.1
+previews with schema 1 is read as is; run `agentdocs sync` after upgrading the
+tool, which rewrites only the recorded tool version when nothing else changed.
+Contexts from development formats before schema 1 are not migrated: remove the
+old generated context with its matching tool version (or delete the reviewed
+`.agentdocs` generated files) and run `init` again.
 
 ## After a package upgrade
 
@@ -280,7 +283,7 @@ restore imports it added to `Directory.Build.targets` and
 - A project outside the selected graph is "not analysed": the index requires
   nothing for it. Select it in `init` to cover it.
 
-The manifest format is an **experimental convention**, not a NuGet standard.
+The manifest format is a convention, not a NuGet standard.
 An agent needs the repository pointers (or explicit direction from its user)
 to find the installed index; installing a guide cannot make every agent
 discover it automatically.
