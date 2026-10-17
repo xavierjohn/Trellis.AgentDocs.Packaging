@@ -19,6 +19,7 @@ try {
     $zip = [System.IO.Compression.ZipFile]::OpenRead($helper)
     try {
         if (-not $zip.GetEntry('build/Trellis.AgentDocs.Packaging.targets') -or
+            -not $zip.GetEntry('buildMultiTargeting/Trellis.AgentDocs.Packaging.targets') -or
             $zip.GetEntry('buildTransitive/Trellis.AgentDocs.Packaging.targets') -or
             @($zip.Entries | Where-Object { $_.FullName -like 'lib/*' }).Count -ne 0) {
             throw 'Helper must have a publisher-only build target and no assembly.'
@@ -335,6 +336,47 @@ $Items
             throw "Invalid multi-document input was not rejected: $case : $($output | Out-String)"
         }
     }
+    # A publisher that multi-targets packs from the outer build, where a build/ import is not applied: without
+    # buildMultiTargeting/ the helper silently packs no guidance at all.
+    $multiTarget = Join-Path $work 'multitarget'
+    New-Item -ItemType Directory -Path $multiTarget | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $multiTarget 'guide.md'), "# Multi-targeted guide`n")
+    [System.IO.File]::WriteAllText((Join-Path $multiTarget 'Multi.Targeted.csproj'), @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net10.0;netstandard2.0</TargetFrameworks>
+    <PackageId>Multi.Targeted</PackageId>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageGuidanceItem Include="guide.md" PackagePath="guide/guide.md" Usage="required" Description="Read before using Multi.Targeted." />
+    <PackageReference Include="Trellis.AgentDocs.Packaging" Version="$version" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
+"@)
+    # netstandard2.0 needs NETStandard.Library from nuget.org, so this restore uses a config with both sources.
+    [System.IO.File]::WriteAllText((Join-Path $multiTarget 'NuGet.Config'),
+        "<configuration><packageSources><clear/><add key=`"feed`" value=`"$Feed`"/>" +
+        '<add key="nuget" value="https://api.nuget.org/v3/index.json"/></packageSources></configuration>')
+    $multiTargetProject = Join-Path $multiTarget 'Multi.Targeted.csproj'
+    $restore = & dotnet restore $multiTargetProject "-p:RestorePackagesPath=$packages" --nologo -v:q 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "Multi-targeted publisher restore failed: $($restore | Out-String)" }
+    & dotnet pack $multiTargetProject --no-restore -o $Feed --nologo -v:q
+    if ($LASTEXITCODE -ne 0) { throw 'Multi-targeted publisher pack failed.' }
+    $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $Feed 'Multi.Targeted.1.0.0.nupkg'))
+    try {
+        $manifests = @($zip.Entries | Where-Object FullName -eq 'guidance/reference-manifest.json')
+        $guides = @($zip.Entries | Where-Object FullName -eq 'guide/guide.md')
+        $libraries = @($zip.Entries | Where-Object { $_.FullName -like 'lib/*' })
+        if ($manifests.Count -ne 1 -or $guides.Count -ne 1) {
+            throw 'A multi-targeted publisher must pack exactly one manifest and its guide.'
+        }
+        if ($libraries.Count -ne 2) { throw 'Multi-targeted publisher test must pack both target frameworks.' }
+        if (@($zip.Entries | Where-Object { $_.FullName -match '^(build|buildMultiTargeting|buildTransitive)/' }).Count -ne 0) {
+            throw 'Multi-targeted publisher leaked a build target.'
+        }
+    }
+    finally { $zip.Dispose() }
     Write-Host 'PASS multi-document publisher, validator round trip, and invalid inputs.'
 }
 finally {
