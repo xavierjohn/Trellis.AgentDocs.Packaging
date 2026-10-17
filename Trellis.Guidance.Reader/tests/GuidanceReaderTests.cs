@@ -298,7 +298,7 @@ public sealed class GuidanceReaderTests
     [InlineData("Docs/one.md", "docs/two.md")]
     [InlineData("caf\u00e9/one.md", "cafe\u0301/two.md")]
     [InlineData("intro.md", "INTRO.md")]
-    [InlineData("guide", "guide/intro.md")]
+    [InlineData("guide.md", "guide.md/intro.md")]
     public void Discover_Portable_aliases_fail_before_loading_missing_payloads(string first, string second)
     {
         using var graph = new Graph();
@@ -316,9 +316,26 @@ public sealed class GuidanceReaderTests
     }
 
     [Theory]
+    [InlineData("1.0")]
+    [InlineData("1e0")]
+    [InlineData("\"1\"")]
+    [InlineData("0")]
+    public void Discover_Requires_the_schema_version_to_be_the_integer_literal_one(string literal)
+    {
+        using var graph = new Graph();
+        graph.Package("Other", "1.0.0", manifest: "{\"schemaVersion\":" + literal + ",\"documents\":[]}");
+
+        var outcome = GuidanceReader.Discover([graph.Assets]).Packages.Single();
+
+        outcome.Status.Should().Be(GuidanceStatus.InvalidManifest);
+    }
+
+    [Theory]
     [InlineData("guide\\intro.md")]
     [InlineData(".github/intro.md")]
     [InlineData("guide/.github/intro.md")]
+    [InlineData("guide/notes.txt")]
+    [InlineData("guide")]
     public void Discover_Unsafe_manifest_paths_are_invalid_before_loading_payloads(string path)
     {
         using var graph = new Graph();

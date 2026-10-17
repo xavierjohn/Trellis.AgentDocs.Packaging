@@ -130,10 +130,10 @@ internal static class ManifestCheck
                     ok = false;
                 }
 
-                if (!JsonElementRules.TryString(raw, "path", out var path) || !PortableManifestPath(path))
+                if (!JsonElementRules.TryString(raw, "path", out var path) || !MarkdownPath(path))
                 {
                     Issue("AD002", path,
-                        "invalid document path: it must be a portable relative path using forward slashes, without rooted, '..', '.github', device or trailing-dot segments.");
+                        "invalid document path: it must be a portable relative Markdown (.md) path using forward slashes, without rooted, '..', '.github', device or trailing-dot segments.");
                     continue;
                 }
 
