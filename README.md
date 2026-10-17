@@ -10,7 +10,7 @@ parts:
 | **Developer** | `Trellis.AgentDocs` | Local .NET tool (`agentdocs`) that installs the guides of packages the developer approves and writes an index derived from the restored project graph. |
 
 Neither part adds an application runtime dependency. Both use the
-[experimental manifest contract](Trellis.Guidance.Reader/docs/experimental-guidance-v1.md);
+[manifest contract](Trellis.Guidance.Reader/docs/guidance-v1.md);
 this is **not** an official NuGet or cross-agent standard.
 
 ## Why this exists
@@ -87,7 +87,7 @@ instruction.
 For Central Package Management, put
 `<PackageVersion Include="Trellis.AgentDocs.Packaging" Version="YOUR_PUBLISHED_VERSION" />`
 in `Directory.Packages.props` and omit `Version` from the private project
-reference. Replace the placeholder with the published version. If a preview is not yet published, add the local feed
+reference. Replace the placeholder with the published version. To try an unpublished build, add the local feed
 containing its nupkg to the publishing project's NuGet restore sources first.
 
 ## What readers and consumers receive
@@ -198,7 +198,7 @@ dotnet pack -c Release
 dotnet tool run agentdocs validate artifacts/Example.Library.1.0.0.nupkg --strict
 ```
 
-See the [contract](Trellis.Guidance.Reader/docs/experimental-guidance-v1.md) for
+See the [contract](Trellis.Guidance.Reader/docs/guidance-v1.md) for
 the manifest format.
 
 ## Write a good guide

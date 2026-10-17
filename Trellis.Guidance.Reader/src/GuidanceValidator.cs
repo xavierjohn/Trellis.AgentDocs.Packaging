@@ -139,12 +139,6 @@ public static class GuidanceValidator
         {
             var path = document.Path;
             var canonical = PackagePath.Separators(path);
-            if (!canonical.EndsWith(".md", StringComparison.OrdinalIgnoreCase))
-            {
-                Error("AD002", path, "Guidance documents must be Markdown (.md); the tool installs Markdown only.");
-                continue;
-            }
-
             if (IsLinked(canonical))
             {
                 Error("AD002", path, "The document path contains a link/reparse point, which consumers reject.");

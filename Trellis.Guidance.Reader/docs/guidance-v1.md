@@ -1,22 +1,27 @@
-# Experimental NuGet package guidance contract, version 1 (preview)
+# AgentDocs NuGet package guidance contract, version 1
 
-This is an experimental convention and reference implementation, **not** a NuGet standard.
+This is a convention and reference implementation, **not** a NuGet standard.
 Package authors place `guidance/reference-manifest.json` in the package. No build target,
 NuGet client extension, or Trellis dependency is required. The machine-readable
 [JSON Schema](reference-manifest-v1.schema.json) describes the manifest structure; the
 additional semantic constraints below are normative.
 
-**Preview status.** Version 1 is the first actual alpha contract. No external consumer depends
-on an earlier shape, so the contract may change in place while it remains alpha. There is no
-backward-compatibility or migration commitment to unpublished preview behavior. Readers reject
-every other schema version.
+**Stability.** Version 1 is stable. The manifest shape and every normative rule in this
+document are fixed for `schemaVersion: 1`. Readers reject unknown fields and every other schema
+version (fail closed), so there is no forward compatibility within a version: adding a field,
+adding a rule, or tightening or loosening what a reader accepts is a breaking change and
+requires `schemaVersion: 2`. `publisherMetadata` is the only extension point. A fix that makes an
+implementation match this document is not a contract change. The reference implementation's
+conformance fixtures are part of the contract; its Markdown parser is pinned (see below), and an
+upgrade of it must pass them unchanged.
 
 This document is the package contract. How a consumer copies, lists, or approves guidance is
 implementation behavior and is described in the [AgentDocs README](../../Trellis.AgentDocs/README.md).
 
 ## Manifest
 
-The UTF-8 JSON object requires `schemaVersion: 1` and a `documents` array. Duplicate JSON
+The UTF-8 JSON object requires `schemaVersion: 1`, written as the integer literal `1` (`1.0`,
+`1e0` and `"1"` are invalid), and a `documents` array. Duplicate JSON
 property names and unknown top-level or document fields are rejected; this is deliberate
 fail-closed behavior, not forward compatibility.
 

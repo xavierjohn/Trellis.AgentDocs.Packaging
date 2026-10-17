@@ -1,12 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xavierjohn/Trellis.AgentDocs.Packaging/blob/main/Trellis.Guidance.Reader/docs/reference-manifest-v1.schema.json",
-  "title": "Experimental NuGet package guidance manifest, version 1 (preview)",
+  "title": "AgentDocs NuGet package guidance manifest, version 1",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "documents"],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": {
+      "const": 1,
+      "description": "Must be written as the integer literal 1; readers also reject 1.0 and 1e0, which JSON Schema treats as equal."
+    },
     "documents": {
       "type": "array",
       "items": {
