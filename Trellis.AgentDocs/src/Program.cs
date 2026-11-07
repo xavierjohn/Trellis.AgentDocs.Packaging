@@ -42,7 +42,12 @@ internal sealed record GraphState(GraphInput[] EntryPoints, GraphProject[] Proje
 internal sealed record ContextState(int SchemaVersion, string TextHashFormat, string GeneratedBy,
     string[] SourceRoots, GraphState Graph, InstructionEntry[] InstructionEntries,
     OwnedFile[] ToolOwnedFiles,
-    OwnedFile[] References, string[] ExplicitSourceRoots);
+    OwnedFile[] References, string[] ExplicitSourceRoots,
+    // Generated agent skills, with repository-root-relative paths. Absent from contexts written before skills existed.
+    OwnedFile[]? Skills = null)
+{
+    public OwnedFile[] SkillFiles => Skills ?? [];
+}
 
 internal sealed record GuideListing(string Path, string Package, string Version, string Description,
     GuidanceUsage Usage, int DocumentIndex);
@@ -234,11 +239,13 @@ public static partial class AgentDocsCommand
             : previous?.ExplicitSourceRoots ?? [];
         var policyPath = Path.Combine(root, ".agentdocs", PolicyFile);
         CheckFileDestination(root, root, policyPath);
-        var approved = request.Verb == AgentDocsVerb.Remove
-            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            : LoadApprovedPackages(policyPath, output);
+        var policy = request.Verb == AgentDocsVerb.Remove
+            ? new AgentDocsPolicy(new HashSet<string>(StringComparer.OrdinalIgnoreCase), DefaultSkillDirectories)
+            : LoadPolicy(policyPath);
+        var approved = policy.ApprovedPackages;
         (ContextState State, Dictionary<string, string> Content)? discovery = request.Verb == AgentDocsVerb.Remove ? null : BuildState(root,
-            graphEntries, explicitRoots, version, previous, discover, approved, request.StrictReferences, output, evaluationCache);
+            graphEntries, explicitRoots, version, previous, discover, approved, policy.SkillDirectories,
+            request.StrictReferences, output, evaluationCache);
         var changes = Plan(root, previous, discovery?.State, discovery?.Content, manifestPath, request.Force);
         if (request.Verb == AgentDocsVerb.Init && !File.Exists(policyPath))
             changes.Insert(0, new Change(policyPath, null, PolicyTemplate(), "Create policy"));
@@ -306,7 +313,7 @@ public static partial class AgentDocsCommand
     private static (ContextState State, Dictionary<string, string> Content) BuildState(string root, string[] entries,
         string[] explicitRoots, string version, ContextState? previous,
         Func<IEnumerable<string>, Func<string, bool>, GuidanceDiscovery> discover, HashSet<string> approved,
-        bool strictReferences, TextWriter output, ProjectEvaluations evaluationCache)
+        string[] skillDirectories, bool strictReferences, TextWriter output, ProjectEvaluations evaluationCache)
     {
         var projects = entries.SelectMany(entry => Projects(entry, root)).Distinct(Portable)
             .OrderBy(p => p, StringComparer.Ordinal).ToArray();
@@ -638,6 +645,20 @@ public static partial class AgentDocsCommand
                     .ThenBy(dependency => dependency.TargetDocumentPath, StringComparer.Ordinal).ToArray())).ToArray();
         var content = mapped.ToDictionary(pair => pair.Key, pair => pair.Value.Text, Portable);
 
+        // Skills are small stubs that point at the verified installed guides, so approval, hashing and link
+        // rewriting stay in one place. Their keys start with a skill directory and never collide with the
+        // .agentdocs-relative keys above.
+        var skillFiles = new List<OwnedFile>();
+        var skillSpecs = skillDirectories.Length == 0 ? [] : PlanSkills(orderedListings, mapped);
+        foreach (var directory in skillDirectories)
+            foreach (var skill in skillSpecs)
+            {
+                var path = directory + "/" + skill.Name + "/" + SkillFileName;
+                var text = RenderSkill(skill, directory, root);
+                content[path] = text;
+                skillFiles.Add(new OwnedFile(path, HashText(text), [skill.Source], SkillTransform, []));
+            }
+
         var enabled = orderedListings.Where(l => l.Usage != GuidanceUsage.Supporting)
             .Select(l => l.Package).ToHashSet(Portable);
         var projectSets = projects.Select(project => new
@@ -661,13 +682,16 @@ public static partial class AgentDocsCommand
             .OrderBy(p => p.Id, StringComparer.OrdinalIgnoreCase).ToArray();
         var indexText = Index(groups, unguided, orderedListings, pending);
         PrintSummary(output, groups, orderedListings, content, indexText, pending);
+        if (skillSpecs.Count != 0)
+            output.WriteLine($"AgentDocs: {skillSpecs.Count} skill(s) in {string.Join(", ", skillDirectories)}.");
 
         var graph = BuildGraph(root, entries, guidance, evaluationCache, output);
         var state = new ContextState(ContextSchemaVersion, "utf8-lf-no-bom-v1", version, roots, graph,
             instructionFiles.Select(p => new InstructionEntry(Rel(root, p), HashText(Entry(root, p)),
                 previous?.InstructionEntries.SingleOrDefault(e => Portable.Equals(e.InstructionFile, Rel(root, p)))?.ExistedBefore
                 ?? File.Exists(p))).ToArray(),
-            [], references, explicitRoots.OrderBy(p => p, StringComparer.Ordinal).ToArray());
+            [], references, explicitRoots.OrderBy(p => p, StringComparer.Ordinal).ToArray(),
+            skillFiles.OrderBy(file => file.Path, StringComparer.Ordinal).ToArray());
         content["README.md"] = indexText;
         return (state with
         {
@@ -1128,21 +1152,37 @@ public static partial class AgentDocsCommand
         var changes = new List<Change>();
         var previousFiles = old is null ? [] : old.References.Concat(old.ToolOwnedFiles).ToArray();
         var desiredFiles = next is null ? [] : next.References.Concat(next.ToolOwnedFiles).ToArray();
-        foreach (var file in previousFiles.Concat(desiredFiles).Select(f => f.Path).Distinct(Portable).OrderBy(p => p))
+        // A skill's YAML front matter must start the file, so skills are written without a byte order mark.
+        void PlanOwnedFile(string destination, OwnedFile? owned, OwnedFile? expected, bool writeBom = true)
         {
-            ValidateRelative(file);
-            var destination = Full(Path.Combine(root, ".agentdocs"), file);
             CheckFileDestination(root, root, destination);
             var before = File.Exists(destination) ? File.ReadAllBytes(destination) : null;
-            var owned = previousFiles.SingleOrDefault(f => Portable.Equals(f.Path, file));
-            var expected = desiredFiles.SingleOrDefault(f => Portable.Equals(f.Path, file));
             if (before is not null && owned is null && !force)
                 throw new InvalidOperationException($"Unowned destination {destination}; review before --force adoption.");
             if (owned is not null && (before is null || HashText(Canonical(before)) != owned.CanonicalSha256) && !force)
                 throw new InvalidOperationException($"Modified owned file {destination}; review before --force.");
             var text = expected is null ? null : content![expected.Path];
-            var after = text is null ? null : Bom.GetPreamble().Concat(Encoding.UTF8.GetBytes(text)).ToArray();
+            var after = text is null ? null
+                : (writeBom ? Bom.GetPreamble() : []).Concat(Encoding.UTF8.GetBytes(text)).ToArray();
             Add(changes, destination, before, after, expected is null ? "Remove" : before is null ? "Create" : "Update");
+        }
+
+        foreach (var file in previousFiles.Concat(desiredFiles).Select(f => f.Path).Distinct(Portable).OrderBy(p => p))
+        {
+            ValidateRelative(file);
+            PlanOwnedFile(Full(Path.Combine(root, ".agentdocs"), file),
+                previousFiles.SingleOrDefault(f => Portable.Equals(f.Path, file)),
+                desiredFiles.SingleOrDefault(f => Portable.Equals(f.Path, file)));
+        }
+
+        var previousSkills = old?.SkillFiles ?? [];
+        var desiredSkills = next?.SkillFiles ?? [];
+        foreach (var file in previousSkills.Concat(desiredSkills).Select(f => f.Path).Distinct(Portable).OrderBy(p => p))
+        {
+            ValidateSkillPath(file);
+            PlanOwnedFile(Full(root, file),
+                previousSkills.SingleOrDefault(f => Portable.Equals(f.Path, file)),
+                desiredSkills.SingleOrDefault(f => Portable.Equals(f.Path, file)), writeBom: false);
         }
 
         var instructionPaths = (old?.InstructionEntries ?? []).Concat(next?.InstructionEntries ?? [])
@@ -1178,11 +1218,15 @@ public static partial class AgentDocsCommand
         return changes;
     }
 
+    private static bool IsAgentInstructionName(string name) =>
+        name.Equals("AGENTS.md", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("CLAUDE.md", StringComparison.OrdinalIgnoreCase);
+
     private static bool CoversSelectedGraph(string root, ContextState state, string instruction)
     {
         if (Physical.Equals(instruction, Path.Combine(root, ".github", "copilot-instructions.md")))
             return state.SourceRoots.Length != 0;
-        if (!Path.GetFileName(instruction).Equals("AGENTS.md", StringComparison.OrdinalIgnoreCase))
+        if (!IsAgentInstructionName(Path.GetFileName(instruction)))
             return false;
         var directory = Path.GetDirectoryName(instruction)!;
         return state.Graph.EntryPoints.Any(entry =>
@@ -1477,7 +1521,11 @@ public static partial class AgentDocsCommand
         foreach (var root in state.SourceRoots.Concat(state.ExplicitSourceRoots))
             if (root != ".")
                 ValidateRelative(root);
-        foreach (var item in state.References.Concat(state.ToolOwnedFiles))
+        foreach (var skill in state.SkillFiles)
+            ValidateSkillPath(skill.Path);
+        if (state.SkillFiles.Select(file => file.Path).Distinct(Portable).Count() != state.SkillFiles.Length)
+            throw new InvalidOperationException("Duplicate skill ownership entry.");
+        foreach (var item in state.References.Concat(state.ToolOwnedFiles).Concat(state.SkillFiles))
         {
             ValidateRelative(item.Path);
             if (item.CanonicalSha256.Length != 64 || !item.CanonicalSha256.All(Uri.IsHexDigit))
@@ -1514,7 +1562,7 @@ public static partial class AgentDocsCommand
         foreach (var item in state.InstructionEntries)
         {
             ValidateRelative(item.InstructionFile);
-            if ((!Path.GetFileName(item.InstructionFile).Equals("AGENTS.md", StringComparison.OrdinalIgnoreCase) &&
+            if ((!IsAgentInstructionName(Path.GetFileName(item.InstructionFile)) &&
                 item.InstructionFile != VisualStudioInstructions) ||
                 item.CanonicalSha256.Length != 64 || !item.CanonicalSha256.All(Uri.IsHexDigit))
                 throw new InvalidOperationException("Invalid instruction ownership entry.");
@@ -1587,14 +1635,44 @@ public static partial class AgentDocsCommand
             Path.Combine(root, "AGENTS.md"),
             Path.Combine(root, ".github", "copilot-instructions.md")
         };
+        AddClaudePointer(root);
         foreach (var entry in entries)
         {
             var directory = Path.GetDirectoryName(entry)!;
             Inside(root, directory);
             files.Add(Path.Combine(directory, "AGENTS.md"));
+            AddClaudePointer(directory);
         }
 
         return files.OrderBy(p => p, StringComparer.Ordinal);
+
+        // Claude Code reads CLAUDE.md, and only falls back to AGENTS.md when a directory has no CLAUDE.md. A
+        // repository that has one would never show the index, so an existing CLAUDE.md gets the same managed pointer.
+        // The tool never creates it, and skips one that already imports the sibling AGENTS.md (which has the pointer).
+        void AddClaudePointer(string directory)
+        {
+            var claude = Path.Combine(directory, "CLAUDE.md");
+            if (File.Exists(claude) && !ImportsAgentsFile(claude))
+                files.Add(claude);
+        }
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex AgentsImport = new(
+        @"^[ \t]*@(\./)?AGENTS\.md[ \t]*\r?$", System.Text.RegularExpressions.RegexOptions.Multiline |
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>True when the file imports its sibling AGENTS.md, or cannot be read as UTF-8 (a file the tool
+    /// cannot edit safely is left alone rather than failing the command).</summary>
+    private static bool ImportsAgentsFile(string claude)
+    {
+        try
+        {
+            return AgentsImport.IsMatch(DecodeInstruction(File.ReadAllBytes(claude)));
+        }
+        catch (Exception e) when (e is DecoderFallbackException or InvalidOperationException)
+        {
+            return true;
+        }
     }
 
     private static void ValidateTool(string cwd, string version)
@@ -1837,29 +1915,34 @@ public static partial class AgentDocsCommand
     {
         var errors = new List<string>();
         var failedDirectories = new HashSet<string>(Physical);
-        var packagesRoot = Path.Combine(root, ".agentdocs", "packages");
+        // Package guides and generated skills are pruned up to, but never including, their namespace directory,
+        // so a customer-owned .agents or .claude directory is never removed.
+        var pruneRoots = new[] { Path.Combine(root, ".agentdocs", "packages") }
+            .Concat(AllowedSkillDirectories.Select(directory =>
+                Path.Combine(root, directory.Replace('/', Path.DirectorySeparatorChar)))).ToArray();
         foreach (var file in removedFiles)
-            for (var directory = Path.GetDirectoryName(file);
-                 directory is not null && Within(packagesRoot, directory) &&
-                 !Physical.Equals(packagesRoot, directory);
-                 directory = Path.GetDirectoryName(directory))
-            {
-                if (failedDirectories.Contains(directory))
-                    break;
-                try
+            foreach (var packagesRoot in pruneRoots)
+                for (var directory = Path.GetDirectoryName(file);
+                     directory is not null && Within(packagesRoot, directory) &&
+                     !Physical.Equals(packagesRoot, directory);
+                     directory = Path.GetDirectoryName(directory))
                 {
-                    CheckDestination(root, root, directory);
-                    if (!Directory.Exists(directory) || Directory.EnumerateFileSystemEntries(directory).Any())
+                    if (failedDirectories.Contains(directory))
                         break;
-                    deleteDirectory(directory);
+                    try
+                    {
+                        CheckDestination(root, root, directory);
+                        if (!Directory.Exists(directory) || Directory.EnumerateFileSystemEntries(directory).Any())
+                            break;
+                        deleteDirectory(directory);
+                    }
+                    catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException)
+                    {
+                        failedDirectories.Add(directory);
+                        errors.Add($"{Rel(root, directory)}: {error.Message}");
+                        break;
+                    }
                 }
-                catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException)
-                {
-                    failedDirectories.Add(directory);
-                    errors.Add($"{Rel(root, directory)}: {error.Message}");
-                    break;
-                }
-            }
         return errors;
     }
 

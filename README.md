@@ -7,7 +7,7 @@ parts:
 | Who | Package | Purpose |
 |---|---|---|
 | **NuGet author** | `Trellis.AgentDocs.Packaging` | Private build-only helper that packs a guide and verified manifest into any publisher's nupkg. |
-| **Developer** | `Trellis.AgentDocs` | Local .NET tool (`agentdocs`) that installs the guides of packages the developer approves and writes an index derived from the restored project graph. |
+| **Developer** | `Trellis.AgentDocs` | Local .NET tool (`agentdocs`) that installs the guides of packages the developer approves, writes an index derived from the restored project graph, and exposes each guide to agents as an Agent Skill (`.agents/skills` by default). |
 
 Neither part adds an application runtime dependency. Both use the
 [manifest contract](Trellis.Guidance.Reader/docs/guidance-v1.md);
@@ -210,6 +210,20 @@ the manifest format.
 - **Say when to open each on-demand guide.** The description is what an agent
   decides from. "Open when adding or changing API versioning" is useful;
   "Documentation" is not.
+- **Split task guides from reference.** A task guide answers "how do I do X" and is
+  small enough to read whole; make each one its own document, so an agent opens
+  one recipe and not a file of forty. Large API reference stays reference: keep it
+  out of the required set and let the task guides link to the sections they need.
+  Carry those links over from any routing table you retire, as a "See also" list in
+  the guide; `agentdocs validate` reports a reference nothing links to (`AD103`).
+- **Write each description as a trigger, in 200 characters or fewer.** Name the
+  task the document covers ("Open when adding a paginated list query"), not its
+  title. Two documents must not share a description (`AD108`). The same text is
+  shown in the index and, by default, becomes the description of the document's
+  agent skill, so it is what an agent routes on.
+- **Mark reference documents `supporting` only when something links to them.** A
+  `supporting` document is installed but neither listed in the index nor turned
+  into a skill, which keeps the catalog small, but an unlinked one cannot be found.
 - **Keep required documents stable.** Consumers review what your package asks
   agents to read; adding or changing required documents is visible to them.
 - **Use relative links to local documents or declared package references.**

@@ -112,8 +112,65 @@ in the selected pointer files are preserved. Each pointer unconditionally says
 containing file and the repository-root path as a fallback. Visual Studio Copilot
 must have custom instructions enabled to use that pointer.
 
+Claude Code reads `CLAUDE.md` and uses `AGENTS.md` only for a directory that has
+no `CLAUDE.md`, so a repository that has one would never show Claude Code the
+index. Wherever a pointer goes into an `AGENTS.md`, an **existing** `CLAUDE.md` in
+the same directory gets the same managed block. The tool never creates a
+`CLAUDE.md`, and it leaves one alone that already imports its sibling
+`AGENTS.md` on a line of its own (`@AGENTS.md`), because that import already
+delivers the pointer. `sync` picks up a `CLAUDE.md` created later and releases one
+that starts importing `AGENTS.md`.
+
+### Agent skills
+
+Every installed guide that is not `supporting` also becomes an
+[Agent Skill](https://agentskills.io/specification), so agents that load skills
+can pick a guide by its description without first reading the index. The default
+location is `.agents\skills\<name>\SKILL.md`, which GitHub Copilot, Codex and
+other agents scan. A skill is a small stub: front matter (`name`,
+`description`, and `metadata` recording the package, version, document and the
+document's SHA-256) and a link to the installed guide, which stays the one
+verified copy. Skills therefore follow the same approval, hash verification,
+`check` and `remove` rules as guides, and the link rewriting for cross-package
+references is not duplicated.
+
+- The skill name is `<package>-<document>` in lowercase letters, digits and
+  single hyphens, such as `trellis-core-trellis-api-core`. Two documents of one
+  package with the same file name use their full path; a name that is still
+  ambiguous or longer than 64 characters is shortened and ends in a hash of the
+  document identity.
+- The `description` is the publisher's description followed by the package and
+  version. It is publisher text that an agent reads as the skill's catalog entry,
+  so approve only packages you trust, as for any guide.
+- Skills are written without a byte order mark, as LF-only text.
+- A destination that already exists and is not owned by the tool, such as a skill
+  you wrote yourself with the same name, stops `init` and `sync` until you review
+  it. `--force` adopts it.
+- Skills are repository-wide. The index scopes a guide to the projects that restore
+  its package; a skill cannot, so the guide's own text and description do that
+  work.
+
+To write elsewhere or turn skills off, add `skillDirectories` to
+`.agentdocs\policy.json`. Allowed values are `".agents/skills"` (the default when
+the setting is absent) and `".claude/skills"`, which Claude Code reads and Copilot also scans. List both to
+serve every agent; the skills in the two directories are identical, and Copilot CLI
+1.0.107 lists each one once. The Agent Skills specification asks clients to warn
+about a name collision, so another client may mention the duplicate.
+`"skillDirectories": []` turns skills off; the next `sync` removes the ones the
+tool wrote. The empty `skills` directory stays, because it may be yours.
+
+```json
+{
+  "schemaVersion": 1,
+  "approvedPackages": ["Trellis.Core"],
+  "skillDirectories": [".agents/skills", ".claude/skills"]
+}
+```
+
+The setting is optional, but an older tool rejects a policy that contains it.
+
 Commit the tool manifest, pointers, `policy.json`, `agent-context.json`, the
-index, and the guides. `agent-context.json` records the selected graph and
+index, the guides, and the skills. `agent-context.json` records the selected graph and
 ownership hashes needed for `check` and safe cleanup after a fresh clone. Keep
 the packages you approve reviewed: their documents are instructions for an
 agent that acts with your privileges.
@@ -126,6 +183,7 @@ add this rule to your repository-root `.gitattributes`:
 
 ```gitattributes
 .agentdocs/** text eol=lf
+.agents/skills/** text eol=lf
 ```
 
 AgentDocs does not modify your `.gitattributes` or normalize existing
@@ -218,7 +276,7 @@ missing.
 | `agentdocs init <solution-or-project>...` | Opt in, create an empty policy if none exists, and install guides for approved packages. |
 | `agentdocs sync` | Update installed guides and the index from the recorded graph and the policy. |
 | `agentdocs check` | Check graph and installed context without writing; useful in CI. `--content-only` ignores drift that does not change the installed guidance; `--strict-references` rejects unresolved references and missing headings. |
-| `agentdocs remove` | Remove owned guides, pointers, and context state without touching customer text or the policy. |
+| `agentdocs remove` | Remove owned guides, skills, pointers, and context state without touching customer text or the policy. |
 | `agentdocs validate <package.nupkg\|directory>` | For authors: check a package's guidance before publishing. Read-only; needs no repository, restore or policy. |
 
 `validate` is the publisher-side check, so a mistake is caught before a consumer
