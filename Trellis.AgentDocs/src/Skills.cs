@@ -8,10 +8,11 @@ using Trellis.Guidance.Reader;
 
 public static partial class AgentDocsCommand
 {
-    // Agent Skills (agentskills.io) are discovered from these project directories. `.agents/skills` is the
-    // cross-client location (Codex, Copilot and others); `.claude/skills` is also scanned by Claude Code and Copilot.
+    // Agent Skills (agentskills.io) are discovered from these project directories. `.claude/skills` is read by
+    // Claude Code and by GitHub Copilot, so it is the default. `.agents/skills` is the cross-client location
+    // that Copilot and other clients scan; Claude Code does not read it.
     private static readonly string[] AllowedSkillDirectories = [".agents/skills", ".claude/skills"];
-    private static readonly string[] DefaultSkillDirectories = [".agents/skills"];
+    private static readonly string[] DefaultSkillDirectories = [".claude/skills"];
     private const string SkillTransform = "skill-stub-v1";
     private const string SkillFileName = "SKILL.md";
     private const int MaxSkillNameLength = 64;
@@ -74,13 +75,37 @@ public static partial class AgentDocsCommand
         return slug.Length == 0 ? "doc" : slug;
     }
 
-    private static List<SkillSpec> PlanSkills(IReadOnlyList<GuideListing> listings,
+    /// <summary>
+    /// A skill body is not inert text: Claude Code runs a `!`command`` it finds there when the skill loads, without
+    /// asking. The stub body repeats the package ID, version and document path, and the manifest contract allows
+    /// spaces, backticks and `!` in a path, so those strings may only reach a skill when they are plain.
+    /// </summary>
+    private static readonly Regex SafeSkillBodyText = new(@"^[A-Za-z0-9][A-Za-z0-9._+/-]*$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private sealed record SkillPlan(List<SkillSpec> Specs, List<string> Skipped);
+
+    private static SkillPlan PlanSkills(IReadOnlyList<GuideListing> listings,
         IReadOnlyDictionary<string, (string Text, List<Source> Sources)> mapped)
     {
-        var listed = listings.Where(l => l.Usage != GuidanceUsage.Supporting).ToArray();
+        var skipped = new List<string>();
+        var listed = new List<GuideListing>();
+        foreach (var listing in listings.Where(l => l.Usage != GuidanceUsage.Supporting))
+        {
+            var path = mapped[listing.Path].Sources[0].PackagePath;
+            if (SafeSkillBodyText.IsMatch(listing.Package) && SafeSkillBodyText.IsMatch(listing.Version) &&
+                SafeSkillBodyText.IsMatch(path))
+                listed.Add(listing);
+            else
+                skipped.Add($"AgentDocs warning: no skill for {listing.Package}/{path}: its package ID, version or path " +
+                    "has characters outside A-Z a-z 0-9 . _ + / -, which a skill body must not carry. " +
+                    "The guide is still installed and listed in the index.");
+        }
+
         var names = SkillNames(listed.Select(l => (l.Path, l.Package, mapped[l.Path].Sources[0].PackagePath)).ToArray());
-        return listed.Select(l => new SkillSpec(names[l.Path], l, mapped[l.Path].Sources[0]))
+        var specs = listed.Select(l => new SkillSpec(names[l.Path], l, mapped[l.Path].Sources[0]))
             .OrderBy(s => s.Name, StringComparer.Ordinal).ToList();
+        return new SkillPlan(specs, skipped);
     }
 
     private static string RenderSkill(SkillSpec skill, string skillDirectory, string root)

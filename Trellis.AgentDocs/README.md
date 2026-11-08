@@ -126,8 +126,8 @@ that starts importing `AGENTS.md`.
 Every installed guide that is not `supporting` also becomes an
 [Agent Skill](https://agentskills.io/specification), so agents that load skills
 can pick a guide by its description without first reading the index. The default
-location is `.agents\skills\<name>\SKILL.md`, which GitHub Copilot, Codex and
-other agents scan. A skill is a small stub: front matter (`name`,
+location is `.claude\skills\<name>\SKILL.md`, which Claude Code and GitHub Copilot
+both read. A skill is a small stub: front matter (`name`,
 `description`, and `metadata` recording the package, version, document and the
 document's SHA-256) and a link to the installed guide, which stays the one
 verified copy. Skills therefore follow the same approval, hash verification,
@@ -143,6 +143,11 @@ references is not duplicated.
   version. It is publisher text that an agent reads as the skill's catalog entry,
   so approve only packages you trust, as for any guide.
 - Skills are written without a byte order mark, as LF-only text.
+- A skill body is not inert: Claude Code runs a `!`command`` it finds there when the skill loads. The
+  manifest contract allows spaces, backticks and `!` in a document path, so a guide whose package ID, version
+  or path uses anything outside letters, digits and `. _ + / -` still installs and appears in the index but
+  gets **no skill**, and `init` and `sync` print a warning. The description and metadata are quoted front
+  matter and are not run.
 - A destination that already exists and is not owned by the tool, such as a skill
   you wrote yourself with the same name, stops `init` and `sync` until you review
   it. `--force` adopts it.
@@ -151,11 +156,13 @@ references is not duplicated.
   work.
 
 To write elsewhere or turn skills off, add `skillDirectories` to
-`.agentdocs\policy.json`. Allowed values are `".agents/skills"` (the default when
-the setting is absent) and `".claude/skills"`, which Claude Code reads and Copilot also scans. List both to
-serve every agent; the skills in the two directories are identical, and Copilot CLI
-1.0.107 lists each one once. The Agent Skills specification asks clients to warn
-about a name collision, so another client may mention the duplicate.
+`.agentdocs\policy.json`. Allowed values are `".claude/skills"` (the default when the
+setting is absent), which Claude Code and GitHub Copilot both read, and
+`".agents/skills"`, the cross-client location that Copilot, and per other sources
+Codex, scan. **Claude Code does not read `.agents/skills`.** List both to serve every
+agent; the skills in the two directories are identical, and Copilot CLI 1.0.107 lists
+each one once. The Agent Skills specification asks clients to warn about a name
+collision, so another client may mention the duplicate.
 `"skillDirectories": []` turns skills off; the next `sync` removes the ones the
 tool wrote. The empty `skills` directory stays, because it may be yours.
 
@@ -183,6 +190,7 @@ add this rule to your repository-root `.gitattributes`:
 
 ```gitattributes
 .agentdocs/** text eol=lf
+.claude/skills/** text eol=lf
 .agents/skills/** text eol=lf
 ```
 

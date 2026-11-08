@@ -649,7 +649,10 @@ public static partial class AgentDocsCommand
         // rewriting stay in one place. Their keys start with a skill directory and never collide with the
         // .agentdocs-relative keys above.
         var skillFiles = new List<OwnedFile>();
-        var skillSpecs = skillDirectories.Length == 0 ? [] : PlanSkills(orderedListings, mapped);
+        var skillPlan = skillDirectories.Length == 0 ? new SkillPlan([], []) : PlanSkills(orderedListings, mapped);
+        var skillSpecs = skillPlan.Specs;
+        foreach (var skipped in skillPlan.Skipped.Distinct(StringComparer.Ordinal).OrderBy(s => s, StringComparer.Ordinal))
+            output.WriteLine(skipped);
         foreach (var directory in skillDirectories)
             foreach (var skill in skillSpecs)
             {
