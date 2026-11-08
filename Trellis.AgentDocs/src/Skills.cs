@@ -8,11 +8,11 @@ using Trellis.Guidance.Reader;
 
 public static partial class AgentDocsCommand
 {
-    // Agent Skills (agentskills.io) are discovered from these project directories. `.claude/skills` is read by
-    // Claude Code and by GitHub Copilot, so it is the default. `.agents/skills` is the cross-client location
-    // that Copilot and other clients scan; Claude Code does not read it.
+    // Agent Skills (agentskills.io) are discovered from these project directories. `.agents/skills` is the
+    // cross-client location (Copilot and other clients scan it) and the default. Claude Code does not read it:
+    // it reads `.claude/skills`, which a repository can list here or link to `.agents/skills`.
     private static readonly string[] AllowedSkillDirectories = [".agents/skills", ".claude/skills"];
-    private static readonly string[] DefaultSkillDirectories = [".claude/skills"];
+    private static readonly string[] DefaultSkillDirectories = [".agents/skills"];
     private const string SkillTransform = "skill-stub-v1";
     private const string SkillFileName = "SKILL.md";
     private const int MaxSkillNameLength = 64;

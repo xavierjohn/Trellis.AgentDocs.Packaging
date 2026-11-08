@@ -3195,7 +3195,7 @@ public sealed class AgentDocsTests
         using var fixture = new Fixture();
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
 
-        var skill = fixture.Path(".claude", "skills", "example-library-overview", "SKILL.md");
+        var skill = fixture.Path(".agents", "skills", "example-library-overview", "SKILL.md");
         var bytes = File.ReadAllBytes(skill);
         bytes.Take(3).Should().NotEqual(new byte[] { 0xEF, 0xBB, 0xBF }, "front matter must start the file");
         var text = Encoding.UTF8.GetString(bytes);
@@ -3210,10 +3210,10 @@ public sealed class AgentDocsTests
         link.Should().Be("../../../.agentdocs/packages/example.library/guides/overview.md");
         File.Exists(System.IO.Path.GetFullPath(link, System.IO.Path.GetDirectoryName(skill)!)).Should().BeTrue();
 
-        File.ReadAllText(fixture.Path(".claude", "skills", "example-library-start-here", "SKILL.md"))
+        File.ReadAllText(fixture.Path(".agents", "skills", "example-library-start-here", "SKILL.md"))
             .Should().Contain("required reading");
-        Directory.Exists(fixture.Path(".claude", "skills", "example-library-details")).Should().BeFalse();
-        fixture.LastOutput.Should().Contain("2 skill(s) in .claude/skills");
+        Directory.Exists(fixture.Path(".agents", "skills", "example-library-details")).Should().BeFalse();
+        fixture.LastOutput.Should().Contain("2 skill(s) in .agents/skills");
         fixture.Run("check").Should().Be(0, fixture.LastOutput);
     }
 
@@ -3221,31 +3221,30 @@ public sealed class AgentDocsTests
     public void Remove_deletes_the_skills_and_empty_skill_directories_but_not_a_customer_agents_directory()
     {
         using var fixture = new Fixture();
-        fixture.Write(".claude/keep.txt", "customer");
+        fixture.Write(".agents/keep.txt", "customer");
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
-        File.Exists(fixture.Path(".claude", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue();
+        File.Exists(fixture.Path(".agents", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue();
 
         fixture.Run("remove").Should().Be(0, fixture.LastOutput);
-        Directory.Exists(fixture.Path(".claude", "skills", "example-library-overview")).Should().BeFalse();
-        File.ReadAllText(fixture.Path(".claude", "keep.txt")).Should().Be("customer");
+        Directory.Exists(fixture.Path(".agents", "skills", "example-library-overview")).Should().BeFalse();
+        File.ReadAllText(fixture.Path(".agents", "keep.txt")).Should().Be("customer");
     }
 
     [Fact]
-    public void A_policy_can_disable_skills_or_choose_the_agents_directory()
+    public void A_policy_can_disable_skills_or_move_them_to_the_claude_directory()
     {
         using var fixture = new Fixture();
         fixture.Write(".agentdocs/policy.json",
             "{\"schemaVersion\":1,\"approvedPackages\":[\"Example.Library\"],\"skillDirectories\":[]}");
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
-        Directory.Exists(fixture.Path(".claude")).Should().BeFalse();
         Directory.Exists(fixture.Path(".agents")).Should().BeFalse();
 
         fixture.Write(".agentdocs/policy.json",
-            "{\"schemaVersion\":1,\"approvedPackages\":[\"Example.Library\"],\"skillDirectories\":[\".agents/skills\"]}");
+            "{\"schemaVersion\":1,\"approvedPackages\":[\"Example.Library\"],\"skillDirectories\":[\".claude/skills\"]}");
         fixture.Run("check").Should().NotBe(0);
         fixture.Run("sync").Should().Be(0, fixture.LastOutput);
-        File.Exists(fixture.Path(".agents", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue();
-        Directory.Exists(fixture.Path(".claude")).Should().BeFalse();
+        File.Exists(fixture.Path(".claude", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue();
+        Directory.Exists(fixture.Path(".agents")).Should().BeFalse();
 
         fixture.Write(".agentdocs/policy.json",
             "{\"schemaVersion\":1,\"approvedPackages\":[\"Example.Library\"],\"skillDirectories\":[\".agents/skills\",\".claude/skills\"]}");
@@ -3253,12 +3252,12 @@ public sealed class AgentDocsTests
         File.Exists(fixture.Path(".agents", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue();
         File.Exists(fixture.Path(".claude", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue();
 
-        // Without the setting, skills go to the default .claude/skills and the .agents copies are removed.
+        // Without the setting, skills go to the default .agents/skills and the .claude copies are removed.
         fixture.Write(".agentdocs/policy.json",
             "{\"schemaVersion\":1,\"approvedPackages\":[\"Example.Library\"]}");
         fixture.Run("sync").Should().Be(0, fixture.LastOutput);
-        File.Exists(fixture.Path(".claude", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue();
-        Directory.Exists(fixture.Path(".agents", "skills", "example-library-overview")).Should().BeFalse();
+        File.Exists(fixture.Path(".agents", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue();
+        Directory.Exists(fixture.Path(".claude", "skills", "example-library-overview")).Should().BeFalse();
         fixture.Run("check").Should().Be(0, fixture.LastOutput);
     }
 
@@ -3282,7 +3281,7 @@ public sealed class AgentDocsTests
     {
         using var fixture = new Fixture();
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
-        var skill = fixture.Path(".claude", "skills", "example-library-overview", "SKILL.md");
+        var skill = fixture.Path(".agents", "skills", "example-library-overview", "SKILL.md");
         File.Exists(skill).Should().BeTrue();
 
         fixture.Unapprove("Example.Library");
@@ -3296,7 +3295,7 @@ public sealed class AgentDocsTests
     {
         using var fixture = new Fixture();
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
-        var skill = fixture.Path(".claude", "skills", "example-library-overview", "SKILL.md");
+        var skill = fixture.Path(".agents", "skills", "example-library-overview", "SKILL.md");
         File.AppendAllText(skill, "\nCustomer edit.\n");
 
         fixture.Run("check").Should().NotBe(0);
@@ -3306,10 +3305,10 @@ public sealed class AgentDocsTests
         fixture.Run("check").Should().Be(0, fixture.LastOutput);
 
         using var other = new Fixture();
-        other.Write(".claude/skills/example-library-overview/SKILL.md", "---\nname: example-library-overview\n---\nMine.\n");
+        other.Write(".agents/skills/example-library-overview/SKILL.md", "---\nname: example-library-overview\n---\nMine.\n");
         other.Run("init", "App.csproj").Should().NotBe(0);
         other.LastOutput.Should().Contain("Unowned destination");
-        File.ReadAllText(other.Path(".claude", "skills", "example-library-overview", "SKILL.md")).Should().Contain("Mine.");
+        File.ReadAllText(other.Path(".agents", "skills", "example-library-overview", "SKILL.md")).Should().Contain("Mine.");
         File.Exists(other.Path(".agentdocs", "agent-context.json")).Should().BeFalse();
     }
 
@@ -3321,12 +3320,37 @@ public sealed class AgentDocsTests
         fixture.OverviewDescription = hostile;
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
 
-        var lines = File.ReadAllText(fixture.Path(".claude", "skills", "example-library-overview", "SKILL.md")).Split('\n');
+        var lines = File.ReadAllText(fixture.Path(".agents", "skills", "example-library-overview", "SKILL.md")).Split('\n');
         lines.Count(line => line.StartsWith("name:", StringComparison.Ordinal)).Should().Be(1);
         lines.Count(line => line == "---").Should().Be(2);
         var description = lines.Single(line => line.StartsWith("description:", StringComparison.Ordinal));
         JsonSerializer.Deserialize<string>(description["description: ".Length..]).Should()
             .Be(hostile + $" (Example.Library {ToolVersion()})");
+    }
+
+    [Fact]
+    public void A_link_from_the_claude_directory_to_the_agents_directory_is_left_alone()
+    {
+        // The documented way to serve Claude Code without writing every skill twice: keep the default
+        // .agents/skills and link .claude/skills to it. The tool never touches the link.
+        using var fixture = new Fixture();
+        Directory.CreateDirectory(fixture.Path(".agents", "skills"));
+        Directory.CreateDirectory(fixture.Path(".claude"));
+        if (!TryCreateDirectoryLink(fixture.Path(".claude", "skills"), fixture.Path(".agents", "skills")))
+        {
+            Assert.Skip(LinksUnavailable);
+            return;
+        }
+
+        fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
+        File.Exists(fixture.Path(".agents", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue();
+        File.Exists(fixture.Path(".claude", "skills", "example-library-overview", "SKILL.md")).Should().BeTrue("through the link");
+        fixture.Run("sync").Should().Be(0, fixture.LastOutput);
+        fixture.Run("check").Should().Be(0, fixture.LastOutput);
+
+        fixture.Run("remove").Should().Be(0, fixture.LastOutput);
+        Directory.EnumerateFiles(fixture.Path(".agents", "skills"), "SKILL.md", SearchOption.AllDirectories).Should().BeEmpty();
+        Directory.Exists(fixture.Path(".claude", "skills")).Should().BeTrue("the link is the user's and stays");
     }
 
     [Fact]
@@ -3341,12 +3365,12 @@ public sealed class AgentDocsTests
 
         fixture.Run("init", "App.csproj").Should().Be(0, fixture.LastOutput);
         fixture.LastOutput.Should().Contain("no skill for Hostile.Publisher/" + hostile);
-        var skills = Directory.EnumerateFiles(fixture.Path(".claude", "skills"), "SKILL.md", SearchOption.AllDirectories)
+        var skills = Directory.EnumerateFiles(fixture.Path(".agents", "skills"), "SKILL.md", SearchOption.AllDirectories)
             .ToArray();
         skills.Should().NotBeEmpty("plain guides still get skills");
         foreach (var skill in skills)
             File.ReadAllText(skill).Should().NotContain("!`").And.NotContain("echo hi");
-        Directory.Exists(fixture.Path(".claude", "skills", "hostile-publisher-note-echo-hi")).Should().BeFalse();
+        Directory.Exists(fixture.Path(".agents", "skills", "hostile-publisher-note-echo-hi")).Should().BeFalse();
         File.ReadAllText(fixture.Path(".agentdocs", "README.md")).Should().Contain("Hostile.Publisher");
         fixture.Run("check").Should().Be(0, fixture.LastOutput);
     }

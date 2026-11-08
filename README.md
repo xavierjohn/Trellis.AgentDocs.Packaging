@@ -7,7 +7,7 @@ parts:
 | Who | Package | Purpose |
 |---|---|---|
 | **NuGet author** | `Trellis.AgentDocs.Packaging` | Private build-only helper that packs a guide and verified manifest into any publisher's nupkg. |
-| **Developer** | `Trellis.AgentDocs` | Local .NET tool (`agentdocs`) that installs the guides of packages the developer approves, writes an index derived from the restored project graph, and exposes each guide to agents as an Agent Skill (`.claude/skills` by default). |
+| **Developer** | `Trellis.AgentDocs` | Local .NET tool (`agentdocs`) that installs the guides of packages the developer approves, writes an index derived from the restored project graph, and exposes each guide to agents as an Agent Skill (`.agents/skills` by default; Claude Code needs `.claude/skills`, see the tool README). |
 
 Neither part adds an application runtime dependency. Both use the
 [manifest contract](Trellis.Guidance.Reader/docs/guidance-v1.md);

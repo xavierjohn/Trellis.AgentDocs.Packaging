@@ -126,8 +126,8 @@ that starts importing `AGENTS.md`.
 Every installed guide that is not `supporting` also becomes an
 [Agent Skill](https://agentskills.io/specification), so agents that load skills
 can pick a guide by its description without first reading the index. The default
-location is `.claude\skills\<name>\SKILL.md`, which Claude Code and GitHub Copilot
-both read. A skill is a small stub: front matter (`name`,
+location is `.agents\skills\<name>\SKILL.md`, the cross-client folder that GitHub Copilot
+and other agents scan. **Claude Code does not read it**; see below. A skill is a small stub: front matter (`name`,
 `description`, and `metadata` recording the package, version, document and the
 document's SHA-256) and a link to the installed guide, which stays the one
 verified copy. Skills therefore follow the same approval, hash verification,
@@ -156,23 +156,35 @@ references is not duplicated.
   work.
 
 To write elsewhere or turn skills off, add `skillDirectories` to
-`.agentdocs\policy.json`. Allowed values are `".claude/skills"` (the default when the
-setting is absent), which Claude Code and GitHub Copilot both read, and
-`".agents/skills"`, the cross-client location that Copilot, and per other sources
-Codex, scan. **Claude Code does not read `.agents/skills`.** List both to serve every
-agent; the skills in the two directories are identical, and Copilot CLI 1.0.107 lists
-each one once. The Agent Skills specification asks clients to warn about a name
-collision, so another client may mention the duplicate.
-`"skillDirectories": []` turns skills off; the next `sync` removes the ones the
-tool wrote. The empty `skills` directory stays, because it may be yours.
+`.agentdocs\policy.json`. Allowed values are `".agents/skills"` (the default when the
+setting is absent) and `".claude/skills"`, which Claude Code and Copilot both read.
+`"skillDirectories": []` turns skills off; the next `sync` removes the ones the tool
+wrote. The empty `skills` directory stays, because it may be yours.
 
-```json
-{
-  "schemaVersion": 1,
-  "approvedPackages": ["Trellis.Core"],
-  "skillDirectories": [".agents/skills", ".claude/skills"]
-}
-```
+**Claude Code needs `.claude/skills`.** There are two ways to give it the same skills:
+
+- **List both directories.** The tool writes every skill twice and keeps both copies
+  hashed, owned and cleaned up. It behaves the same on every operating system, and Copilot
+  CLI 1.0.107 lists each skill once. The Agent Skills specification asks clients to warn
+  about a name collision, so another client may mention the duplicate.
+
+  ```json
+  {
+    "schemaVersion": 1,
+    "approvedPackages": ["Trellis.Core"],
+    "skillDirectories": [".agents/skills", ".claude/skills"]
+  }
+  ```
+
+- **Link `.claude/skills` to `.agents/skills`.** Keep the default and create the link
+  yourself, before or after `init`: `New-Item -ItemType SymbolicLink -Path .claude\skills
+  -Target ..\.agents\skills` (or `ln -s ../.agents/skills .claude/skills`). Claude Code
+  follows the link, and the tool never touches `.claude/skills`, so `sync`, `check` and
+  `remove` leave it alone. The tool does not create the link and does not notice if it is
+  missing. A link needs Developer Mode or administrator rights on Windows, and a checkout
+  without symbolic link support turns it into a small text file, after which Claude Code
+  sees no skills. Never point `skillDirectories` at the link itself: the tool refuses to
+  write through a link.
 
 The setting is optional, but an older tool rejects a policy that contains it.
 
